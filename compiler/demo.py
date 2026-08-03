@@ -242,6 +242,20 @@ def run_executor_showcase(seed=7):
     print("\n注：--executor 下 _simulate 用 CircuitExecutor 替代 circ.execute()；"
           "反馈环(max_iter 重试)类场景指标会与 execute() 略有差异（执行器做单次传播+补数闭环）。")
 
+    # 观察窗（B）：把两个展示拓扑的事件流渲染成可 present_files 的 HTML 产物
+    from compiler.executor_trace import render_executor_trace
+    _ex = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "examples")
+    p1 = render_executor_trace(
+        ex1, title="Executor 观察窗 · ① 自动补数闭环",
+        out_path=os.path.join(_ex, "executor_trace_fill.html"))
+    p2 = render_executor_trace(
+        ex2, title="Executor 观察窗 · ② 3.5 多任务进化",
+        out_path=os.path.join(_ex, "executor_trace.html"))
+    print(f"\n观察窗产物已生成（用 present_files 打开查看）：")
+    print(f"  · 补数闭环 : {p1}")
+    print(f"  · 多任务进化: {p2}")
+
 
 def main():
     ap = argparse.ArgumentParser(

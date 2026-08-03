@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -478,7 +479,14 @@ class CircuitExecutor:
     def __init__(self, circuit: "Circuit", state: dict | None = None,
                  data_fill_budget: int = 2, skills_enabled: bool = True,
                  evolve_enabled: bool = True, evolve_threshold: int = 5,
-                 evolve_top_k: int = 3, evolve_skill: str = "web_search"):
+                 evolve_top_k: int = 3, evolve_skill: str = "web_search",
+                 verbose: bool = False, on_event: "Optional[callable]" = None,
+                 events: "Optional[list]" = None, scope: str = ""):
+        """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
+        on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
+        events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
+        scope      : 事件作用域前缀（子电路用 'evolve'，渲染器据此标紫⚠）。
+        """
         self.circuit = circuit
         self.budget = data_fill_budget
         self.skills_enabled = skills_enabled
@@ -486,27 +494,78 @@ class CircuitExecutor:
         self.evolve_threshold = evolve_threshold
         self.evolve_top_k = evolve_top_k
         self.evolve_skill = evolve_skill
+        self.verbose = verbose
+        self.on_event = on_event
+        self.scope = scope
         self.state = state or {"_fetched": {}, "_skills_used": [], "_trace": []}
+        # 观察窗（B）：事件流 + 最终节点结果 + 补数/进化标记，供 executor_trace 渲染。
+        self._events = events if events is not None else []
+        self._t0 = None
+        self._results = {}
+        self._filled_nodes = set()      # 触发过自动补数闭环的节点（橙虚框）
+        self._evolved_from_node = None  # 触发 3.5 进化的来源节点（紫⚠）
+
+    # ---- 观察窗（B）：事件流发射 ----
+    def _emit(self, etype: str, **fields):
+        """统一发射一个事件：① 写进 self._events（供 SVG 渲染）② 调 on_event 回调
+        ③ 若 verbose 同时打印控制台行（CI 冗余）。零重复埋点。"""
+        if self._t0 is None:
+            self._t0 = time.perf_counter()
+        t = (time.perf_counter() - self._t0) * 1000.0
+        ev = {"t": round(t, 1), "type": etype, "scope": self.scope}
+        ev.update(fields)
+        self._events.append(ev)
+        if self.on_event is not None:
+            try:
+                self.on_event(ev)
+            except Exception:
+                pass
+        if self.verbose:
+            print(self._fmt_event(ev))
+
+    @staticmethod
+    def _fmt_event(ev: dict) -> str:
+        t = ev.get("t", 0.0)
+        et = ev.get("type", "?")
+        node = ev.get("node")
+        scope = ev.get("scope")
+        tag = f"[{scope}] " if scope else ""
+        if node is not None:
+            tag += f"{node} · "
+        extra = {k: v for k, v in ev.items()
+                 if k not in ("t", "type", "scope", "node")}
+        return f"[+{t:7.1f}ms] {et:<14} {tag}{extra}"
 
     # ---- 执行器主动派发（动态技能调用核心）----
     def dispatch(self, cid: str, spec: dict) -> str:
         name = spec.get("skill")
         args = spec.get("args", {})
         if not self.skills_enabled or not name:
+            self._emit("skill_skip", node=cid, skill=name)
             return f"[no-skill-fill:{name}]"
         try:
             from compiler.agent_skills import execute_skill
         except Exception as e:
+            self._emit("skill_error", node=cid, skill=name, error=str(e))
             return f"[skill 模块不可用: {e}]"
         self.state["_skills_used"].append(name)
         self.state["_trace"].append({"action": "dispatch_skill", "node": cid,
                                       "skill": name, "args": args})
-        return execute_skill(name, json.dumps(args))
+        self._emit("skill_call", node=cid, skill=name, args=args)
+        try:
+            result = execute_skill(name, json.dumps(args))
+        except Exception as e:
+            self._emit("skill_error", node=cid, skill=name, error=str(e))
+            return f"[skill 错误: {e}]"
+        self._emit("skill_return", node=cid, skill=name,
+                   ok=True, length=len(str(result)))
+        return result
 
     # ---- 自动补数据：对 missing 逐个派发 filler，写回 state._fetched ----
     def _auto_fill(self, cid: str, missing: list):
         comp = self.circuit.components[cid]
         fillers = comp.get("fillers") or {}
+        self._filled_nodes.add(cid)
         for m in missing:
             if m in self.state["_fetched"]:
                 continue
@@ -534,19 +593,39 @@ class CircuitExecutor:
 
     # ---- 分层 propagate + 闭环补数 ----
     def run(self):
+        self._t0 = time.perf_counter()
         out = {}
-        for layer in self.circuit.layers():
+        layers = self.circuit.layers()
+        self._emit("start",
+                   spec=self.circuit.spec.get("name", "unnamed"),
+                   nodes=len(self.circuit.components),
+                   layers=len(layers))
+
+        for li, layer in enumerate(layers):
+            self._emit("layer_start", layer_idx=li, nodes=list(layer))
             for cid in layer:
-                sig = self.circuit._run_one(cid, out)     # 现有线性关系闸 + backend.run
-                b = self.budget
-                while sig.meta.get("gate") == "fail_linear" and b > 0:
-                    self._auto_fill(cid, sig.meta.get("missing", []))
-                    sig = self._rerun_with_filled(cid, out)
-                    b -= 1
-                    self.state["_trace"].append(
-                        {"action": "retry_after_fill", "node": cid,
-                         "ok": sig.ok, "budget_left": b})
+                comp = self.circuit.components[cid]
+                self._emit("node_start", node=cid, ctype=comp.get("type"),
+                           label=comp.get("label"))
+                sig = self.circuit._run_one(cid, out)   # 现有线性关系闸 + backend.run
+                if sig.meta.get("gate") == "fail_linear":
+                    self._emit("gate_fail", node=cid,
+                               missing=sig.meta.get("missing", []))
+                    b = self.budget
+                    while sig.meta.get("gate") == "fail_linear" and b > 0:
+                        self._auto_fill(cid, sig.meta.get("missing", []))
+                        sig = self._rerun_with_filled(cid, out)
+                        b -= 1
+                        self._emit("retry", node=cid, ok=sig.ok,
+                                   budget_left=b,
+                                   filled=sig.meta.get("auto_filled", False))
+                self._emit("node_done", node=cid, ok=sig.ok,
+                           quality=round(sig.quality, 3),
+                           retried=(cid in self._filled_nodes))
                 out[cid] = sig
+            self._emit("layer_done", layer_idx=li)
+
+        self._results = out
         terminals = [c for c in self.circuit.components if not self.circuit.succ[c]]
         fq = max((out[c].quality for c in terminals), default=0.0)
         total_cost = sum(s.cost for s in out.values())
@@ -557,19 +636,42 @@ class CircuitExecutor:
         if self.evolve_enabled:
             sub = self.maybe_evolve(self.state)
             if sub is not None:
+                from_key = sub.get("_evolve_from")
+                # 反查「声明需要该检索结果」的节点，作为紫⚠高亮目标（_fetched 键≠节点 id）
+                src_node = None
+                for c, comp in self.circuit.components.items():
+                    if from_key in (comp.get("required_inputs") or []):
+                        src_node = c
+                        break
+                self._evolved_from_node = src_node or from_key
+                self._emit("evolve_detect", from_node=self._evolved_from_node,
+                           count=len(self.state["_fetched"].get(from_key, []) or []),
+                           threshold=self.evolve_threshold,
+                           top_k=self.evolve_top_k)
+                self._emit("evolve_spawn", sub_name=sub.get("name"),
+                           from_node=from_key)
                 child = CircuitExecutor(
                     Circuit(sub, self.circuit.backend),
                     state=self.state,
                     data_fill_budget=self.budget,
                     skills_enabled=self.skills_enabled,
                     evolve_enabled=False,          # 子电路不再进化，防无限递归
+                    events=self._events,            # 共享事件列表 → 时间线连续
+                    on_event=self.on_event,
+                    verbose=self.verbose,
+                    scope="evolve",
                 )
+                child._t0 = self._t0              # 事件时间接在父时钟上，连续
                 evolved = child.run()
                 self.state["_evolved"] = {
                     "spec_name": sub.get("name"),
                     "result": evolved,
                 }
 
+        self._emit("done",
+                   total_cost=round(total_cost, 4),
+                   total_latency_ms=round(total_lat, 1),
+                   final_quality=round(fq, 3))
         return {
             "success": all(out[c].ok for c in terminals),
             "final_quality": round(fq, 3),
@@ -613,7 +715,9 @@ class CircuitExecutor:
                 continue
             if len(items) > self.evolve_threshold:
                 chosen = items[: self.evolve_top_k]
-                return self._build_subcircuit(key, chosen)
+                sub = self._build_subcircuit(key, chosen)
+                sub["_evolve_from"] = key     # 供渲染器定位触发进化的节点（紫⚠）
+                return sub
         return None
 
     def _build_subcircuit(self, src_key, chosen):
@@ -705,6 +809,12 @@ def circuit_executor_selftest():
     assert "calculator" in res2["state"]["_skills_used"], "应真实调用已注册技能 calculator"
     print("✓ D 动态技能调用: 节点声明 calculator filler → 执行器主动调真技能(无 LLM) → ok")
 
+    # 观察窗（B）：事件流 + 最终节点结果 + 补数标记应被填充（零回归）
+    assert ex._events, "executor 应填充 _events 观察窗事件流"
+    assert ex._results.get("reason") is not None, "应记录 reason 最终信号"
+    assert "reason" in ex._filled_nodes, "reason 触发过自动补数 → 应在 _filled_nodes"
+    print(f"✓ 观察窗(B): _events={len(ex._events)} 条 · reason 已补数闭环 · 渲染键齐全")
+
 
 def circuit_executor_evolve_selftest():
     """3.5 多任务进化离线自检（无 key/无网）：检索结果决定第二步拓扑。
@@ -761,7 +871,11 @@ def circuit_executor_evolve_selftest():
     ev = res["state"]["_evolved"]
     assert ev["result"]["components"].get("analyze", {}).get("ok"), \
         "进化出的分析子电路 analyze 应 ok"
+    assert ex._evolved_from_node == "research", "进化来源节点应反查到 research"
+    assert any(e.get("scope") == "evolve" for e in ex._events), \
+        "子电路事件应并入时间线(scope=evolve)"
     print("✓ 3.5 多任务进化: research 检索到 8 框架(>5) → 动态拼『分析 top3』子电路递归执行 → _evolved 存在且 analysis ok")
+    print(f"✓ 观察窗(B): 进化来源节点={ex._evolved_from_node} · 子电路事件并入时间线(scope=evolve)")
 
 
 def selftest():

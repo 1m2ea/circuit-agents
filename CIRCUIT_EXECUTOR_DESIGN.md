@@ -248,3 +248,36 @@ class CircuitExecutor:
   受 `resolve_api_key` 控制（无 key 走 SimBackend/ dry 文本）。
 - **循环风险**：补数据闭环有 `budget` 上限，不会无限重跑；`gate:fail_linear` 仍诚实上抛。
 - **多任务（3.5）**：stretch，先做接口与 PoC 钩子，不全量实现以免范围爆炸。
+
+---
+
+## 8. 观察窗（B）：可视化执行追踪产物
+
+**痛点**：执行过程对使用者是黑箱——只能看到技能被调用，看不到「技能在干什么」；
+且用户环境不显示 Python stdout（控制台日志不可见）。故把"观察"从控制台改为
+**可 `present_files` 打开的 HTML 视觉文件**。
+
+**双通道埋点（`CircuitExecutor.__init__`）**：
+- `verbose: bool=False` —— 同时向控制台打印事件行（CI 冗余，用户环境通常不可见）。
+- `on_event: Callable=None` —— 结构化事件回调 `(dict)->None`，供 SVG/UI 订阅，零重复埋点。
+- 内部 `self._events: list` —— **默认始终填充**（不受 verbose/on_event 影响），是渲染数据源。
+- `events` / `scope` 参数 —— 子电路执行器共享父事件列表 + 打 `evolve` 作用域前缀，
+  使时间线连续、子电路事件可识别（紫⚠）。
+
+**事件流覆盖**：`start` → `layer_start`/`layer_done` → `node_start` →
+（`gate_fail` → `skill_call`/`skill_return` → `retry`）→ `node_done` →
+`evolve_detect`/`evolve_spawn`（3.5）→ 子电路递归 → `done`。节点最终状态写 `self._results`，
+补数节点记 `self._filled_nodes`，进化来源节点反查记 `self._evolved_from_node`。
+
+**渲染器 `compiler/executor_trace.py`**：
+`render_executor_trace(executor, title, out_path)` 把事件流 + 拓扑渲染成自包含 HTML：
+- 拓扑图：节点按最终状态四色着色（绿✓完成 / 红✗失败 / 橙虚框=补数闭环 / 紫⚠=触发 3.5 进化），
+  复用 circuit-planner 的复盘配色约定。
+- 时间线面板：每个事件一行（相对时间戳 + 类型色点 + 详情）。
+- 走查动画：播放/暂停 + 倍速(0.5/1/2/4×) + 进度条，按事件发生顺序高亮对应节点（蓝激活 / 紫脉冲）。
+
+**接入点**：`compiler/demo.py --executor` 末尾 `run_executor_showcase()` 跑完两个演示拓扑，
+自动生成 `examples/executor_trace.html`（3.5 多任务进化）与 `examples/executor_trace_fill.html`
+（自动补数闭环）并提示用 `present_files` 打开。CI 仍可由 `circuit_executor_selftest()` /
+`circuit_executor_evolve_selftest()` 的 `_events`/`_filled_nodes`/`_evolved_from_node` 断言做冗余校验。
+
