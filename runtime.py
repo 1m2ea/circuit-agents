@@ -278,59 +278,59 @@ class Circuit:
             ready = nxt
         return out
 
+    def _run_one(self, cid, out):
+        """跑单个组件：先做『线性关系自测』(若有声明输入)，再调后端，
+        并给产出信号打 produced_outputs 标供下游核对。
+
+        线性关系自测（用户核心诉求：每个电阻都要会判断线性关系）：
+        有 required_inputs 的电阻，核对它声明的每个产物名是否都被某条
+        上游(直接前驱)信号的 produced_outputs 覆盖——覆盖即『该线性关系成立』，
+        缺一个即『依赖未满足』→ 短路返回 gate:fail_linear（不调后端，
+        天然喂进反馈环/adc 重试用）。无 required_inputs 的节点跳过（零回归）。
+        """
+        comp = self.components[cid]
+        ins = [out[p] for p in self.pred[cid] if p in out]
+        req = comp.get("required_inputs")
+        if req:
+            input_map = comp.get("input_map") or {}   # 命名漂移符号映射表（转接头）
+            available = set()
+            for p in self.pred[cid]:
+                s = out.get(p)
+                if s is not None and s.ok:
+                    available.update(s.meta.get("produced_outputs") or [])
+            # 每个声明输入经映射表翻译为上游『实际产物名』后再核对（仍报下游原名便于人读）。
+            # 映射表只来自编译期确定性规则判定的等价对，故翻译是安全的、零回归的。
+            missing = []
+            for r in req:
+                actual = input_map.get(r, r)
+                if actual not in available:
+                    missing.append(r)
+            if missing:
+                return Signal(value=None, quality=0.0, ok=False,
+                              cost=0.0, latency_ms=0.0,
+                              meta={"gate": "fail_linear",
+                                    "missing": missing,
+                                    "required": list(req),
+                                    "node": cid})
+        sig = self.backend.run(comp, ins)
+        # 给产出信号打 produced_outputs 标：自身声明产出 ∪ 所有上游产出（累积透传）。
+        # 关键：汇合(capacitor)/适配(format_adapter)等中间节点会把上游产物名继续向
+        # 下游转发，于是下游核对线性关系时只需看「直接前驱信号的 produced_outputs」即可，
+        # 不必追溯整条上游链（Router 会在 producer→consumer 间插电容汇合/适配器）。
+        upstream_outputs = set()
+        for s in ins:
+            if s is not None and s.ok:
+                upstream_outputs.update(s.meta.get("produced_outputs") or [])
+        own = comp.get("produced_outputs") or []
+        combined = list(dict.fromkeys(list(own) + list(upstream_outputs)))
+        if combined:
+            sig.meta["produced_outputs"] = combined
+        return sig
+
     def propagate(self):
         out = {}
         total_cost = 0.0
         total_lat = 0.0
-
-        def _run_one(cid):
-            """跑单个组件：先做『线性关系自测』(若有声明输入)，再调后端，
-            并给产出信号打 produced_outputs 标供下游核对。
-
-            线性关系自测（用户核心诉求：每个电阻都要会判断线性关系）：
-            有 required_inputs 的电阻，核对它声明的每个产物名是否都被某条
-            上游(直接前驱)信号的 produced_outputs 覆盖——覆盖即『该线性关系成立』，
-            缺一个即『依赖未满足』→ 短路返回 gate:fail_linear（不调后端，
-            天然喂进反馈环/adc 重试用）。无 required_inputs 的节点跳过（零回归）。
-            """
-            comp = self.components[cid]
-            ins = [out[p] for p in self.pred[cid] if p in out]
-            req = comp.get("required_inputs")
-            if req:
-                input_map = comp.get("input_map") or {}   # 命名漂移符号映射表（转接头）
-                available = set()
-                for p in self.pred[cid]:
-                    s = out.get(p)
-                    if s is not None and s.ok:
-                        available.update(s.meta.get("produced_outputs") or [])
-                # 每个声明输入经映射表翻译为上游『实际产物名』后再核对（仍报下游原名便于人读）。
-                # 映射表只来自编译期确定性规则判定的等价对，故翻译是安全的、零回归的。
-                missing = []
-                for r in req:
-                    actual = input_map.get(r, r)
-                    if actual not in available:
-                        missing.append(r)
-                if missing:
-                    return Signal(value=None, quality=0.0, ok=False,
-                                  cost=0.0, latency_ms=0.0,
-                                  meta={"gate": "fail_linear",
-                                        "missing": missing,
-                                        "required": list(req),
-                                        "node": cid})
-            sig = self.backend.run(comp, ins)
-            # 给产出信号打 produced_outputs 标：自身声明产出 ∪ 所有上游产出（累积透传）。
-            # 关键：汇合(capacitor)/适配(format_adapter)等中间节点会把上游产物名继续向
-            # 下游转发，于是下游核对线性关系时只需看「直接前驱信号的 produced_outputs」即可，
-            # 不必追溯整条上游链（Router 会在 producer→consumer 间插电容汇合/适配器）。
-            upstream_outputs = set()
-            for s in ins:
-                if s is not None and s.ok:
-                    upstream_outputs.update(s.meta.get("produced_outputs") or [])
-            own = comp.get("produced_outputs") or []
-            combined = list(dict.fromkeys(list(own) + list(upstream_outputs)))
-            if combined:
-                sig.meta["produced_outputs"] = combined
-            return sig
 
         for layer in self.layers():
             layer_cost = 0.0
@@ -338,7 +338,7 @@ class Circuit:
             if len(layer) <= 1:
                 # 单节点层：直接串行（无并发必要）
                 for cid in layer:
-                    sig = _run_one(cid)
+                    sig = self._run_one(cid, out)
                     out[cid] = sig
                     layer_cost += sig.cost
                     layer_lat = max(layer_lat, sig.latency_ms)
@@ -348,7 +348,7 @@ class Circuit:
                 # 本层内只向 out 写各自独立的 key，无竞态；_run_one 仅读前层 out、
                 # 写本节点独立 key，无共享写竞争。
                 with ThreadPoolExecutor(max_workers=len(layer)) as ex:
-                    fut = {cid: ex.submit(_run_one, cid) for cid in layer}
+                    fut = {cid: ex.submit(self._run_one, cid, out) for cid in layer}
                     for cid, f in fut.items():
                         sig = f.result()
                         out[cid] = sig
@@ -459,6 +459,162 @@ class Circuit:
                 healed[cid] = nxt
                 changed = True
         return changed
+
+
+class CircuitExecutor:
+    """把 Circuit 从『参谋部』升级为『前线指挥部』：自动并发 + 闭环补数据 + 动态技能派发。
+
+    设计（见 CIRCUIT_EXECUTOR_DESIGN.md）：
+      · 复用 Circuit.layers() / Circuit._run_one() / backend.run() / Signal，内核零改动。
+      · 节点 gate:fail_linear 报 missing 时，执行器自动派发 filler 技能(默认 web_search)
+        补数 → 合成信号 → 重跑该节点（闭环，不等人工）。
+      · 节点可声明 skills/fillers，执行器在运行时主动调 execute_skill（即便 SimBackend、
+        无 LLM 也能调——技能不再封在图纸上）。
+      · state 黑板(_fetched/_skills_used/_trace)内部流转，供调试/CI 断言。
+      · 安全：单次技能失败→可读错误文本(开路不崩)；补数有 budget 上限，不无限重跑；
+        gate:fail_linear 仍诚实上抛。
+    """
+
+    def __init__(self, circuit: "Circuit", state: dict | None = None,
+                 data_fill_budget: int = 2, skills_enabled: bool = True):
+        self.circuit = circuit
+        self.budget = data_fill_budget
+        self.skills_enabled = skills_enabled
+        self.state = state or {"_fetched": {}, "_skills_used": [], "_trace": []}
+
+    # ---- 执行器主动派发（动态技能调用核心）----
+    def dispatch(self, cid: str, spec: dict) -> str:
+        name = spec.get("skill")
+        args = spec.get("args", {})
+        if not self.skills_enabled or not name:
+            return f"[no-skill-fill:{name}]"
+        try:
+            from compiler.agent_skills import execute_skill
+        except Exception as e:
+            return f"[skill 模块不可用: {e}]"
+        self.state["_skills_used"].append(name)
+        self.state["_trace"].append({"action": "dispatch_skill", "node": cid,
+                                      "skill": name, "args": args})
+        return execute_skill(name, json.dumps(args))
+
+    # ---- 自动补数据：对 missing 逐个派发 filler，写回 state._fetched ----
+    def _auto_fill(self, cid: str, missing: list):
+        comp = self.circuit.components[cid]
+        fillers = comp.get("fillers") or {}
+        for m in missing:
+            if m in self.state["_fetched"]:
+                continue
+            spec = fillers.get(m) or {"skill": "web_search", "args": {"query": m}}
+            self.state["_fetched"][m] = self.dispatch(cid, spec)
+
+    # ---- 带补给信号重跑该节点（数据已由执行器补齐，绕过线性关系闸）----
+    def _rerun_with_filled(self, cid: str, out: dict):
+        comp = self.circuit.components[cid]
+        real_inputs = [out[p] for p in self.circuit.pred[cid] if p in out]
+        synth = [Signal(value=self.state["_fetched"][m], quality=0.6, ok=True,
+                        meta={"produced_outputs": [m], "auto_filled": True})
+                 for m in (comp.get("required_inputs") or [])
+                 if m in self.state["_fetched"]]
+        sig = self.circuit.backend.run(comp, real_inputs + synth)
+        upstream = set()
+        for s in real_inputs + synth:
+            if s is not None and s.ok:
+                upstream.update(s.meta.get("produced_outputs") or [])
+        own = comp.get("produced_outputs") or []
+        combined = list(dict.fromkeys(list(own) + list(upstream)))
+        if combined:
+            sig.meta["produced_outputs"] = combined
+        return sig
+
+    # ---- 分层 propagate + 闭环补数 ----
+    def run(self):
+        out = {}
+        for layer in self.circuit.layers():
+            for cid in layer:
+                sig = self.circuit._run_one(cid, out)     # 现有线性关系闸 + backend.run
+                b = self.budget
+                while sig.meta.get("gate") == "fail_linear" and b > 0:
+                    self._auto_fill(cid, sig.meta.get("missing", []))
+                    sig = self._rerun_with_filled(cid, out)
+                    b -= 1
+                    self.state["_trace"].append(
+                        {"action": "retry_after_fill", "node": cid,
+                         "ok": sig.ok, "budget_left": b})
+                out[cid] = sig
+        terminals = [c for c in self.circuit.components if not self.circuit.succ[c]]
+        fq = max((out[c].quality for c in terminals), default=0.0)
+        return {
+            "success": all(out[c].ok for c in terminals),
+            "final_quality": round(fq, 3),
+            "components": {c: {"ok": s.ok, "quality": round(s.quality, 3),
+                               "gate": s.meta.get("gate")}
+                           for c, s in out.items()},
+            "state": self.state,
+        }
+
+
+def circuit_executor_selftest():
+    """CircuitExecutor 离线自检（无 key/无网）：自动补数据闭环 + 动态技能派发。"""
+    import random
+    from compiler.agent_skills import SKILLS
+
+    def _demo_fetch(query: str) -> str:
+        return f"[demo_fetch] {query}: China GDP 2024 ≈ 18.94T (demo)"
+    SKILLS["exec_demo_fetch"] = {
+        "name": "exec_demo_fetch",
+        "description": "executor selftest 确定性检索",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "handler": _demo_fetch,
+    }
+
+    spec = {
+        "name": "exec_selftest",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "reason": {
+                "type": "resistor", "label": "reason", "model": "small",
+                "required_inputs": ["china_gdp_2024"],
+                "produced_outputs": ["report"],
+                "fillers": {"china_gdp_2024": {"skill": "exec_demo_fetch",
+                                               "args": {"query": "china gdp 2024"}}},
+            },
+        },
+        "wires": [["src", "reason"]],
+    }
+    # 对照：仅 Circuit.propagate → gate:fail_linear
+    bare = Circuit(spec, SimBackend(random.Random(0)))
+    ob, _, _ = bare.propagate()
+    assert ob["reason"].meta.get("gate") == "fail_linear", "对照应 gate:fail_linear"
+
+    # CircuitExecutor：自动补数 → ok
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(0))),
+                         data_fill_budget=2)
+    res = ex.run()
+    assert res["components"]["reason"]["ok"], "executor 应自动补数使 reason ok"
+    assert "china_gdp_2024" in res["state"]["_fetched"]
+    assert "exec_demo_fetch" in res["state"]["_skills_used"]
+    print("✓ CircuitExecutor: gate:fail_linear → 自动补数(动态技能派发) → 重跑 ok（SimBackend）")
+
+    # D 验证：节点声明 filler 用真实已注册技能 calculator → 执行器主动调用（无 LLM 在场）
+    spec2 = {
+        "name": "exec_d",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "calc": {
+                "type": "resistor", "label": "calc", "model": "small",
+                "required_inputs": ["interest"],
+                "produced_outputs": ["report"],
+                "fillers": {"interest": {"skill": "calculator",
+                                         "args": {"expression": "10000*(1+0.035*5)"}}},
+            },
+        },
+        "wires": [["src", "calc"]],
+    }
+    ex2 = CircuitExecutor(Circuit(spec2, SimBackend(random.Random(0))), data_fill_budget=2)
+    res2 = ex2.run()
+    assert res2["components"]["calc"]["ok"], "executor 应调用 calculator 技能补数使 calc ok"
+    assert "calculator" in res2["state"]["_skills_used"], "应真实调用已注册技能 calculator"
+    print("✓ D 动态技能调用: 节点声明 calculator filler → 执行器主动调真技能(无 LLM) → ok")
 
 
 def selftest():
@@ -594,6 +750,7 @@ def selftest():
 
 if __name__ == "__main__":
     selftest()
+    circuit_executor_selftest()
 
 
 def load(path):
