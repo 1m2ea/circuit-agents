@@ -1430,16 +1430,6 @@ return sig
   - 全量 `python runtime.py` 通过（S1–S8 + CircuitExecutor 补数/动态技能/观察窗 + 3.5 进化，无 key/无网）。
 - **诚实边界**：完整性检查默认只挂在 `capacitor`（汇合节点）；`format_adapter`/`diode` 等中间节点未挂（如需可后续扩）。
   `mode="any"` 冗余汇合场景下，只要任一副本承运值非空即不算 incomplete（与"任一副本存活"语义一致）。
-### B. 规划前确认环（circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
-
-- **动机（用户待办）**：原架构 NL 直接编译，调度器不回述理解；若解析错方向，整条链编译错。需要"规划前确认环"——先回述理解、用户确认再编译。
-- **落点（`~/.workbuddy/skills/circuit-planner/scripts/plan.py`，规划入口 CLI）**：
-  - 新增纯函数 `_build_recap(nl, goal, mode)`：把规划器理解回述为可读摘要——能力步骤 / 依赖布线(并联·串联·DAG) / 约束(reliability/min_quality/max_cost/…) / 反馈环 / 子任务 IO。
-  - 新增 `--confirm` 开关：在**编译前**、且仅当**交互终端(TTY)**时打印摘要并 `input()` 等用户确认；非交互/CI/常驻自动模式（`--confirm` 未给，或非 TTY）**不阻断**，保持原自动规划行为。
-  - 新增 `--self-test`：离线断言 `_build_recap` 含关键字段（能力/依赖/DAG/约束），无需 TTY/网络。
-- **设计取舍**：确认环默认关闭，避免与"circuit-planner 常驻即自动"的偏好冲突；它是一项**安全闸门**（用户跑 plan.py 想先核对理解时显式 `--confirm` 开启）。取消编译返回 0（正常取消非错误）。
-- **验证**：`python plan.py --self-test` 离线通过；真实 NL 目标跑通（非 TTY 下确认环自动跳过，不阻断流程）。
-- **诚实边界**：`--confirm` 依赖真实 TTY 的 `input()`，CI/管道/常驻自动场景自动失效（不卡流程）；确认发生在「解析后、模板匹配/编译前」，回述的是 NL 解析出的初始理解（模板改写前的 goal）。
 
 ### B. 规划前确认环（circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
 
@@ -1451,3 +1441,19 @@ return sig
 - **设计取舍**：确认环默认关闭，避免与"circuit-planner 常驻即自动"的偏好冲突；它是一项**安全闸门**（用户跑 plan.py 想先核对理解时显式 `--confirm` 开启）。取消编译返回 0（正常取消非错误）。
 - **验证**：`python plan.py --self-test` 离线通过；真实 NL 目标跑通（非 TTY 下确认环自动跳过，不阻断流程）。
 - **诚实边界**：`--confirm` 依赖真实 TTY 的 `input()`，CI/管道/常驻自动场景自动失效（不卡流程）；确认发生在「解析后、模板匹配/编译前」，回述的是 NL 解析出的初始理解（模板改写前的 goal）。
+
+### C. 异构校验（runtime.py + compiler/backend_llm.py + circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
+
+- **动机（用户待办）**：原内核的质量门 / verify 节点与主链路同走一个 LLM 后端。同源 LLM 的系统性错误可能被自己的质量门放过（"自己审自己"）。需要"异构校验"——verify 节点走**独立后端（不同模型/供应商）**。
+- **落点**：
+  - `runtime.py`：
+    - `Circuit.__init__(spec, backend, verify_backend=None)` 新增 `verify_backend`；`Circuit._backend_for(comp)` 路由——组件 `label` 以 `verify` 前缀（如 `verify#quality`、`verify`）命中时走 `verify_backend`，否则走主 `backend`。
+    - `_run_one` 改用 `_backend_for(comp).run(...)`；当 `verify_backend` 未配置但组件是 verify 时，退回主 backend 并 `sig.meta["warnings"].append("hetero_verify_unconfigured")`（诚实告警，不静默）。
+    - `_rerun_with_filled` 同样走 `_backend_for`（补数重跑也保持异构）。
+    - `CircuitExecutor.__init__` 新增 `verify_backend` 参数，覆盖 `circuit.verify_backend`（子电路递归继承 `self.verify_backend`，保持异构一致）。
+  - `compiler/backend_llm.py`：新增 `resolve_verify_backend()` —— 读 `VERIFY_API_KEY` / `VERIFY_DEEPSEEK_API_KEY` 与 `VERIFY_API_BASE` / `VERIFY_OPENAI_BASE_URL`，配置齐全则返回一个独立 `LLMAgentBackend(...)`；否则返回 `None`（触发退回主 backend + 告警）。
+  - `circuit-planner/scripts/plan.py`：`_run_real` 接线 `Circuit(spec, backend, verify_backend=resolve_verify_backend())`，端到端启用异构校验。
+  - 新增 `hetero_verify_selftest()`（`_TagBackend` 标记 main/verify），纳入 `runtime.py __main__`。
+- **设计取舍**：verify 节点识别靠 `label` 前缀 `verify`（规划器/模板把校验类电阻标 `verify#xxx` 即可启用异构）；不强制改名主链路组件。**零回归**：未配置 `VERIFY_*` 时整条链退回旧行为（verify 走主 backend），仅多一条 `hetero_verify_unconfigured` 告警，普通执行不受影响。
+- **验证**：`hetero_verify_selftest` 离线通过——verify 节点走独立 backend、其余走主 backend、未配置时正确退回并告警；全量 `python runtime.py` 含该用例通过（无 key/无网）。
+- **诚实边界**：异构校验只解决"同源 LLM 自验证"风险，不保证 verify 后端一定更正确；必须用户另行配置 `VERIFY_*` 环境变量（独立 key/模型）才真正异构。未配置时它是"显性降级"而非"假装异构"。

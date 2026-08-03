@@ -89,6 +89,22 @@ def get_default_backend(api_key=None, rng=None, **kw):
         return LLMAgentBackend(api_key=key, **kw)
     return SimBackend(rng or random.Random(0))
 
+
+def resolve_verify_backend():
+    """C. 异构校验专用后端：用 VERIFY_API_KEY / VERIFY_API_BASE（可指向不同供应商/模型）。
+
+    未配置返回 None → verify 节点退回主 backend（同源），runtime 会打
+    ``hetero_verify_unconfigured`` 告警。配置则返回真 LLM 后端（与主 backend 不同 key/模型），
+    使质量门不被同源 LLM 错误放过。
+    """
+    key = os.environ.get("VERIFY_API_KEY") or os.environ.get("VERIFY_DEEPSEEK_API_KEY")
+    if not key:
+        return None
+    base = (os.environ.get("VERIFY_API_BASE")
+            or os.environ.get("VERIFY_OPENAI_BASE_URL"))
+    from compiler.llm_agents import LLMAgentBackend
+    return LLMAgentBackend(api_key=key.strip().lstrip("\ufeff"), base_url=base)
+
 # 每 1K token 的近似单价（USD）：仅用于成本估计，非账单级精确
 _PER_1K_COST = {
     "gpt-4o-mini": (0.00015, 0.00060),   # (输入价, 输出价)

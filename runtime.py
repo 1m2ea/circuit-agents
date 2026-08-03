@@ -270,9 +270,11 @@ class Watchdog:
 
 
 class Circuit:
-    def __init__(self, spec, backend):
+    def __init__(self, spec, backend, verify_backend=None):
         self.spec = spec
         self.backend = backend
+        # C. 异构校验：verify 节点可选的独立后端（不同模型/供应商），未配置则 None（退回主 backend）。
+        self.verify_backend = verify_backend
         self.components = spec["components"]
         self.feedback = spec.get("feedback")
         # 汇合节点完整性检查开关（A）：默认开；仅对『下游要求且本节点转发』的字段生效，
@@ -304,6 +306,14 @@ class Circuit:
                         nxt.append(m)
             ready = nxt
         return out
+
+    def _backend_for(self, comp):
+        """C. 异构校验路由：verify 节点且配置了独立 verify_backend 时走之；否则主 backend。"""
+        label = comp.get("label", "")
+        base = label.split("#")[0]   # 去多重集/冗余后缀（如 verify#2）
+        if base == "verify" and self.verify_backend is not None:
+            return self.verify_backend
+        return self.backend
 
     def _run_one(self, cid, out):
         """跑单个组件：先做『线性关系自测』(若有声明输入)，再调后端，
@@ -339,7 +349,11 @@ class Circuit:
                                     "missing": missing,
                                     "required": list(req),
                                     "node": cid})
-        sig = self.backend.run(comp, ins)
+        be = self._backend_for(comp)
+        sig = be.run(comp, ins)
+        # C. 异构校验未配置时的诚实告警：verify 节点仍在用同源主 backend
+        if comp.get("label", "").split("#")[0] == "verify" and self.verify_backend is None:
+            sig.meta.setdefault("warnings", []).append("hetero_verify_unconfigured")
         # 给产出信号打 produced_outputs 标：自身声明产出 ∪ 所有上游产出（累积透传）。
         # 关键：汇合(capacitor)/适配(format_adapter)等中间节点会把上游产物名继续向
         # 下游转发，于是下游核对线性关系时只需看「直接前驱信号的 produced_outputs」即可，
@@ -523,7 +537,8 @@ class CircuitExecutor:
                  evolve_enabled: bool = True, evolve_threshold: int = 5,
                  evolve_top_k: int = 3, evolve_skill: str = "web_search",
                  verbose: bool = False, on_event: "Optional[callable]" = None,
-                 events: "Optional[list]" = None, scope: str = ""):
+                 events: "Optional[list]" = None, scope: str = "",
+                 verify_backend: "Optional[object]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
@@ -539,6 +554,9 @@ class CircuitExecutor:
         self.verbose = verbose
         self.on_event = on_event
         self.scope = scope
+        # C. 异构校验：verify 节点走独立后端（不同模型/供应商）。解析为显式传入或沿用 circuit 既有配置。
+        self.verify_backend = verify_backend or getattr(circuit, "verify_backend", None)
+        self.circuit.verify_backend = self.verify_backend
         self.state = state or {"_fetched": {}, "_skills_used": [], "_trace": []}
         # 观察窗（B）：事件流 + 最终节点结果 + 补数/进化标记，供 executor_trace 渲染。
         self._events = events if events is not None else []
@@ -622,7 +640,7 @@ class CircuitExecutor:
                         meta={"produced_outputs": [m], "auto_filled": True})
                  for m in (comp.get("required_inputs") or [])
                  if m in self.state["_fetched"]]
-        sig = self.circuit.backend.run(comp, real_inputs + synth)
+        sig = self.circuit._backend_for(comp).run(comp, real_inputs + synth)
         upstream = set()
         for s in real_inputs + synth:
             if s is not None and s.ok:
@@ -693,7 +711,7 @@ class CircuitExecutor:
                 self._emit("evolve_spawn", sub_name=sub.get("name"),
                            from_node=from_key)
                 child = CircuitExecutor(
-                    Circuit(sub, self.circuit.backend),
+                    Circuit(sub, self.circuit.backend, verify_backend=self.verify_backend),
                     state=self.state,
                     data_fill_budget=self.budget,
                     skills_enabled=self.skills_enabled,
@@ -1102,10 +1120,45 @@ def selftest():
     print("\nruntime 线性关系自测全过 ✓（无 key / 无网络）")
 
 
+def hetero_verify_selftest():
+    """C. 异构校验离线自检（无 key/无网）：verify 节点走独立 backend，其余走主 backend。"""
+    class _TagBackend(Backend):
+        def __init__(self, tag):
+            self.tag = tag
+            self.served = []
+        def run(self, comp, inputs):
+            self.served.append(comp.get("label"))
+            return Signal(value=f"[{self.tag}:{comp.get('label')}]",
+                          quality=0.9, ok=True)
+    main = _TagBackend("main")
+    ver = _TagBackend("verify")
+    spec = {
+        "name": "het",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "reason": {"type": "resistor", "label": "reason", "model": "small"},
+            "V": {"type": "resistor", "label": "verify", "model": "small"},
+        },
+        "wires": [["src", "reason"], ["reason", "V"], ["src", "V"]],
+    }
+    c = Circuit(spec, main, verify_backend=ver)
+    c.propagate()
+    assert "reason" in main.served, "reason 应走主 backend"
+    assert "verify" in ver.served, "verify 应走独立 verify backend（异构）"
+    assert "reason" not in ver.served, "verify backend 不应服务非 verify 节点"
+    # 零回归：未配置 verify_backend → verify 退回主 backend
+    main2 = _TagBackend("main")
+    c2 = Circuit(spec, main2)
+    c2.propagate()
+    assert "verify" in main2.served, "未配置时 verify 退回主 backend（零回归）"
+    print("✓ C 异构校验：verify 节点走独立 backend，其余走主 backend；未配置则退回（零回归）")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
     circuit_executor_evolve_selftest()
+    hetero_verify_selftest()
 
 
 def load(path):
