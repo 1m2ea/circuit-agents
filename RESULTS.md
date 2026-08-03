@@ -1457,3 +1457,18 @@ return sig
 - **设计取舍**：verify 节点识别靠 `label` 前缀 `verify`（规划器/模板把校验类电阻标 `verify#xxx` 即可启用异构）；不强制改名主链路组件。**零回归**：未配置 `VERIFY_*` 时整条链退回旧行为（verify 走主 backend），仅多一条 `hetero_verify_unconfigured` 告警，普通执行不受影响。
 - **验证**：`hetero_verify_selftest` 离线通过——verify 节点走独立 backend、其余走主 backend、未配置时正确退回并告警；全量 `python runtime.py` 含该用例通过（无 key/无网）。
 - **诚实边界**：异构校验只解决"同源 LLM 自验证"风险，不保证 verify 后端一定更正确；必须用户另行配置 `VERIFY_*` 环境变量（独立 key/模型）才真正异构。未配置时它是"显性降级"而非"假装异构"。
+
+### D. 3.5 多任务进化增强（runtime.py，2026-08-03 续，已完成）
+
+- **动机（用户待办）**：原 `maybe_evolve` 只认「JSON 列表串且长度 > 阈值」，触发面窄、阈值写死、且业务侧无法主动要求「下一步就深挖」。需要把 3.5 进化从「仅 JSON 列表>阈值」扩为可配/更通用触发。
+- **落点（全在 `runtime.py`，C 异构校验代码之上，内核零回归）**：
+  - `_as_list` → `_countable(val)`：归一为 `(items, count)`，接受 **list/tuple/set/dict(按键数)/JSON 列表串**；普通字符串/数字/None 返回 `(None, 0)`（不触发，零误触发）。
+  - `maybe_evolve` 重写为两级触发：
+    - **② 显式提示队列** `state._evolve_requests`（形如 `[{"key":"frameworks","top_k":3}]`）：组件/技能可绕过阈值强制进化（top_k 可单条覆盖），置 `sub["_evolve_explicit"]=True`。
+    - **① 泛化自动发现**：对任意可计数集合，若 `count > 生效阈值` 则取前 `evolve_top_k` 条生成。
+  - **③ 阈值/取数可配**：生效 `evolve_threshold`/`evolve_top_k` 先读 `circuit.spec` 覆盖构造参数；并写入 `self._evolve_thr`/`self._evolve_top_k` 供观察窗 `evolve_detect` 事件显示真实生效值；事件新增 `explicit` 字段。
+  - `run()` 的 `evolve_detect` 事件改用生效阈值并显示 `explicit`；子电路递归契约不变（`evolve_enabled=False` 防无限递归）。
+  - 新增 `evolve_enhanced_selftest()`（D1 显式绕过阈值 / D2 非列表零误触发 / D3 dict 触发 / D4 spec 覆盖阈值 / D5 tuple 触发），纳入 `__main__`。
+- **设计取舍**：子电路形状（拼『分析 top-k』电阻）保持不变，只扩「何时触发」与「阈值来源」；显式提示是**业务侧拉闸**，默认队列为空 → 退旧自动行为。**零回归**：无非列表值误触发；未达阈值且无显式提示 → 返回 None，普通执行不受影响。
+- **验证**：`evolve_enhanced_selftest` 离线通过（5 项全绿）；既有 `circuit_executor_evolve_selftest`（research 8 框架>5 端到端递归）仍通过；全量 `python runtime.py` 通过（无 key/无网）。
+- **诚实边界**：进化仍是「检索到一堆 → 自动拼第二步」的启发式；显式提示只强制「触发」，不保证第二步子电路本身更对。`_evolve_requests` 目前由自检/下游组件注入，规划器尚未自动产出（可作为后续）。

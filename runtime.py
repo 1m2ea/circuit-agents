@@ -706,8 +706,9 @@ class CircuitExecutor:
                 self._evolved_from_node = src_node or from_key
                 self._emit("evolve_detect", from_node=self._evolved_from_node,
                            count=len(self.state["_fetched"].get(from_key, []) or []),
-                           threshold=self.evolve_threshold,
-                           top_k=self.evolve_top_k)
+                           threshold=getattr(self, "_evolve_thr", self.evolve_threshold),
+                           top_k=getattr(self, "_evolve_top_k", self.evolve_top_k),
+                           explicit=bool(sub.get("_evolve_explicit", False)))
                 self._emit("evolve_spawn", sub_name=sub.get("name"),
                            from_node=from_key)
                 child = CircuitExecutor(
@@ -744,39 +745,74 @@ class CircuitExecutor:
             "evolved": self.state.get("_evolved"),
         }
 
-    # ---- 3.5 多任务进化钩子：检索结果决定第二步拓扑 ----
-    def _as_list(self, val):
-        """若 state._fetched 的某值是（或可解析为）JSON 列表，返回该列表；否则 None。"""
-        if isinstance(val, list):
-            return val
+    # ---- 3.5 多任务进化增强（D）：泛化触发 + 显式提示 + 阈值可配 ----
+    def _countable(self, val):
+        """把 state._fetched 的某值归一为 (items, count)：
+        - list/tuple/set → 直接计数；
+        - dict → 按键计数（items 为键列表）；
+        - JSON 列表串 → 解析后计数；
+        其它（普通字符串/数字/None）→ (None, 0)，不触发进化（零回归，无误触发）。
+        """
+        if isinstance(val, (list, tuple, set)):
+            return list(val), len(val)
+        if isinstance(val, dict):
+            return list(val.keys()), len(val)
         if isinstance(val, str):
             s = val.strip()
             if s.startswith("["):
                 try:
                     parsed = json.loads(s)
                     if isinstance(parsed, list):
-                        return parsed
+                        return parsed, len(parsed)
                 except Exception:
-                    return None
-        return None
+                    return None, 0
+        return None, 0
 
     def maybe_evolve(self, state) -> "Optional[dict]":
-        """钩子（设计书 3.5）：扫描 state._fetched，若存在『JSON 列表且长度 > evolve_threshold』
-        的检索结果，取前 evolve_top_k 条动态拼出第二步『分析子电路』并返回其 spec；
-        否则返回 None（零回归，不影响普通执行）。
+        """钩子（设计书 3.5，D 增强）：扫描 state，决定第二步『分析子电路』是否生成。
+        零回归：无非列表值误触发；未达阈值且无显式提示 → 返回 None（普通执行不受影响）。
 
-        例：「研究最新 Agent 框架，发现 8 个(>5) → 重点分析最热 3 个」的第二步即由此生成并递归执行。
+        触发优先级：
+        ② 显式提示队列 state._evolve_requests（组件/技能可绕过阈值强制进化）：
+           形如 [{"key": "frameworks", "top_k": 3}, ...]，命中即生成（top_k 可单条覆盖）。
+        ① 泛化自动发现：对任意可计数集合（list/tuple/set/dict/JSON 列表串），
+           若 count > 生效阈值 → 取前 evolve_top_k 条生成。
+
+        生效阈值/取数：构造参数 evolve_threshold/evolve_top_k，可被 circuit.spec
+        的 evolve_threshold/evolve_top_k 覆盖（③ 可配）。
         """
         if not self.evolve_enabled:
             return None
-        for key, val in state.get("_fetched", {}).items():
-            items = self._as_list(val)
+        thr = self.circuit.spec.get("evolve_threshold", self.evolve_threshold)
+        top_k = self.circuit.spec.get("evolve_top_k", self.evolve_top_k)
+        self._evolve_thr = thr           # 供 run() 的 evolve_detect 事件用真实生效值
+        self._evolve_top_k = top_k
+        fetched = state.get("_fetched", {})
+
+        # ② 显式提示队列（绕过阈值）
+        for req in (state.get("_evolve_requests") or []):
+            key = req.get("key")
+            if not key or key not in fetched:
+                continue
+            items, _ = self._countable(fetched[key])
             if items is None:
                 continue
-            if len(items) > self.evolve_threshold:
-                chosen = items[: self.evolve_top_k]
+            k = req.get("top_k", top_k)
+            chosen = items[:k]
+            sub = self._build_subcircuit(key, chosen)
+            sub["_evolve_from"] = key
+            sub["_evolve_explicit"] = True
+            return sub
+
+        # ① 泛化自动发现：任意可计数集合且 count > 阈值
+        for key, val in fetched.items():
+            items, count = self._countable(val)
+            if items is None:
+                continue
+            if count > thr:
+                chosen = items[:top_k]
                 sub = self._build_subcircuit(key, chosen)
-                sub["_evolve_from"] = key     # 供渲染器定位触发进化的节点（紫⚠）
+                sub["_evolve_from"] = key
                 return sub
         return None
 
@@ -966,6 +1002,58 @@ def circuit_executor_evolve_selftest():
         "子电路事件应并入时间线(scope=evolve)"
     print("✓ 3.5 多任务进化: research 检索到 8 框架(>5) → 动态拼『分析 top3』子电路递归执行 → _evolved 存在且 analysis ok")
     print(f"✓ 观察窗(B): 进化来源节点={ex._evolved_from_node} · 子电路事件并入时间线(scope=evolve)")
+
+
+def evolve_enhanced_selftest():
+    """D 增强离线自检（无 key/无网）：验证三件套——
+    ① 任意可计数集合触发 ② 显式提示队列绕过阈值 ③ 阈值/取数可配（零回归：非列表不误触发）。
+    """
+    import random
+    base_spec = {"name": "ev", "components": {"s": {"type": "power", "label": "s"}},
+                 "wires": []}
+
+    def _mk(**kw):
+        return CircuitExecutor(Circuit({**base_spec}, SimBackend(random.Random(0))), **kw)
+
+    # D1 显式提示绕过阈值：列表仅 1 条(<=5) 但 _evolve_requests 强制
+    ex = _mk(evolve_threshold=5, evolve_top_k=3)
+    sub = ex.maybe_evolve({"_fetched": {"frameworks": ["LangGraph"]},
+                            "_evolve_requests": [{"key": "frameworks", "top_k": 1}]})
+    assert sub is not None, "显式提示应绕过阈值强制进化"
+    assert sub.get("_evolve_from") == "frameworks"
+    assert sub.get("_evolve_explicit") is True, "应标记显式进化"
+    print("✓ D 显式提示: 列表仅1条(<=阈值) 但 _evolve_requests 强制进化(_evolve_explicit)")
+
+    # D2 非列表值不误触发（普通字符串/数字）
+    ex2 = _mk(evolve_threshold=5, evolve_top_k=3)
+    assert ex2.maybe_evolve({"_fetched": {"x": "just a plain string"}}) is None, \
+        "普通字符串不应触发进化"
+    assert ex2.maybe_evolve({"_fetched": {"n": 42}}) is None, \
+        "数字不应触发进化"
+    print("✓ D 零误触发: 普通字符串/数字不触发进化")
+
+    # D3 dict 按 key 计数触发
+    ex3 = _mk(evolve_threshold=5, evolve_top_k=3)
+    d = {f"k{i}": i for i in range(6)}      # 6 键 > 5
+    sub3 = ex3.maybe_evolve({"_fetched": {"opts": d}})
+    assert sub3 is not None, "dict(6键)>5 应触发进化"
+    assert sub3.get("_evolve_from") == "opts"
+    print("✓ D 泛化触发: dict(6键)>阈值 触发进化(按 key 计数)")
+
+    # D4 阈值/取数可配：circuit.spec 覆盖构造参数
+    spec_lo = {**base_spec, "evolve_threshold": 2, "evolve_top_k": 2}
+    ex4 = CircuitExecutor(Circuit(spec_lo, SimBackend(random.Random(0))),
+                           evolve_threshold=5, evolve_top_k=3)
+    sub4 = ex4.maybe_evolve({"_fetched": {"items": ["a", "b", "c"]}})  # 3 > 2(spec)
+    assert sub4 is not None, "spec.evolve_threshold=2 应对 3 条触发"
+    assert ex4._evolve_thr == 2 and ex4._evolve_top_k == 2, "应取 spec 覆盖值"
+    print("✓ D 阈值可配: circuit.spec.evolve_threshold=2 对 3 条触发(覆盖构造参数)")
+
+    # D5 tuple/set 也可触发
+    ex5 = _mk(evolve_threshold=3, evolve_top_k=2)
+    assert ex5.maybe_evolve({"_fetched": {"s": ("a", "b", "c", "d")}}) is not None, \
+        "tuple(4)>3 应触发"
+    print("✓ D 泛化触发: tuple(4)>阈值 触发进化")
 
 
 def selftest():
@@ -1158,6 +1246,7 @@ if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
     circuit_executor_evolve_selftest()
+    evolve_enhanced_selftest()
     hetero_verify_selftest()
 
 
