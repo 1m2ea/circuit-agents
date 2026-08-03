@@ -558,6 +558,10 @@ class CircuitExecutor:
         self.verify_backend = verify_backend or getattr(circuit, "verify_backend", None)
         self.circuit.verify_backend = self.verify_backend
         self.state = state or {"_fetched": {}, "_skills_used": [], "_trace": []}
+        # ① 规划器接 evolve_requests：把 spec 顶层 evolve_requests 种进 state，
+        #    供 maybe_evolve 的显式提示队列消费（零回归：无则空列表，退旧自动行为）。
+        if "_evolve_requests" not in self.state:
+            self.state["_evolve_requests"] = list(self.circuit.spec.get("evolve_requests") or [])
         # 观察窗（B）：事件流 + 最终节点结果 + 补数/进化标记，供 executor_trace 渲染。
         self._events = events if events is not None else []
         self._t0 = None
@@ -743,6 +747,8 @@ class CircuitExecutor:
                            for c, s in out.items()},
             "state": self.state,
             "evolved": self.state.get("_evolved"),
+            "iterations": 1,
+            "self_healed": {},
         }
 
     # ---- 3.5 多任务进化增强（D）：泛化触发 + 显式提示 + 阈值可配 ----

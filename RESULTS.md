@@ -1472,3 +1472,14 @@ return sig
 - **设计取舍**：子电路形状（拼『分析 top-k』电阻）保持不变，只扩「何时触发」与「阈值来源」；显式提示是**业务侧拉闸**，默认队列为空 → 退旧自动行为。**零回归**：无非列表值误触发；未达阈值且无显式提示 → 返回 None，普通执行不受影响。
 - **验证**：`evolve_enhanced_selftest` 离线通过（5 项全绿）；既有 `circuit_executor_evolve_selftest`（research 8 框架>5 端到端递归）仍通过；全量 `python runtime.py` 通过（无 key/无网）。
 - **诚实边界**：进化仍是「检索到一堆 → 自动拼第二步」的启发式；显式提示只强制「触发」，不保证第二步子电路本身更对。`_evolve_requests` 目前由自检/下游组件注入，规划器尚未自动产出（可作为后续）。
+
+### ① 规划器自动产出显式进化提示（compiler/compile.py + runtime.py + circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
+
+- **动机（用户待办 + D 增强收口）**：D 让 `maybe_evolve` 支持显式提示队列 `state._evolve_requests`，但此前只能由自检/下游组件手动注入。要把它「接进规划器」——让 NL 规划在编译期自动判定「该进化」并写进 spec，闭环引擎（CircuitExecutor）消费。
+- **落点**：
+  - `compiler/compile.py`：新增 `_infer_evolve_requests(spec)` 启发式——扫描组件/连线，当某「检索/研究」类子任务（`label` ∈ retrieve/search/... 或其 produced 字段含 list/options/frameworks 等集合信号）存在下游「分析/推理」类子任务（`reason/analyze/compare/...`）消费同一集合字段时，对该字段发 `{"key": <字段名>, "top_k": 3}`；`compile_goal` 在返回 spec 前赋值 `spec["evolve_requests"]`（与 `binder_report` 同位置）。
+  - `runtime.py` `CircuitExecutor.__init__`：把 `circuit.spec.get("evolve_requests")` 种进 `state["_evolve_requests"]`，供 `maybe_evolve` 的显式提示队列消费（零回归：无则空列表，退旧自动行为）。
+  - `circuit-planner/scripts/plan.py` `_run_real`：由 `circuit.execute()`（仅 propagate，不跑进化/补数/异构）切换为 `CircuitExecutor(circuit).run()`——使规划器的真实执行走闭环引擎，**同时激活 A 自动补数 + C 异构校验 + D 进化**，并消费 spec.evolve_requests。为兼容原 `res` 打印，给 `CircuitExecutor.run()` 返回补 `iterations=1`/`self_healed={}`。
+- **设计取舍**：启发式只「建议」，是否真进化仍取决于该字段的检索值是否真为可计数集合（`maybe_evolve` 显式分支对非空壳列表才触发）；误提示无害（数据非列表则跳过）。把 spec 作为唯一载体，规划器→执行器零额外传参。**注意**：此改动让 plan.py 的真实执行从 propagate-only 升级为闭环引擎，是 ① 的必然代价（否则显式提示在规划器路径永不触发）。
+- **验证**：`python -m compiler.compile` 新增 `_planner_evolve_selftest` 离线通过（retrieve→reason + 集合字段 frameworks → 推断 evolve_requests=[{key:frameworks,top_k:3}]；CircuitExecutor 正确种进 state）；`python runtime.py` 全量仍绿（含 C/D 回归）。`plan.py --self-test` 不受影响。
+- **诚实边界**：启发式依赖 capability/字段命名约定（CAPABILITY_VOCAB + 集合 token 词表）；若模型把「研究」输出命名成非集合词，可能漏提示。真异构仍需 ③ 配 VERIFY_*；本块只负责「规划器发出进化意图」。
