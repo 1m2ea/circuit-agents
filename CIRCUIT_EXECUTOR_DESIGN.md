@@ -269,7 +269,8 @@ class CircuitExecutor:
 `evolve_detect`/`evolve_spawn`（3.5）→ 子电路递归 → `done`。节点最终状态写 `self._results`，
 补数节点记 `self._filled_nodes`，进化来源节点反查记 `self._evolved_from_node`。
 
-**渲染器 `compiler/executor_trace.py`**：
+**渲染器 `compiler/trace_renderer.py`（仓库内唯一源码）**：
+`compiler/executor_trace.py` 现仅作向后兼容重导出（`from .trace_renderer import render_executor_trace`），调用方零改动。
 `render_executor_trace(executor, title, out_path)` 把事件流 + 拓扑渲染成自包含 HTML：
 - 拓扑图：节点按最终状态四色着色（绿✓完成 / 红✗失败 / 橙虚框=补数闭环 / 紫⚠=触发 3.5 进化），
   复用 circuit-planner 的复盘配色约定。

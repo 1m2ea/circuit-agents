@@ -65,7 +65,7 @@
 <body>
 <header>
   <h1>Executor 观察窗 · ① 自动补数闭环</h1>
-  <div class="summary"><span class="k">总耗时</span> 0ms &nbsp;·&nbsp; <span class="k">总成本</span> $0.0010 &nbsp;·&nbsp; <span class="k">末级延迟</span> 200ms &nbsp;·&nbsp; <span class="k">3.5 进化</span> 否</div>
+  <div class="summary"><span class="k">总耗时</span> 1ms &nbsp;·&nbsp; <span class="k">总成本</span> $0.0010 &nbsp;·&nbsp; <span class="k">末级延迟</span> 200ms &nbsp;·&nbsp; <span class="k">进化</span> 否</div>
 </header>
 <div class="wrap">
   <div class="card topo-card">
@@ -85,7 +85,7 @@
       <span><i style="background:#e8f5e9;border:1.5px solid var(--green)"></i>完成 ✓</span>
       <span><i style="background:#ffebee;border:1.5px solid var(--red)"></i>失败 ✗</span>
       <span><i style="background:#eef2f5;border:2.5px dashed var(--orange)"></i>补数闭环</span>
-      <span><i style="background:#eef2f5;border:2.5px solid var(--purple)"></i>触发 3.5 进化 ⚠</span>
+      <span><i style="background:#eef2f5;border:2.5px solid var(--purple)"></i>触发进化 ⚠</span>
     </div>
   </div>
   <div class="card tl-card">
@@ -99,27 +99,27 @@
         <option value="2">2×</option>
         <option value="4">4×</option>
       </select>
-      <input id="seek" type="range" min="0" max="300.2" value="0" step="10">
+      <input id="seek" type="range" min="0" max="301.0" value="0" step="10">
     </div>
     <div id="tl"><div class="ev" data-t="0.0" data-node="" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">开始执行</span> <span class="detail">spec=exec_showcase_fill  nodes=2  layers=2</span></div>
 <div class="ev" data-t="0.0" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层开始</span> <span class="detail">layer_idx=0  nodes=[&#x27;src&#x27;]</span></div>
 <div class="ev" data-t="0.0" data-node="src" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">节点开始</span> </div>
-<div class="ev" data-t="0.0" data-node="src" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">节点完成</span> <span class="detail">ok=True  quality=1.0  retried=False</span></div>
-<div class="ev" data-t="0.0" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层完成</span> <span class="detail">layer_idx=0</span></div>
-<div class="ev" data-t="0.0" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层开始</span> <span class="detail">layer_idx=1  nodes=[&#x27;reason&#x27;]</span></div>
-<div class="ev" data-t="0.0" data-node="reason" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">节点开始</span> </div>
-<div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot red"></span><span class="t">+0ms</span> <span class="etype">线性关系闸未过(缺数据)</span> <span class="detail">missing=china_gdp_2024</span></div>
+<div class="ev" data-t="0.1" data-node="src" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">节点完成</span> <span class="detail">ok=True  quality=1.0  retried=False</span></div>
+<div class="ev" data-t="0.1" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层完成</span> <span class="detail">layer_idx=0</span></div>
+<div class="ev" data-t="0.1" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层开始</span> <span class="detail">layer_idx=1  nodes=[&#x27;reason&#x27;]</span></div>
+<div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">节点开始</span> </div>
+<div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot red"></span><span class="t">+0ms</span> <span class="etype">闸未过(缺数据)</span> <span class="detail">missing=china_gdp_2024</span></div>
 <div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot orange"></span><span class="t">+0ms</span> <span class="etype">技能调用</span> <span class="detail">skill=@ci_demo_fetch  args={&#x27;query&#x27;: &#x27;china gdp 2024&#x27;}</span></div>
 <div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">技能返回</span> <span class="detail">skill=@ci_demo_fetch  ok=True  length=46</span></div>
-<div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot orange"></span><span class="t">+0ms</span> <span class="etype">补数后重试</span> <span class="detail">ok=True  budget_left=1  filled=False</span></div>
-<div class="ev" data-t="0.1" data-node="reason" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">节点完成</span> <span class="detail">ok=True  quality=0.679  retried=True</span></div>
-<div class="ev" data-t="0.1" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层完成</span> <span class="detail">layer_idx=1</span></div>
-<div class="ev" data-t="0.2" data-node="" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">执行完成</span> <span class="detail">total_cost=0.001  total_latency_ms=200  final_quality=0.679</span></div></div>
+<div class="ev" data-t="0.2" data-node="reason" data-scope=""><span class="dot orange"></span><span class="t">+0ms</span> <span class="etype">补数后重试</span> <span class="detail">ok=True  budget_left=1  filled=False</span></div>
+<div class="ev" data-t="0.2" data-node="reason" data-scope=""><span class="dot green"></span><span class="t">+0ms</span> <span class="etype">节点完成</span> <span class="detail">ok=True  quality=0.679  retried=True</span></div>
+<div class="ev" data-t="0.2" data-node="" data-scope=""><span class="dot blue"></span><span class="t">+0ms</span> <span class="etype">层完成</span> <span class="detail">layer_idx=1</span></div>
+<div class="ev" data-t="1.0" data-node="" data-scope=""><span class="dot green"></span><span class="t">+1ms</span> <span class="etype">执行完成</span> <span class="detail">total_cost=0.001  total_latency_ms=200  final_quality=0.679</span></div></div>
   </div>
 </div>
 <script>
   const rows = Array.from(document.querySelectorAll('#tl .ev'));
-  const maxT = 300.2;
+  const maxT = 301.0;
   const evolvedFrom = "";
   let vit = 0, playing = false, speed = 1, timer = null;
 
