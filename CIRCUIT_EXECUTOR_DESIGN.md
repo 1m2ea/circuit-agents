@@ -146,7 +146,13 @@ for node in 拓扑(分层):
 - 例："研究最新 AI Agent 框架，若发现 >5 个，重点分析最热 3 个" → 第一步检索结果写
   `state`，`CircuitExecutor` 据计数动态拼出第二步子电路（分析 top3）并入队执行。
 - 实现：在 `run()` 末尾加 `maybe_evolve(state) -> Optional[sub_spec]`，非空则递归执行。
-- 本阶段先留接口与 PoC 钩子，不强制全做。
+- **已实现（最小可用，见 runtime.py `CircuitExecutor.maybe_evolve` / `_as_list` / `_build_subcircuit`）**：
+  `maybe_evolve` 默认扫描 `state._fetched` 中「JSON 列表且长度 > `evolve_threshold`(默认5)」的检索结果，
+  取前 `evolve_top_k`(默认3) 条动态拼出第二步「分析子电路」并递归执行（子电路 `evolve_enabled=False` 防无限递归），
+  结果存 `state["_evolved"]`。离线自检 `circuit_executor_evolve_selftest` 已验证
+  「research 检索到 8 框架(>5) → 拼『分析 top3』子电路递归 → `_evolved` 存在且 analysis ok」。
+  接入点：`compiler/demo.py --executor`（末尾跑 `run_executor_showcase` 演示 ① 补数闭环 ② 多任务进化）；
+  `compiler/verify_drift_smoke.py --executor`（剥映射→执行器自动补数救活节点，CI 闭环冒烟）。
 
 ---
 

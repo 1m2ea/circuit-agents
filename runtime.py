@@ -19,7 +19,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 # ---- 看门狗（健康自检）常量 ----
@@ -476,10 +476,16 @@ class CircuitExecutor:
     """
 
     def __init__(self, circuit: "Circuit", state: dict | None = None,
-                 data_fill_budget: int = 2, skills_enabled: bool = True):
+                 data_fill_budget: int = 2, skills_enabled: bool = True,
+                 evolve_enabled: bool = True, evolve_threshold: int = 5,
+                 evolve_top_k: int = 3, evolve_skill: str = "web_search"):
         self.circuit = circuit
         self.budget = data_fill_budget
         self.skills_enabled = skills_enabled
+        self.evolve_enabled = evolve_enabled
+        self.evolve_threshold = evolve_threshold
+        self.evolve_top_k = evolve_top_k
+        self.evolve_skill = evolve_skill
         self.state = state or {"_fetched": {}, "_skills_used": [], "_trace": []}
 
     # ---- 执行器主动派发（动态技能调用核心）----
@@ -543,13 +549,96 @@ class CircuitExecutor:
                 out[cid] = sig
         terminals = [c for c in self.circuit.components if not self.circuit.succ[c]]
         fq = max((out[c].quality for c in terminals), default=0.0)
+        total_cost = sum(s.cost for s in out.values())
+        total_lat = max((s.latency_ms for s in out.values()), default=0.0)
+
+        # 3.5 多任务进化：检索结果(写入 state._fetched)决定第二步拓扑
+        evolved = None
+        if self.evolve_enabled:
+            sub = self.maybe_evolve(self.state)
+            if sub is not None:
+                child = CircuitExecutor(
+                    Circuit(sub, self.circuit.backend),
+                    state=self.state,
+                    data_fill_budget=self.budget,
+                    skills_enabled=self.skills_enabled,
+                    evolve_enabled=False,          # 子电路不再进化，防无限递归
+                )
+                evolved = child.run()
+                self.state["_evolved"] = {
+                    "spec_name": sub.get("name"),
+                    "result": evolved,
+                }
+
         return {
             "success": all(out[c].ok for c in terminals),
             "final_quality": round(fq, 3),
+            "total_cost": round(total_cost, 4),
+            "total_latency_ms": total_lat,
             "components": {c: {"ok": s.ok, "quality": round(s.quality, 3),
                                "gate": s.meta.get("gate")}
                            for c, s in out.items()},
             "state": self.state,
+            "evolved": self.state.get("_evolved"),
+        }
+
+    # ---- 3.5 多任务进化钩子：检索结果决定第二步拓扑 ----
+    def _as_list(self, val):
+        """若 state._fetched 的某值是（或可解析为）JSON 列表，返回该列表；否则 None。"""
+        if isinstance(val, list):
+            return val
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    return None
+        return None
+
+    def maybe_evolve(self, state) -> "Optional[dict]":
+        """钩子（设计书 3.5）：扫描 state._fetched，若存在『JSON 列表且长度 > evolve_threshold』
+        的检索结果，取前 evolve_top_k 条动态拼出第二步『分析子电路』并返回其 spec；
+        否则返回 None（零回归，不影响普通执行）。
+
+        例：「研究最新 Agent 框架，发现 8 个(>5) → 重点分析最热 3 个」的第二步即由此生成并递归执行。
+        """
+        if not self.evolve_enabled:
+            return None
+        for key, val in state.get("_fetched", {}).items():
+            items = self._as_list(val)
+            if items is None:
+                continue
+            if len(items) > self.evolve_threshold:
+                chosen = items[: self.evolve_top_k]
+                return self._build_subcircuit(key, chosen)
+        return None
+
+    def _build_subcircuit(self, src_key, chosen):
+        """据检索到的 top-k 条目，拼出第二步『分析子电路』spec。"""
+        chosen_text = json.dumps(chosen, ensure_ascii=False)
+        arg_key = "query" if self.evolve_skill == "web_search" else "items"
+        arg_val = (f"深入分析最热{len(chosen)}项: {chosen_text}"
+                   if self.evolve_skill == "web_search" else chosen_text)
+        in_name = f"top_{src_key}"
+        return {
+            "name": f"evolve_{src_key}",
+            "components": {
+                "src": {"type": "power", "label": "task"},
+                "analyze": {
+                    "type": "resistor", "label": f"analyze_{src_key}",
+                    "model": "small",
+                    "required_inputs": [in_name],
+                    "produced_outputs": ["analysis"],
+                    "fillers": {in_name: {
+                        "skill": self.evolve_skill,
+                        "args": {arg_key: arg_val},
+                    }},
+                },
+            },
+            "wires": [["src", "analyze"]],
         }
 
 
@@ -615,6 +704,64 @@ def circuit_executor_selftest():
     assert res2["components"]["calc"]["ok"], "executor 应调用 calculator 技能补数使 calc ok"
     assert "calculator" in res2["state"]["_skills_used"], "应真实调用已注册技能 calculator"
     print("✓ D 动态技能调用: 节点声明 calculator filler → 执行器主动调真技能(无 LLM) → ok")
+
+
+def circuit_executor_evolve_selftest():
+    """3.5 多任务进化离线自检（无 key/无网）：检索结果决定第二步拓扑。
+
+    构造 research 节点缺 `frameworks`，filler 用 ci_list_search 返回 JSON 列表(8 条)。
+    执行器自动补数后，state._fetched["frameworks"] 是列表且 8>5(阈值) → maybe_evolve
+    动态拼出『分析 top3』子电路并递归执行 → state._evolved 存在且分析节点 ok。
+    """
+    import random
+    from compiler.agent_skills import SKILLS
+
+    def _list_search(query):
+        return json.dumps(
+            ["LangGraph", "AutoGen", "CrewAI", "MetaGPT",
+             "AgencySwarm", "OpenAI Swarm", "PhiData", "AgentOps"],
+            ensure_ascii=False)
+    SKILLS["ci_list_search"] = {
+        "name": "ci_list_search",
+        "description": "返回最新 Agent 框架列表(JSON)",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "handler": _list_search,
+    }
+
+    def _analyze(items):
+        return f"[analysis] 重点分析: {items}"
+    SKILLS["ci_analyze"] = {
+        "name": "ci_analyze",
+        "description": "分析 top-k 框架",
+        "parameters": {"type": "object", "properties": {"items": {"type": "string"}}},
+        "handler": _analyze,
+    }
+
+    spec = {
+        "name": "research_agents",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "research": {
+                "type": "resistor", "label": "research", "model": "small",
+                "required_inputs": ["frameworks"],
+                "produced_outputs": ["report"],
+                "fillers": {"frameworks": {"skill": "ci_list_search",
+                                           "args": {"query": "latest agent frameworks"}}},
+            },
+        },
+        "wires": [["src", "research"]],
+    }
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(0))),
+                         data_fill_budget=2, evolve_skill="ci_analyze",
+                         evolve_threshold=5, evolve_top_k=3)
+    res = ex.run()
+    assert res["components"]["research"]["ok"], "research 应自动补数 ok"
+    assert "frameworks" in res["state"]["_fetched"], "应补到 frameworks"
+    assert "_evolved" in res["state"], "检索 8 条(>5) 应触发多任务进化 _evolved"
+    ev = res["state"]["_evolved"]
+    assert ev["result"]["components"].get("analyze", {}).get("ok"), \
+        "进化出的分析子电路 analyze 应 ok"
+    print("✓ 3.5 多任务进化: research 检索到 8 框架(>5) → 动态拼『分析 top3』子电路递归执行 → _evolved 存在且 analysis ok")
 
 
 def selftest():
@@ -751,6 +898,7 @@ def selftest():
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
+    circuit_executor_evolve_selftest()
 
 
 def load(path):

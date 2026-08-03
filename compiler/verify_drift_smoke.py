@@ -35,7 +35,7 @@ for p in (_ROOT, _HERE):
 from compiler.nl_parser import GoalParser                         # noqa: E402
 from compiler.compile import compile_goal                          # noqa: E402
 from compiler.backend_llm import resolve_api_key                    # noqa: E402
-from runtime import Circuit, SimBackend, Signal                    # noqa: E402
+from runtime import Circuit, SimBackend, Signal, CircuitExecutor         # noqa: E402
 
 
 # 内置确定性漂移样例（CI 零参一键冒烟用）：A 产 gdp_china_2024、B 产 gdp_per_capita、
@@ -123,6 +123,65 @@ def _offline(subtasks, reliability, expect_exact, expect_contains, verbose):
     return 0
 
 
+def _offline_executor(subtasks, reliability, verbose):
+    """--executor 离线 CI 分支：验证 CircuitExecutor 的『自动补数据闭环』。
+
+    原漂移节点靠 input_map 消解命名漂移；本分支先剥掉映射（强制 gate:fail_linear），
+    再给缺失输入注入确定性 CI 补数技能(ci_demo_fill)，跑 CircuitExecutor.run()，
+    断言原本 fail 的节点被自动补数救活（ok=True）。证明『去掉映射后执行器自动补数闭环』。
+    不污染正式技能注册表（ci_demo_fill 仅本函数内注册）。
+    """
+    print("=== [离线模式 · Executor 分支] 剥映射 → 执行器自动补数闭环 → 救活节点 ===")
+    goal = GoalParser._goal_from_subtasks(
+        {"subtasks": subtasks, "reliability": reliability or "normal"})
+    if verbose:
+        print("component_io:", json.dumps(goal.component_io, ensure_ascii=False, indent=2))
+
+    spec = compile_goal(goal, auto_bind=True, route=True)
+    drift_cids = [cid for cid, c in spec["components"].items()
+                  if c.get("type") == "resistor" and c.get("input_map")]
+    if not drift_cids:
+        print("· 无带映射的电阻节点，Executor 闭环无靶可验（零回归）。")
+        return 0
+
+    # 注入确定性 CI 补数技能（不污染正式注册表）
+    from compiler.agent_skills import SKILLS
+    SKILLS.setdefault("ci_demo_fill", {
+        "name": "ci_demo_fill", "description": "CI 确定性补数",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "handler": lambda q: f"[ci_demo_fill] 已补齐缺失数据: {q}",
+    })
+
+    # 剥掉映射（强制 gate:fail_linear），并给每个缺失输入挂确定性 filler
+    for cid in drift_cids:
+        comp = spec["components"][cid]
+        req = comp.get("required_inputs") or []
+        comp.pop("input_map", None)
+        comp["fillers"] = {m: {"skill": "ci_demo_fill", "args": {"query": m}}
+                           for m in req}
+
+    # 先证因果性：剥映射后裸 Circuit.propagate 必 gate:fail_linear
+    out_bare, _, _ = Circuit(spec, SimBackend(random.Random(0))).propagate()
+    for cid in drift_cids:
+        s = out_bare.get(cid)
+        g = (s.meta or {}).get("gate") if s else "NO_SIGNAL"
+        assert g == "fail_linear", \
+            f"因果性失败：剥映射后 {cid} 应 gate:fail_linear，实际 gate={g}"
+
+    # 执行器：自动补数闭环（派发 ci_demo_fill → 合成信号 → 重跑）
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(0))), data_fill_budget=2)
+    res = ex.run()
+    for cid in drift_cids:
+        s = res["components"].get(cid, {})
+        assert s.get("ok"), f"Executor 应自动补数使 {cid} ok，实际 {s}"
+    assert "ci_demo_fill" in res["state"]["_skills_used"], \
+        "应真实派发 ci_demo_fill 补数技能"
+    print(f"✓ Executor 闭环冒烟通过：剥映射后 {drift_cids} 经执行器自动补数均 ok=True")
+    print(f"  _skills_used={res['state']['_skills_used']}")
+    print(f"  _trace={json.dumps(res['state']['_trace'], ensure_ascii=False)}")
+    return 0
+
+
 def _collect_input_maps_from_goal(goal):
     m = {}
     for node, io in (goal.component_io or {}).items():
@@ -200,6 +259,10 @@ def main(argv=None):
     ap.add_argument("--reliability", default="normal",
                     help="goal.reliability（默认 normal）")
     ap.add_argument("--verbose", action="store_true", help="打印 component_io 明细")
+    ap.add_argument("--executor", action="store_true",
+                    help="离线模式附加：用 CircuitExecutor 自动补数闭环跑 CI 冒烟"
+                         "（剥映射→强制 fail→执行器补数救活；断言节点 ok）。"
+                         "仅离线模式有意义，--online 下忽略。")
     args = ap.parse_args(argv)
 
     if args.online and not args.nl:
@@ -207,6 +270,9 @@ def main(argv=None):
         return 2
     if args.execute and not args.online:
         print("⚠ --execute 仅在 --online 下有意义，已忽略（离线模式本就执行 SimBackend）")
+    if args.executor and args.online:
+        print("⚠ --executor 仅在离线模式下有意义，--online 已忽略该开关")
+        args.executor = False
     if not args.online and args.nl:
         print("⚠ 离线模式忽略 --nl（离线不调 LLM；请用 --subtasks 或 --demo）")
         args.nl = None
@@ -226,6 +292,8 @@ def main(argv=None):
         else:
             with open(args.subtasks_file, "r", encoding="utf-8") as f:
                 subtasks = json.load(f)
+        if args.executor:
+            return _offline_executor(subtasks, args.reliability, args.verbose)
         return _offline(subtasks, args.reliability, expect_exact,
                         expect_contains, args.verbose)
     except AssertionError as e:

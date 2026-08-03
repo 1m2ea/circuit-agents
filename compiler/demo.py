@@ -6,6 +6,7 @@ circuit-agents · compiler.demo
 运行：  python -m compiler.demo   （在 circuit-agents/ 下）
   或：  python compiler/demo.py
 """
+import argparse
 import json
 import os
 import random
@@ -30,7 +31,7 @@ def _fmt(m):
             f"feasible={'✓' if m['feasible'] else '✗'}")
 
 
-def _simulate(spec, g, seed=7, runs=300, api_key=None):
+def _simulate(spec, g, seed=7, runs=300, api_key=None, executor=False):
     """多次仿真取均值（由主种子派生的确定性 rng）。返回聚合指标 dict。
 
     指标说明（无 feedback 环时 runtime.success 恒 True，故用更有信息量的量）：
@@ -57,7 +58,10 @@ def _simulate(spec, g, seed=7, runs=300, api_key=None):
     for _ in range(runs):
         r = random.Random(rng.random())
         circ = runtime.Circuit(spec, backend)
-        res = circ.execute()
+        if executor:
+            res = runtime.CircuitExecutor(circ, skills_enabled=True).run()
+        else:
+            res = circ.execute()
         cost += res["total_cost"]
         lat += res["total_latency_ms"]
         q += res["final_quality"]
@@ -86,7 +90,7 @@ def _print_metrics(sim):
           f"quality_if_all_fired={sim['ceiling']:.3f}")
 
 
-def run_case(title, goal_dict, tiers=None, seed=7, runs=300, router=False):
+def run_case(title, goal_dict, tiers=None, seed=7, runs=300, router=False, executor=False):
     g = Goal.from_dict(goal_dict)
     if router:
         spec = Router(default_tier="small").route(g, tiers=tiers)
@@ -98,7 +102,7 @@ def run_case(title, goal_dict, tiers=None, seed=7, runs=300, router=False):
     print("rationale:", spec["rationale"])
 
     # Circuit 直接吃 spec dict（无需落临时文件），与 Optimizer 共用同一 Evaluator 路径。
-    sim = _simulate(spec, g, seed, runs)
+    sim = _simulate(spec, g, seed, runs, executor=executor)
     _print_metrics(sim)
 
     # 约束检查（约束违反最终由 Optimizer(M3) 处理）
@@ -117,7 +121,7 @@ def run_case(title, goal_dict, tiers=None, seed=7, runs=300, router=False):
     return spec
 
 
-def run_nl_case(nl, api_key=None, seed=7, runs=300, router=True):
+def run_nl_case(nl, api_key=None, seed=7, runs=300, router=True, executor=False):
     """M4 端到端：自然语言 → GoalParser → compile_goal(auto_bind+route) → Circuit 仿真。
 
     默认尝试真模型：api_key 留空(None)时会自动解析（环境变量 DEEPSEEK/OPENAI/AGENT
@@ -138,7 +142,7 @@ def run_nl_case(nl, api_key=None, seed=7, runs=300, router=True):
         print(f"Binder: tiers={rep.get('tiers')}  feasible={rep.get('feasible')}")
     print("rationale:", spec["rationale"])
 
-    sim = _simulate(spec, goal, seed, runs, api_key=key)
+    sim = _simulate(spec, goal, seed, runs, api_key=key, executor=executor)
     _print_metrics(sim)
 
     c = goal.constraints
@@ -156,7 +160,97 @@ def run_nl_case(nl, api_key=None, seed=7, runs=300, router=True):
     return spec
 
 
+def run_executor_showcase(seed=7):
+    """Executor 模式展示（离线、确定性）：自动补数据闭环 + 3.5 多任务进化。
+
+    不污染正式技能注册表：在本地临时注册确定性 CI 技能（ci_demo_fetch/ci_list_search/ci_analyze），
+    跑两个专为演示而建的小拓扑，打印 state._trace 与 state._evolved，让 --executor 开关可见其价值。
+    """
+    import random
+    from compiler.agent_skills import SKILLS
+
+    def _fetch(query):
+        return f"[demo] {query}: China GDP 2024 ≈ 18.94T"
+    SKILLS.setdefault("ci_demo_fetch", {
+        "name": "ci_demo_fetch", "description": "demo 确定性检索",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "handler": _fetch})
+
+    def _list_search(query):
+        return json.dumps(
+            ["LangGraph", "AutoGen", "CrewAI", "MetaGPT",
+             "AgencySwarm", "OpenAI Swarm", "PhiData", "AgentOps"],
+            ensure_ascii=False)
+    SKILLS.setdefault("ci_list_search", {
+        "name": "ci_list_search", "description": "最新 Agent 框架列表(JSON)",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "handler": _list_search})
+
+    def _analyze(items):
+        return f"[analysis] 重点分析: {items}"
+    SKILLS.setdefault("ci_analyze", {
+        "name": "ci_analyze", "description": "分析 top-k 框架",
+        "parameters": {"type": "object", "properties": {"items": {"type": "string"}}},
+        "handler": _analyze})
+
+    # 演示 ①：节点缺数据 → 执行器自动派发检索补数 → 闭环重跑 ok
+    spec1 = {
+        "name": "exec_showcase_fill",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "reason": {"type": "resistor", "label": "reason", "model": "small",
+                       "required_inputs": ["china_gdp_2024"],
+                       "produced_outputs": ["report"],
+                       "fillers": {"china_gdp_2024": {"skill": "ci_demo_fetch",
+                                                      "args": {"query": "china gdp 2024"}}}},
+        },
+        "wires": [["src", "reason"]],
+    }
+    ex1 = runtime.CircuitExecutor(
+        runtime.Circuit(spec1, runtime.SimBackend(random.Random(seed))),
+        data_fill_budget=2)
+    r1 = ex1.run()
+    print("\n=== Executor 展示 ① · 自动补数据闭环 ===")
+    print(f"  reason ok={r1['components']['reason']['ok']}  已派发技能={r1['state']['_skills_used']}")
+    print(f"  _trace: {json.dumps(r1['state']['_trace'], ensure_ascii=False)}")
+
+    # 演示 ②：检索结果(8 条) > 阈值(5) → 多任务进化拼『分析 top3』子电路递归执行
+    spec2 = {
+        "name": "exec_showcase_evolve",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "research": {"type": "resistor", "label": "research", "model": "small",
+                         "required_inputs": ["frameworks"],
+                         "produced_outputs": ["report"],
+                         "fillers": {"frameworks": {"skill": "ci_list_search",
+                                                    "args": {"query": "latest agent frameworks"}}}},
+        },
+        "wires": [["src", "research"]],
+    }
+    ex2 = runtime.CircuitExecutor(
+        runtime.Circuit(spec2, runtime.SimBackend(random.Random(seed))),
+        data_fill_budget=2, evolve_skill="ci_analyze",
+        evolve_threshold=5, evolve_top_k=3)
+    r2 = ex2.run()
+    ev = r2["state"].get("_evolved")
+    print("\n=== Executor 展示 ② · 3.5 多任务进化（检索结果决定第二步拓扑）===")
+    n_found = len(json.loads(r2["state"]["_fetched"]["frameworks"]))
+    print(f"  检索到框架数={n_found}  触发进化={'是' if ev else '否'}")
+    if ev:
+        print(f"  进化子电路={ev['spec_name']}  analysis ok={ev['result']['components'].get('analyze', {}).get('ok')}")
+        print(f"  _evolved 子电路 _skills_used={ev['result']['state']['_skills_used']}")
+    print("\n注：--executor 下 _simulate 用 CircuitExecutor 替代 circ.execute()；"
+          "反馈环(max_iter 重试)类场景指标会与 execute() 略有差异（执行器做单次传播+补数闭环）。")
+
+
 def main():
+    ap = argparse.ArgumentParser(
+        description="circuit-agents 端到端 demo（Goal → 编译 → 执行 → 指标）")
+    ap.add_argument("--executor", action="store_true",
+                    help="用 CircuitExecutor（自动补数据闭环 + 3.5 多任务进化）"
+                         "替代 circ.execute()；并在末尾跑 Executor 模式展示")
+    args = ap.parse_args()
+
     # COMPILER.md §9 走查目标
     goal = {
         "name": "pdf_summarize_verify",
@@ -168,7 +262,8 @@ def main():
     }
 
     # (a) 基线：默认 small 档 → 能力上限仅 0.70，预期不达标（引出 M1 Binder 的必要性）
-    spec_a = run_case("A · 默认 small 档（基线：能力上限仅 0.70）", goal, tiers=None)
+    spec_a = run_case("A · 默认 small 档（基线：能力上限仅 0.70）", goal, tiers=None,
+                     executor=args.executor)
 
     # (b) 指定 large/tool 档 → 全通时可达 ~0.92，但串联良率(yield 开路)拖累均值
     #     （引出 M2 Router 的反馈/冗余 与 补强#1 recovery 系数）
@@ -176,6 +271,7 @@ def main():
         "B · 指定 large/tool 档（全通可达 ~0.92，串联良率拖累均值）", goal,
         tiers={"retrieve": "tool", "reason": "large",
                "calculate": "tool", "verify": "large"},
+        executor=args.executor,
     )
 
     # (c) M1 Binder 自动选型：在满足 min_quality 前提下挑最便宜档（复用 _TIERS）
@@ -185,7 +281,8 @@ def main():
     rep = binder.report(g, auto_tiers)
     print("\n=== C 前置 · Binder 自动选型报告 ===")
     print("tiers:", auto_tiers, "  budget:", rep["budget"], "  feasible:", rep["feasible"])
-    spec_c = run_case("C · Binder 自动选型（满足精度的最低成本档）", goal, tiers=auto_tiers)
+    spec_c = run_case("C · Binder 自动选型（满足精度的最低成本档）", goal, tiers=auto_tiers,
+                     executor=args.executor)
 
     # (d) M2 Router · 全并联：dependencies=[] 声明四步互不依赖 → 同层并发
     #     延迟从 ~3500ms 砍到 ~1100ms，三项约束全过（证明布线直接决定系统级指标）
@@ -194,7 +291,7 @@ def main():
     tiers_d = binder_d.bind(g_d)
     spec_d = run_case("D · Router 全并联（dependencies=[] 假设四步独立）",
                       goal_dict={**goal, "dependencies": []},
-                      tiers=tiers_d, router=True)
+                      tiers=tiers_d, router=True, executor=args.executor)
 
     # (e) M2 反馈环标准单元：D 全并联 + 终端 adc 质量门控整链重试(max_iter=3)
     #     runtime 原生仅支持单环 → 以终端 adc 为质量门，不达标整链重试（max_iter=3）
@@ -203,7 +300,7 @@ def main():
     tiers_e = binder_e.bind(g_e)
     spec_e = run_case("E · 全并联 + 反馈环(末级汇合all-fired门控, max_iter=3)",
                       goal_dict={**goal, "dependencies": [], "feedback": {"max_iter": 3}},
-                      tiers=tiers_e, router=True)
+                      tiers=tiers_e, router=True, executor=args.executor)
 
     # (f) M2 冗余标准单元 #5：D 全并联 + 全能力 K=2 冗余（any 汇合收口）
     #     all_fired 从 ~92% 拉到 ~99.8%（单点 yield 失败被副本吸收，一支开路不影响其余）；
@@ -215,7 +312,7 @@ def main():
     tiers_f = binder_f.bind(g_f)
     spec_f = run_case("F · 全并联 + 冗余(全能力 K=2, any汇合)",
                       goal_dict={**goal, "dependencies": [], "redundancy": red_all},
-                      tiers=tiers_f, router=True)
+                      tiers=tiers_f, router=True, executor=args.executor)
     out_f = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "examples", "generated_pdf_verify_redundant.json")
     with open(out_f, "w", encoding="utf-8") as f:
@@ -264,9 +361,11 @@ def main():
     }
     tiers_h = {"draft": "small", "polish": "tool"}
     run_case("H0 · 串联 small→tool 无recovery(η=0)",
-             goal_dict={**goal_h, "recovery": 0.0}, tiers=tiers_h, router=False)
+             goal_dict={**goal_h, "recovery": 0.0}, tiers=tiers_h, router=False,
+             executor=args.executor)
     run_case("H1 · 串联 small→tool recovery(η=0.5)",
-             goal_dict={**goal_h, "recovery": 0.5}, tiers=tiers_h, router=False)
+             goal_dict={**goal_h, "recovery": 0.5}, tiers=tiers_h, router=False,
+             executor=args.executor)
 
     # ---- M4：NL → Goal → 编译 → 执行（端到端，离线规则兜底）----
     print("\n" + "=" * 60)
@@ -278,7 +377,11 @@ def main():
         "从图片里提取表格并分类，随便处理",
     ]
     for nl in nl_examples:
-        run_nl_case(nl, api_key=None, seed=7, runs=300, router=True)
+        run_nl_case(nl, api_key=None, seed=7, runs=300, router=True,
+                    executor=args.executor)
+
+    if args.executor:
+        run_executor_showcase(seed=7)
 
     print("\n解读：")
     print(" · A 受'能力上限 0.70'卡死；C 经 Binder 自动选型（tool 档 accuracy 0.99≥0.85）")
