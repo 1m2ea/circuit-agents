@@ -1,0 +1,210 @@
+{
+  "name": "pdf_summarize_verify",
+  "task": "总结一篇 PDF 并核对里面的数字",
+  "components": {
+    "src": {
+      "type": "power",
+      "label": "pdf_summarize_verify"
+    },
+    "sched": {
+      "type": "opamp",
+      "label": "调度器",
+      "spec_clarify": true
+    },
+    "bridge": {
+      "type": "bridge_rectifier",
+      "label": "整流桥"
+    },
+    "mod_pdf": {
+      "type": "source",
+      "label": "输入[pdf]",
+      "quality": 0.95
+    },
+    "mod_table": {
+      "type": "source",
+      "label": "输入[table]",
+      "quality": 0.95
+    },
+    "pmerge": {
+      "type": "capacitor",
+      "label": "并联汇合"
+    },
+    "cap_0_1": {
+      "type": "resistor",
+      "label": "retrieve#1",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_0_2": {
+      "type": "resistor",
+      "label": "retrieve#2",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "rmerge_0": {
+      "type": "capacitor",
+      "label": "冗余汇合(retrieve×2)",
+      "mode": "any"
+    },
+    "cap_1_1": {
+      "type": "resistor",
+      "label": "reason#1",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_1_2": {
+      "type": "resistor",
+      "label": "reason#2",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "rmerge_1": {
+      "type": "capacitor",
+      "label": "冗余汇合(reason×2)",
+      "mode": "any"
+    },
+    "cap_2_1": {
+      "type": "resistor",
+      "label": "calculate#1",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_2_2": {
+      "type": "resistor",
+      "label": "calculate#2",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "rmerge_2": {
+      "type": "capacitor",
+      "label": "冗余汇合(calculate×2)",
+      "mode": "any"
+    },
+    "cap_3_1": {
+      "type": "resistor",
+      "label": "verify#1",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_3_2": {
+      "type": "resistor",
+      "label": "verify#2",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "rmerge_3": {
+      "type": "capacitor",
+      "label": "冗余汇合(verify×2)",
+      "mode": "any"
+    },
+    "adc": {
+      "type": "adc",
+      "label": "质量评估",
+      "threshold": 0.85
+    }
+  },
+  "wires": [
+    [
+      "src",
+      "sched"
+    ],
+    [
+      "sched",
+      "bridge"
+    ],
+    [
+      "mod_pdf",
+      "bridge"
+    ],
+    [
+      "mod_table",
+      "bridge"
+    ],
+    [
+      "bridge",
+      "cap_0_1"
+    ],
+    [
+      "bridge",
+      "cap_0_2"
+    ],
+    [
+      "cap_0_1",
+      "rmerge_0"
+    ],
+    [
+      "cap_0_2",
+      "rmerge_0"
+    ],
+    [
+      "rmerge_0",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_1_1"
+    ],
+    [
+      "bridge",
+      "cap_1_2"
+    ],
+    [
+      "cap_1_1",
+      "rmerge_1"
+    ],
+    [
+      "cap_1_2",
+      "rmerge_1"
+    ],
+    [
+      "rmerge_1",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_2_1"
+    ],
+    [
+      "bridge",
+      "cap_2_2"
+    ],
+    [
+      "cap_2_1",
+      "rmerge_2"
+    ],
+    [
+      "cap_2_2",
+      "rmerge_2"
+    ],
+    [
+      "rmerge_2",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_3_1"
+    ],
+    [
+      "bridge",
+      "cap_3_2"
+    ],
+    [
+      "cap_3_1",
+      "rmerge_3"
+    ],
+    [
+      "cap_3_2",
+      "rmerge_3"
+    ],
+    [
+      "rmerge_3",
+      "pmerge"
+    ],
+    [
+      "pmerge",
+      "adc"
+    ]
+  ],
+  "feedback": null,
+  "rationale": "dependencies=[]→全并联(假设能力互不依赖) | 分层(同层并联/跨层串联): [retrieve,reason,calculate,verify] | 终端 adc 阈值=min_quality=0.85 | 冗余(标准单元#5): {'retrieve': 2, 'reason': 2, 'calculate': 2, 'verify': 2} → 复制并联+any汇合（runtime capacitor mode=any，默认 all 不变）"
+}

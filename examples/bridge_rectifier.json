@@ -1,0 +1,18 @@
+{
+  "name": "bridge-rectifier-multimodal",
+  "task": "整合文本 / 图像 / 表格信号",
+  "components": {
+    "src":   {"type": "power",            "label": "任务"},
+    "txt":   {"type": "source",           "label": "文本输入", "quality": 0.90},
+    "img":   {"type": "source",           "label": "图像输入", "quality": 0.80},
+    "tbl":   {"type": "source",           "label": "表格输入", "quality": 0.95},
+    "bridge":{"type": "bridge_rectifier", "label": "整流桥"},
+    "core":  {"type": "resistor",         "label": "统一理解", "model": "large"},
+    "adc":   {"type": "adc",              "label": "评估", "threshold": 0.80}
+  },
+  "wires": [
+    ["src", "bridge"],
+    ["txt", "bridge"], ["img", "bridge"], ["tbl", "bridge"],
+    ["bridge", "core"], ["core", "adc"]
+  ]
+}

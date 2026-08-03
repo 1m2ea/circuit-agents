@@ -1,0 +1,118 @@
+{
+  "name": "pdf_summarize_verify",
+  "task": "总结一篇 PDF 并核对里面的数字",
+  "components": {
+    "src": {
+      "type": "power",
+      "label": "pdf_summarize_verify"
+    },
+    "sched": {
+      "type": "opamp",
+      "label": "调度器",
+      "spec_clarify": true
+    },
+    "bridge": {
+      "type": "bridge_rectifier",
+      "label": "整流桥"
+    },
+    "mod_pdf": {
+      "type": "source",
+      "label": "输入[pdf]",
+      "quality": 0.95
+    },
+    "mod_table": {
+      "type": "source",
+      "label": "输入[table]",
+      "quality": 0.95
+    },
+    "pmerge": {
+      "type": "capacitor",
+      "label": "并联汇合"
+    },
+    "cap_0": {
+      "type": "resistor",
+      "label": "retrieve",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_1": {
+      "type": "resistor",
+      "label": "reason",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_2": {
+      "type": "resistor",
+      "label": "calculate",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "cap_3": {
+      "type": "resistor",
+      "label": "verify",
+      "model": "tool",
+      "recovery": 0.0
+    },
+    "adc": {
+      "type": "adc",
+      "label": "质量评估",
+      "threshold": 0.85
+    }
+  },
+  "wires": [
+    [
+      "src",
+      "sched"
+    ],
+    [
+      "sched",
+      "bridge"
+    ],
+    [
+      "mod_pdf",
+      "bridge"
+    ],
+    [
+      "mod_table",
+      "bridge"
+    ],
+    [
+      "bridge",
+      "cap_0"
+    ],
+    [
+      "cap_0",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_1"
+    ],
+    [
+      "cap_1",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_2"
+    ],
+    [
+      "cap_2",
+      "pmerge"
+    ],
+    [
+      "bridge",
+      "cap_3"
+    ],
+    [
+      "cap_3",
+      "pmerge"
+    ],
+    [
+      "pmerge",
+      "adc"
+    ]
+  ],
+  "feedback": null,
+  "rationale": "dependencies=[]→全并联(假设能力互不依赖) | 分层(同层并联/跨层串联): [retrieve,reason,calculate,verify] | 终端 adc 阈值=min_quality=0.85 | 注：延迟由 runtime layer 化 propagate 给出(同层max/跨层sum)；M2 五标准单元(串联/并联/反馈/桥式/冗余)均已就位"
+}

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="690" height="830" viewBox="0 0 690 830" font-family="Helvetica, Arial, sans-serif">
+<defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+      <marker id="arrowF" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#c0392b"/></marker>
+    </defs>
+<rect width="690" height="830" fill="#fdfdfd"/>
+<path d="M155.0,140.0 C155.0,175.0 155.0,175.0 155.0,210.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,290.0 C155.0,325.0 155.0,325.0 155.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,290.0 C155.0,325.0 345.0,325.0 345.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,290.0 C155.0,325.0 535.0,325.0 535.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,440.0 C155.0,475.0 155.0,475.0 155.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M345.0,440.0 C345.0,475.0 155.0,475.0 155.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M535.0,440.0 C535.0,475.0 155.0,475.0 155.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,590.0 C155.0,625.0 155.0,625.0 155.0,660.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="80.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#c0392b" stroke-width="2.5"/>
+<text x="155.0" y="76.0" font-size="10" fill="#c0392b" text-anchor="middle" font-weight="bold" letter-spacing="1">POWER</text>
+<line x1="142.0" y1="83.0" x2="168.0" y2="83.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="92.0" x2="162.0" y2="92.0" stroke="#c0392b" stroke-width="3"/><line x1="142.0" y1="101.0" x2="168.0" y2="101.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="110.0" x2="162.0" y2="110.0" stroke="#c0392b" stroke-width="3"/>
+<text x="155.0" y="126.0" font-size="12" fill="#222" text-anchor="middle">任务</text>
+<rect x="80.0" y="210.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#2980b9" stroke-width="2.5"/>
+<text x="155.0" y="226.0" font-size="10" fill="#2980b9" text-anchor="middle" font-weight="bold" letter-spacing="1">OP-AMP</text>
+<polygon points="139.0,230.0 139.0,262.0 173.0,246.0" fill="none" stroke="#2980b9" stroke-width="2.5"/><text x="142.0" y="242.0" font-size="11" fill="#2980b9">+</text><text x="142.0" y="260.0" font-size="11" fill="#2980b9">&#8722;</text>
+<text x="155.0" y="276.0" font-size="12" fill="#222" text-anchor="middle">调度器</text>
+<text x="155.0" y="288.0" font-size="9" fill="#888" text-anchor="middle">clarify</text>
+<rect x="80.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="155.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="133.0,404.0 140.3,388.0 147.7,404.0 155.0,388.0 162.3,404.0 169.7,388.0 177.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="155.0" y="426.0" font-size="12" fill="#222" text-anchor="middle">快速检索</text>
+<text x="155.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=small</text>
+<rect x="270.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="345.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="323.0,404.0 330.3,388.0 337.7,404.0 345.0,388.0 352.3,404.0 359.7,388.0 367.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="345.0" y="426.0" font-size="12" fill="#222" text-anchor="middle">深度分析</text>
+<text x="345.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=large</text>
+<rect x="460.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="535.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="513.0,404.0 520.3,388.0 527.7,404.0 535.0,388.0 542.3,404.0 549.7,388.0 557.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="535.0" y="426.0" font-size="12" fill="#222" text-anchor="middle">计算</text>
+<text x="535.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=tool</text>
+<rect x="80.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="155.0" y="526.0" font-size="10" fill="#8e44ad" text-anchor="middle" font-weight="bold" letter-spacing="1">CAPACITOR</text>
+<line x1="155.0" y1="530.0" x2="155.0" y2="543.0" stroke="#8e44ad" stroke-width="2.5"/><line x1="137.0" y1="543.0" x2="173.0" y2="543.0" stroke="#8e44ad" stroke-width="3"/><line x1="137.0" y1="549.0" x2="173.0" y2="549.0" stroke="#8e44ad" stroke-width="3"/><line x1="155.0" y1="549.0" x2="155.0" y2="562.0" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="155.0" y="576.0" font-size="12" fill="#222" text-anchor="middle">汇合</text>
+<rect x="80.0" y="660.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#d35400" stroke-width="2.5"/>
+<text x="155.0" y="676.0" font-size="10" fill="#d35400" text-anchor="middle" font-weight="bold" letter-spacing="1">DIODE</text>
+<polygon points="139.0,682.0 139.0,710.0 169.0,696.0" fill="none" stroke="#d35400" stroke-width="2.5"/><line x1="169.0" y1="682.0" x2="169.0" y2="710.0" stroke="#d35400" stroke-width="3"/>
+<text x="155.0" y="726.0" font-size="12" fill="#222" text-anchor="middle">校验</text>
+<text x="345.0" y="24" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">parallel-fanout</text>
+</svg>

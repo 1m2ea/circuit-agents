@@ -1,0 +1,16 @@
+{
+  "name": "series-pipeline",
+  "task": "撰写技术趋势简报",
+  "components": {
+    "src":   {"type": "power",  "label": "初始任务"},
+    "sched": {"type": "opamp",  "label": "调度器", "spec_clarify": true},
+    "r1":    {"type": "resistor", "label": "检索", "model": "small"},
+    "r2":    {"type": "resistor", "label": "草稿", "model": "large"},
+    "r3":    {"type": "resistor", "label": "润色", "model": "small"},
+    "d":     {"type": "diode",  "label": "校验"}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "r1"], ["r1", "r2"], ["r2", "r3"], ["r3", "d"]
+  ]
+}

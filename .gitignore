@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local state / secrets
+.watchdog_state.json
+.env
+.env.*
+*.local
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+
+# Throwaway demo artifacts
+_demo_out.txt
+_mk_pareto.py
+_append_*.md

@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 470" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrR" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="680" height="470" fill="#fbfbfd"/>
+
+  <!-- title -->
+  <text x="24" y="30" font-size="18" font-weight="700" fill="#1f2937">M3 Optimizer · 搜索空间与闭环（待确认草图）</text>
+  <line x1="24" y1="42" x2="656" y2="42" stroke="#cbd5e1" stroke-width="1"/>
+
+  <!-- ===== 闭环 ===== -->
+  <text x="24" y="66" font-size="13" font-weight="600" fill="#334155">闭环：生成候选 → 仿真打分 → 不满意就改 config → 再仿</text>
+
+  <rect x="40" y="86" width="120" height="56" rx="8" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="100" y="110" font-size="12" font-weight="600" fill="#3730a3" text-anchor="middle">候选生成</text>
+  <text x="100" y="128" font-size="10" fill="#4f46e5" text-anchor="middle">Netlister/Router</text>
+
+  <line x1="160" y1="114" x2="196" y2="114" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="200" y="86" width="120" height="56" rx="8" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>
+  <text x="260" y="110" font-size="12" font-weight="600" fill="#155e75" text-anchor="middle">Evaluator</text>
+  <text x="260" y="128" font-size="10" fill="#0e7490" text-anchor="middle">runtime.py 仿真</text>
+
+  <line x1="320" y1="114" x2="356" y2="114" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="360" y="86" width="120" height="56" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="420" y="110" font-size="12" font-weight="600" fill="#166534" text-anchor="middle">指标 score</text>
+  <text x="420" y="128" font-size="10" fill="#15803d" text-anchor="middle">成本/延迟/质量</text>
+
+  <line x1="480" y1="114" x2="516" y2="114" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="520" y="86" width="130" height="56" rx="8" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text x="585" y="110" font-size="12" font-weight="600" fill="#9a3412" text-anchor="middle">Optimizer</text>
+  <text x="585" y="128" font-size="10" fill="#c2410c" text-anchor="middle">贪心 / 搜索</text>
+
+  <path d="M 520 114 C 470 152, 170 152, 40 114" fill="none" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrR)"/>
+  <text x="285" y="148" font-size="10.5" fill="#dc2626" text-anchor="middle">改 config → 再仿（不满足约束就迭代）</text>
+  <text x="260" y="163" font-size="9.5" fill="#64748b" text-anchor="middle">Evaluator 注：每个候选跑 N=200 次仿真取均值，指标可比</text>
+
+  <line x1="24" y1="182" x2="656" y2="182" stroke="#cbd5e1" stroke-width="1"/>
+
+  <!-- ===== 搜索空间 4 旋钮（左下 2x2） ===== -->
+  <text x="24" y="204" font-size="13" font-weight="600" fill="#334155">搜索空间（4 旋钮 · 标准单元库剪枝，不暴力枚举）</text>
+
+  <rect x="24" y="214" width="150" height="56" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="34" y="234" font-size="11.5" font-weight="600" fill="#0f172a">① pattern 布线</text>
+  <text x="34" y="252" font-size="10" fill="#475569">串联 / 并联([]) / DAG</text>
+  <text x="34" y="266" font-size="10" fill="#475569">→ 决定延迟结构</text>
+
+  <rect x="186" y="214" width="150" height="56" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="196" y="234" font-size="11.5" font-weight="600" fill="#0f172a">② tiers 选型</text>
+  <text x="196" y="252" font-size="10" fill="#475569">small/large/tool</text>
+  <text x="196" y="266" font-size="10" fill="#475569">Binder 最小档可升降</text>
+
+  <rect x="24" y="282" width="150" height="56" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="34" y="302" font-size="11.5" font-weight="600" fill="#0f172a">③ redundancy</text>
+  <text x="34" y="320" font-size="10" fill="#475569">{cap: K} 副本</text>
+  <text x="34" y="334" font-size="10" fill="#475569">any 汇合抗单点</text>
+
+  <rect x="186" y="282" width="150" height="56" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="196" y="302" font-size="11.5" font-weight="600" fill="#0f172a">④ feedback</text>
+  <text x="196" y="320" font-size="10" fill="#475569">on/off + max_iter</text>
+  <text x="196" y="334" font-size="10" fill="#475569">末级门控整链重试</text>
+
+  <!-- ===== 目标 + 两阶段（右下） ===== -->
+  <rect x="350" y="214" width="306" height="56" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.2"/>
+  <text x="360" y="234" font-size="11.5" font-weight="600" fill="#92400e">目标函数</text>
+  <text x="360" y="252" font-size="10.5" fill="#b45309">min cost</text>
+  <text x="360" y="266" font-size="10.5" fill="#b45309">s.t. latency≤L ∧ quality≥Q ∧ ¬trip</text>
+
+  <rect x="350" y="282" width="306" height="56" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.2"/>
+  <text x="360" y="302" font-size="11.5" font-weight="600" fill="#5b21b6">两阶段</text>
+  <text x="360" y="320" font-size="10" fill="#6d28d9">① 贪心：Binder最小档+并联 → hill-climb 修约束</text>
+  <text x="360" y="334" font-size="10" fill="#6d28d9">② 搜索：枚举候选 → 收集可行 → Pareto 前沿</text>
+
+  <line x1="24" y1="356" x2="656" y2="356" stroke="#cbd5e1" stroke-width="1"/>
+
+  <!-- ===== Pareto 概念图（底） ===== -->
+  <text x="24" y="378" font-size="13" font-weight="600" fill="#334155">Pareto 前沿概念（成本 vs 延迟，红点=可行，灰=超约束）</text>
+
+  <!-- plot frame -->
+  <rect x="60" y="392" width="300" height="62" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="42" y="426" font-size="9" fill="#64748b" transform="rotate(-90 42 426)" text-anchor="middle">延迟↑</text>
+  <text x="210" y="466" font-size="9" fill="#64748b" text-anchor="middle">成本 →</text>
+  <!-- frontier line -->
+  <polyline points="80,444 150,430 230,418 300,406" fill="none" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <!-- feasible points -->
+  <circle cx="150" cy="430" r="3.5" fill="#16a34a"/>
+  <circle cx="230" cy="418" r="3.5" fill="#16a34a"/>
+  <circle cx="300" cy="406" r="3.5" fill="#16a34a"/>
+  <!-- infeasible -->
+  <circle cx="100" cy="448" r="3.5" fill="#94a3b8"/>
+  <circle cx="200" cy="448" r="3.5" fill="#94a3b8"/>
+  <text x="320" y="404" font-size="9" fill="#16a34a">可行(绿)</text>
+  <text x="320" y="418" font-size="9" fill="#94a3b8">超约束(灰)</text>
+
+  <!-- legend D/E/F/G -->
+  <text x="380" y="404" font-size="10.5" font-weight="600" fill="#0f172a">候选对照（§9 目标实测）</text>
+  <text x="380" y="420" font-size="10" fill="#475569">D 并联      1180ms / 0.036 / 全过</text>
+  <text x="380" y="434" font-size="10" fill="#475569">E 并联+反馈  1270ms / 0.039 / 全过</text>
+  <text x="380" y="448" font-size="10" fill="#475569">F 全冗余K=2 1210ms / 0.060 / 成本✗</text>
+  <text x="380" y="462" font-size="10" fill="#7c3aed">G 优化器解   ? / ? / 预期 min-cost全过</text>
+</svg>

@@ -1,0 +1,81 @@
+<svg viewBox="0 0 680 440" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#444"/>
+    </marker>
+    <marker id="arrowR" markerWidth="11" markerHeight="11" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#d23"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="680" height="440" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="20" y="30" font-family="sans-serif" font-size="18" font-weight="bold" fill="#1a1a2e">布局布线编译器 · 流水线蓝图</text>
+  <text x="20" y="49" font-family="sans-serif" font-size="12" fill="#667">Layout &amp; Routing Compiler — 6 级流水线 + 反馈环（终局目标 #3）</text>
+
+  <!-- ===== Row 1 boxes (y=72, h=74) ===== -->
+  <!-- GoalParser -->
+  <rect x="20" y="72" width="150" height="74" rx="8" fill="#eef3fb" stroke="#6c8ed4" stroke-width="1.6"/>
+  <circle cx="38" cy="90" r="12" fill="#6c8ed4"/><text x="38" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">1</text>
+  <text x="95" y="106" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">GoalParser</text>
+  <text x="95" y="126" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">自然语言 / 目标 → 结构化 schema</text>
+
+  <!-- Netlister -->
+  <rect x="265" y="72" width="150" height="74" rx="8" fill="#e9f6f4" stroke="#4db6ac" stroke-width="1.6"/>
+  <circle cx="283" cy="90" r="12" fill="#4db6ac"/><text x="283" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">2</text>
+  <text x="340" y="106" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">Netlister</text>
+  <text x="340" y="126" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">目标 → 元件网表 (components+wires)</text>
+
+  <!-- Binder -->
+  <rect x="510" y="72" width="150" height="74" rx="8" fill="#eef4e6" stroke="#7e9b54" stroke-width="1.6"/>
+  <circle cx="528" cy="90" r="12" fill="#7e9b54"/><text x="528" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">3</text>
+  <text x="585" y="106" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">Binder</text>
+  <text x="585" y="126" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">绑定模型档位 / 成本 / 能力</text>
+
+  <!-- ===== Row 2 boxes (y=250, h=74) ===== -->
+  <!-- Router -->
+  <rect x="510" y="250" width="150" height="74" rx="8" fill="#fdf1e6" stroke="#e0995a" stroke-width="1.6"/>
+  <circle cx="528" cy="268" r="12" fill="#e0995a"/><text x="528" y="272" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">4</text>
+  <text x="585" y="284" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">Router</text>
+  <text x="585" y="304" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">拓扑布局 / 时序 / 约束插入</text>
+
+  <!-- Evaluator -->
+  <rect x="265" y="250" width="150" height="74" rx="8" fill="#fbeaea" stroke="#d96b6b" stroke-width="1.6"/>
+  <circle cx="283" cy="268" r="12" fill="#d96b6b"/><text x="283" y="272" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">5</text>
+  <text x="340" y="284" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">Evaluator</text>
+  <text x="340" y="304" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">= runtime.py 仿真打分</text>
+
+  <!-- Optimizer -->
+  <rect x="20" y="250" width="150" height="74" rx="8" fill="#f3ecf9" stroke="#9b7ed4" stroke-width="1.6"/>
+  <circle cx="38" cy="268" r="12" fill="#9b7ed4"/><text x="38" y="272" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff">6</text>
+  <text x="95" y="284" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a1a2e">Optimizer</text>
+  <text x="95" y="304" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#667">贪心→搜索 改 spec</text>
+
+  <!-- ===== forward wires ===== -->
+  <line x1="174" y1="109" x2="261" y2="109" stroke="#444" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="419" y1="109" x2="506" y2="109" stroke="#444" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="585" y1="150" x2="585" y2="246" stroke="#444" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="506" y1="287" x2="419" y2="287" stroke="#444" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="261" y1="287" x2="174" y2="287" stroke="#444" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+  <!-- ===== feedback loop (Optimizer -> GoalParser) ===== -->
+  <line x1="95" y1="246" x2="95" y2="150" stroke="#d23" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowR)"/>
+  <text x="108" y="200" font-family="sans-serif" font-size="11" fill="#d23" font-weight="bold">反馈环：优化后 spec 回灌重新 Binder/Router</text>
+
+  <!-- ===== standard cell library callout ===== -->
+  <rect x="510" y="350" width="150" height="62" rx="6" fill="#f5f7fa" stroke="#9aa7b5" stroke-dasharray="4 3" stroke-width="1.2"/>
+  <text x="522" y="368" font-family="sans-serif" font-size="11" font-weight="bold" fill="#334">标准单元库（5 模板）</text>
+  <text x="522" y="384" font-family="sans-serif" font-size="9.5" fill="#556">串联 / 并联扇出 /</text>
+  <text x="522" y="398" font-family="sans-serif" font-size="9.5" fill="#556">质量反馈 / 异构桥 / 冗余</text>
+  <line x1="510" y1="350" x2="585" y2="146" stroke="#9aa7b5" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="585" y1="350" x2="585" y2="324" stroke="#9aa7b5" stroke-width="1" stroke-dasharray="3 3"/>
+
+  <!-- ===== legend / milestones ===== -->
+  <text x="20" y="356" font-family="sans-serif" font-size="11" font-weight="bold" fill="#334">里程碑</text>
+  <text x="20" y="374" font-family="sans-serif" font-size="10" fill="#556">M0 目标 schema + Netlister    M1 Binder(复用 _TIERS)</text>
+  <text x="20" y="392" font-family="sans-serif" font-size="10" fill="#556">M2 Router + 5 单元库 + 约束    M3 Optimizer(贪心→搜索)</text>
+  <text x="20" y="410" font-family="sans-serif" font-size="10" fill="#556">M4/M5 可选：NL→结构化(LLM) · 真 LLM 后端(补强 #2)</text>
+  <text x="20" y="428" font-family="sans-serif" font-size="10" fill="#888">注：Evaluator 阶段零新建，直接 import 现有 runtime.py 的 Circuit 引擎</text>
+</svg>

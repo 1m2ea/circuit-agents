@@ -1,0 +1,21 @@
+{
+  "name": "feedback-selfcorrect",
+  "task": "带自校正的写作任务",
+  "components": {
+    "src":   {"type": "power",    "label": "任务"},
+    "sched": {"type": "opamp",    "label": "调度器", "spec_clarify": true},
+    "a":     {"type": "resistor", "label": "初稿", "model": "small"},
+    "b":     {"type": "resistor", "label": "深析", "model": "large"},
+    "merge": {"type": "capacitor","label": "汇合"},
+    "d":     {"type": "diode",    "label": "格式校验"},
+    "adc":   {"type": "adc",      "label": "质量评估", "threshold": 0.85},
+    "wg":    {"type": "watchdog", "label": "看门狗"}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "a"], ["sched", "b"],
+    ["a", "merge"], ["b", "merge"],
+    ["merge", "d"], ["d", "adc"], ["adc", "wg"]
+  ],
+  "feedback": {"from": "wg", "to": "sched", "max_iter": 3}
+}

@@ -1,0 +1,19 @@
+{
+  "name": "parallel-fanout",
+  "task": "并行：检索 + 深度分析 + 计算",
+  "components": {
+    "src":   {"type": "power",    "label": "任务"},
+    "sched": {"type": "opamp",    "label": "调度器", "spec_clarify": true},
+    "a":     {"type": "resistor", "label": "快速检索", "model": "small"},
+    "b":     {"type": "resistor", "label": "深度分析", "model": "large"},
+    "c":     {"type": "resistor", "label": "计算",     "model": "tool"},
+    "merge": {"type": "capacitor","label": "汇合"},
+    "d":     {"type": "diode",    "label": "校验"}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "a"], ["sched", "b"], ["sched", "c"],
+    ["a", "merge"], ["b", "merge"], ["c", "merge"],
+    ["merge", "d"]
+  ]
+}
