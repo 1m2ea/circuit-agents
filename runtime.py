@@ -53,6 +53,29 @@ def aggregate(inputs):
     return Signal(value=inputs, quality=quality, ok=ok)
 
 
+def _value_empty(v):
+    """判断一个信号值是否为『空壳』：None / 空串 / 纯空白 / 全空聚合。"""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip() == ""
+    if isinstance(v, Signal):
+        return _value_empty(v.value)
+    if isinstance(v, (list, tuple)):
+        return len(v) == 0 or all(_value_empty(x) for x in v)
+    return False
+
+
+def _completeness_missing(ins, fields):
+    """返回『下游要求、但上游承运信号值为空壳』的字段名列表（汇合完整性检查用）。"""
+    missing = []
+    for f in fields:
+        carriers = [s for s in ins if f in (s.meta.get("produced_outputs") or [])]
+        if not carriers or all(_value_empty(s.value) for s in carriers):
+            missing.append(f)
+    return missing
+
+
 class Backend:
     def run(self, comp: dict, inputs: list) -> Signal:
         raise NotImplementedError
@@ -252,6 +275,9 @@ class Circuit:
         self.backend = backend
         self.components = spec["components"]
         self.feedback = spec.get("feedback")
+        # 汇合节点完整性检查开关（A）：默认开；仅对『下游要求且本节点转发』的字段生效，
+        # 真实非空数据不受影响（零回归）。
+        self.join_completeness = spec.get("join_completeness", True)
         # forward wires only (exclude the declared feedback edge)
         self.forward = [w for w in spec["wires"]
                         if not (self.feedback
@@ -326,6 +352,22 @@ class Circuit:
         combined = list(dict.fromkeys(list(own) + list(upstream_outputs)))
         if combined:
             sig.meta["produced_outputs"] = combined
+        # 汇合节点完整性检查（A）：电容汇合放行的字段，若下游要求且上游承运值为空壳，
+        # 标 gate=incomplete(ok=False) → 下游前驱不 ok → 下游线性关系闸 gate:fail_linear
+        # → CircuitExecutor 自动补数闭环救活。仅对 capacitor + 下游要求字段生效（零回归）。
+        if (self.join_completeness and sig.ok
+                and comp.get("type") == "capacitor"):
+            downstream_req = set()
+            for sc in self.succ[cid]:
+                downstream_req.update(self.components[sc].get("required_inputs") or [])
+            forwarded = sig.meta.get("produced_outputs") or []
+            relevant = [f for f in forwarded if f in downstream_req]
+            if relevant:
+                inc = _completeness_missing(ins, relevant)
+                if inc:
+                    sig.ok = False
+                    sig.meta["gate"] = "incomplete"
+                    sig.meta["incomplete_fields"] = inc
         return sig
 
     def propagate(self):
@@ -815,6 +857,36 @@ def circuit_executor_selftest():
     assert "reason" in ex._filled_nodes, "reason 触发过自动补数 → 应在 _filled_nodes"
     print(f"✓ 观察窗(B): _events={len(ex._events)} 条 · reason 已补数闭环 · 渲染键齐全")
 
+    # A 协同验证：汇合完整性检查 + CircuitExecutor 自动补数闭环端到端。
+    # A 产出空壳 x → 电容 M gate=incomplete → B 前驱不 ok → B gate:fail_linear
+    # → 执行器按 B 的 filler 自动补 x → B ok。
+    class _EmptyBackend(Backend):
+        def run(self, comp, inputs):
+            if comp.get("type") == "resistor" and comp.get("label") == "A":
+                return Signal(value="", quality=0.9, ok=True,
+                              meta={"produced_outputs": ["x"]})
+            return Signal(value=f"[{comp.get('label')}]", quality=0.9, ok=True)
+    spec3 = {
+        "name": "exec_completeness",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["x"]},
+            "M": {"type": "capacitor", "label": "merge"},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["x"], "produced_outputs": ["report"],
+                  "fillers": {"x": {"skill": "exec_demo_fetch",
+                                    "args": {"query": "x filler"}}}},
+        },
+        "wires": [["src", "A"], ["A", "M"], ["M", "B"]],
+    }
+    ex3 = CircuitExecutor(Circuit(spec3, _EmptyBackend()), data_fill_budget=2)
+    res3 = ex3.run()
+    assert res3["components"]["B"]["ok"], \
+        "完整性检查应触发 B fail_linear → 执行器补 x → B ok"
+    assert "x" in res3["state"]["_fetched"], "执行器应自动补到 x"
+    print("✓ A 协同：电容完整性(空壳x)→ B fail_linear → 执行器自动补数 → B ok（端到端）")
+
 
 def circuit_executor_evolve_selftest():
     """3.5 多任务进化离线自检（无 key/无网）：检索结果决定第二步拓扑。
@@ -1005,6 +1077,27 @@ def selftest():
     assert "y" in (out7["B"].meta.get("missing") or []), \
         f"S7: 缺失项应含下游声明名 y: {out7['B'].meta}"
     print("✓ S7 映射目标真实缺失：input_map{y:x} 但上游无 x → 仍 gate:fail（诚实不掩盖）")
+
+    # S8 汇合节点完整性检查（A）：A 产出 x 但值为空壳 → 电容 M 转发 x(空) → 下游 B 要求 x
+    # 应被完整性检查拦下：M gate=incomplete(ok=False) → B 前驱不 ok → B gate:fail_linear。
+    emp_spec = json.loads(json.dumps(base_spec))
+    emp_spec["components"]["M"] = {"type": "capacitor", "label": "merge"}
+    emp_spec["wires"] = [["src", "A"], ["A", "M"], ["M", "B"]]
+    b8 = _PlanBackend({"A": {"value": "", "quality": 0.9, "ok": True}}, {})
+    c8 = Circuit(emp_spec, b8)
+    out8, _, _ = c8.propagate()
+    assert (not out8["M"].ok) and out8["M"].meta.get("gate") == "incomplete", \
+        f"S8: 电容 M 应因转发空壳 x 被标 gate=incomplete: {out8['M'].meta}"
+    assert (not out8["B"].ok) and out8["B"].meta.get("gate") == "fail_linear", \
+        f"S8: B 应因前驱 M 不 ok 而 gate:fail_linear: {out8['B'].meta}"
+    # 对照：关闭完整性检查 → 旧行为（空壳放行，B 线性关系满足）
+    emp_spec_off = json.loads(json.dumps(emp_spec))
+    emp_spec_off["join_completeness"] = False
+    c8off = Circuit(emp_spec_off,
+                    _PlanBackend({"A": {"value": "", "quality": 0.9, "ok": True}}, {}))
+    out8off, _, _ = c8off.propagate()
+    assert out8off["B"].ok, "关闭完整性检查时 B 应放行空壳(旧行为对照)"
+    print("✓ S8 汇合完整性：A 空壳 x → 电容 M gate=incomplete → B gate:fail_linear（不传空壳）；对照关检查→旧行为")
 
     print("\nruntime 线性关系自测全过 ✓（无 key / 无网络）")
 
