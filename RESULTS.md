@@ -1430,3 +1430,24 @@ return sig
   - 全量 `python runtime.py` 通过（S1–S8 + CircuitExecutor 补数/动态技能/观察窗 + 3.5 进化，无 key/无网）。
 - **诚实边界**：完整性检查默认只挂在 `capacitor`（汇合节点）；`format_adapter`/`diode` 等中间节点未挂（如需可后续扩）。
   `mode="any"` 冗余汇合场景下，只要任一副本承运值非空即不算 incomplete（与"任一副本存活"语义一致）。
+### B. 规划前确认环（circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
+
+- **动机（用户待办）**：原架构 NL 直接编译，调度器不回述理解；若解析错方向，整条链编译错。需要"规划前确认环"——先回述理解、用户确认再编译。
+- **落点（`~/.workbuddy/skills/circuit-planner/scripts/plan.py`，规划入口 CLI）**：
+  - 新增纯函数 `_build_recap(nl, goal, mode)`：把规划器理解回述为可读摘要——能力步骤 / 依赖布线(并联·串联·DAG) / 约束(reliability/min_quality/max_cost/…) / 反馈环 / 子任务 IO。
+  - 新增 `--confirm` 开关：在**编译前**、且仅当**交互终端(TTY)**时打印摘要并 `input()` 等用户确认；非交互/CI/常驻自动模式（`--confirm` 未给，或非 TTY）**不阻断**，保持原自动规划行为。
+  - 新增 `--self-test`：离线断言 `_build_recap` 含关键字段（能力/依赖/DAG/约束），无需 TTY/网络。
+- **设计取舍**：确认环默认关闭，避免与"circuit-planner 常驻即自动"的偏好冲突；它是一项**安全闸门**（用户跑 plan.py 想先核对理解时显式 `--confirm` 开启）。取消编译返回 0（正常取消非错误）。
+- **验证**：`python plan.py --self-test` 离线通过；真实 NL 目标跑通（非 TTY 下确认环自动跳过，不阻断流程）。
+- **诚实边界**：`--confirm` 依赖真实 TTY 的 `input()`，CI/管道/常驻自动场景自动失效（不卡流程）；确认发生在「解析后、模板匹配/编译前」，回述的是 NL 解析出的初始理解（模板改写前的 goal）。
+
+### B. 规划前确认环（circuit-planner/scripts/plan.py，2026-08-03 续，已完成）
+
+- **动机（用户待办）**：原架构 NL 直接编译，调度器不回述理解；若解析错方向，整条链编译错。需要"规划前确认环"——先回述理解、用户确认再编译。
+- **落点（`~/.workbuddy/skills/circuit-planner/scripts/plan.py`，规划入口 CLI）**：
+  - 新增纯函数 `_build_recap(nl, goal, mode)`：把规划器理解回述为可读摘要——能力步骤 / 依赖布线(并联·串联·DAG) / 约束(reliability/min_quality/max_cost/…) / 反馈环 / 子任务 IO。
+  - 新增 `--confirm` 开关：在**编译前**、且仅当**交互终端(TTY)**时打印摘要并 `input()` 等用户确认；非交互/CI/常驻自动模式（`--confirm` 未给，或非 TTY）**不阻断**，保持原自动规划行为。
+  - 新增 `--self-test`：离线断言 `_build_recap` 含关键字段（能力/依赖/DAG/约束），无需 TTY/网络。
+- **设计取舍**：确认环默认关闭，避免与"circuit-planner 常驻即自动"的偏好冲突；它是一项**安全闸门**（用户跑 plan.py 想先核对理解时显式 `--confirm` 开启）。取消编译返回 0（正常取消非错误）。
+- **验证**：`python plan.py --self-test` 离线通过；真实 NL 目标跑通（非 TTY 下确认环自动跳过，不阻断流程）。
+- **诚实边界**：`--confirm` 依赖真实 TTY 的 `input()`，CI/管道/常驻自动场景自动失效（不卡流程）；确认发生在「解析后、模板匹配/编译前」，回述的是 NL 解析出的初始理解（模板改写前的 goal）。
