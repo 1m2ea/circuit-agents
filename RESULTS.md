@@ -1483,3 +1483,14 @@ return sig
 - **设计取舍**：启发式只「建议」，是否真进化仍取决于该字段的检索值是否真为可计数集合（`maybe_evolve` 显式分支对非空壳列表才触发）；误提示无害（数据非列表则跳过）。把 spec 作为唯一载体，规划器→执行器零额外传参。**注意**：此改动让 plan.py 的真实执行从 propagate-only 升级为闭环引擎，是 ① 的必然代价（否则显式提示在规划器路径永不触发）。
 - **验证**：`python -m compiler.compile` 新增 `_planner_evolve_selftest` 离线通过（retrieve→reason + 集合字段 frameworks → 推断 evolve_requests=[{key:frameworks,top_k:3}]；CircuitExecutor 正确种进 state）；`python runtime.py` 全量仍绿（含 C/D 回归）。`plan.py --self-test` 不受影响。
 - **诚实边界**：启发式依赖 capability/字段命名约定（CAPABILITY_VOCAB + 集合 token 词表）；若模型把「研究」输出命名成非集合词，可能漏提示。真异构仍需 ③ 配 VERIFY_*；本块只负责「规划器发出进化意图」。
+
+### ③ 配 VERIFY_* 真跑异构校验 smoke（2026-08-03 续，已完成）
+
+- **动机（用户待办）**：C 实现了异构校验路由 + `resolve_verify_backend()`，但未真跑过。需配 `VERIFY_*` 真跑一次验证路由真实生效。
+- **做法（同供应商 smoke）**：读本地 `~/Desktop/key_tmp.txt` 的 DeepSeek key 配 `VERIFY_API_KEY` + `VERIFY_API_BASE=https://api.deepseek.com/v1`（同主后端供应商，验证机制非真异构）；主后端也走该 key。用 `TagWrapper` 包裹主/verify 两个真实 `LLMAgentBackend`，记录每个 label 由哪个后端服务。
+- **结果（真实在线，2.3s，success=True，final_quality=0.7）**：
+  - MAIN 后端服务：`task`(power) / `reason`(resistor)
+  - VERIFY 后端服务：`verify#quality`(resistor)
+  - 断言通过：`verify#quality` 走 VERIFY 独立后端、`reason` 走 MAIN 后端 → 异构路由真实生效。
+- **诚实边界**：这是「同供应商 smoke」——验证 C 的路由/接线正确，但 verify 与主后端是同一 DeepSeek key（非真异构）。要真·异构需另给一把异供应商 key（如 OpenAI）配 `VERIFY_API_KEY`。
+- **安全**：key 仅从本地文件读入进程环境变量，绝不进命令/日志/remote；本次未提交任何密钥或配置。
