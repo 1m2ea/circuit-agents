@@ -355,7 +355,8 @@ class Watchdog:
 
 
 class Circuit:
-    def __init__(self, spec, backend, verify_backend=None, backend_map=None):
+    def __init__(self, spec, backend, verify_backend=None, backend_map=None,
+                 tuner=None):
         # ③ 自主发现新元件类型：composite 节点内联展开（无 composite 时原样返回，零回归）
         spec = _expand_composites(spec)
         self.spec = spec
@@ -364,6 +365,8 @@ class Circuit:
         self.verify_backend = verify_backend
         # ③ 多后端并行：{backend_id: Backend} 映射，节点 spec.backend 指定用哪个
         self.backend_map = backend_map or {}
+        # 第四层① 在线调参：可选 OnlineTuner，在 _run_one 中选型+反馈
+        self.tuner = tuner
         self.components = spec["components"]
         self.feedback = spec.get("feedback")
         # 汇合节点完整性检查开关（A）：默认开；仅对『下游要求且本节点转发』的字段生效，
@@ -444,8 +447,21 @@ class Circuit:
                                     "missing": missing,
                                     "required": list(req),
                                     "node": cid})
+        # 第四层① 在线调参：运行时用 Bandit 动态选型（有 tuner 且是 resistor 时覆盖 model）
+        tuning_model = None
+        tuning_capability = None
+        if self.tuner is not None and comp.get("type") == "resistor":
+            tuning_capability = comp.get("label", "").split("#")[0]
+            tuning_model = self.tuner.select_for(
+                cid, tuning_capability, ins, self.components)
+            if tuning_model and tuning_model != comp.get("model"):
+                comp = dict(comp, model=tuning_model, _tuned=True)
         be = self._backend_for(comp)
         sig = be.run(comp, ins)
+        # 在线调参反馈
+        if self.tuner is not None and tuning_model is not None:
+            self.tuner.feedback(cid, tuning_capability or "unknown",
+                                tuning_model, sig.quality, sig.cost, sig.latency_ms)
         # C. 异构校验未配置时的诚实告警：verify 节点仍在用同源主 backend
         if comp.get("label", "").split("#")[0] == "verify" and self.verify_backend is None:
             sig.meta.setdefault("warnings", []).append("hetero_verify_unconfigured")

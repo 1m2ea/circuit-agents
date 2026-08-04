@@ -960,6 +960,59 @@ def verify_topology(req: VerifyRequest):
     return fv.verify(req.spec)
 
 
+class TuneRunRequest(BaseModel):
+    """第四层① 在线调参：执行中 Bandit 动态选型。"""
+    goal: Optional[str] = Field(None, description="自然语言任务")
+    spec: Optional[dict] = Field(None, description="直接给拓扑 spec")
+    iterations: int = Field(20, description="执行轮数，每轮积累经验")
+    c_ucb: float = Field(1.4, description="UCB 探索系数")
+    seed: int = Field(0, description="随机种子")
+    tiers: Optional[list] = Field(None, description="可用档位，默认 small/large/tool")
+
+
+@app.post("/tune")
+def tune_run(req: TuneRunRequest):
+    """第四层① 在线调参：运行时用 UCB1 多臂老虎机动态选型。
+
+    同一个 OnlineTuner 跨多轮执行积累经验——
+    「research 用 tool 档成功率最高」「analyze 用 large 就够了」这类经验
+    是运行时学到的，不是离线预设的。收敛到当前环境下的最优档位。
+
+    与 /rl/optimize 分工：/rl/optimize 离线搜**拓扑结构**；/tune 运行时调**模型参数**。
+    离线安全（Bandit 纯本地统计，无 key、无网络）。
+    """
+    from compiler.online_tuner import OnlineTuner
+    from runtime import Circuit, SimBackend, CircuitExecutor
+    os.environ.pop("AGENT_API_KEY", None)
+    import random as _rnd
+    target = req.spec if req.spec is not None else req.goal
+    if target is None:
+        raise HTTPException(400, "goal 与 spec 至少提供一个")
+    spec = target if isinstance(target, dict) else None
+    tuner = OnlineTuner(c_ucb=req.c_ucb, seed=req.seed,
+                        tiers=req.tiers or None)
+    results = []
+    for i in range(req.iterations):
+        be = SimBackend(_rnd.Random(req.seed + i))
+        circ = Circuit(spec, be, tuner=tuner) if spec else None
+        # goal 走 compile
+        if circ is None:
+            from compiler.compile import compile_goal
+            spec = compile_goal(req.goal, sim=True)
+            circ = Circuit(spec, be, tuner=tuner)
+        res = CircuitExecutor(circ).run()
+        results.append({"iteration": i, "quality": res["final_quality"],
+                        "cost": res["total_cost"], "success": res["success"]})
+    final_quality = sum(r["quality"] for r in results) / len(results)
+    caps = {k[0] for k in tuner.arms}
+    return {"iterations": req.iterations,
+            "avg_final_quality": round(final_quality, 4),
+            "arm_stats": tuner.arm_stats(),
+            "converged_tiers": {c: tuner.best_tier(c) for c in caps},
+            "progress": results[:5] + ["..."] + results[-5:]
+            if len(results) > 10 else results}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1617,6 +1670,30 @@ def selftest():
     print(f"✓ S24 Phase2 三层④ 形式化验证(FormalVerifier): 6维全通过(proven) · "
           f"合法spec {_v['summary']} · 有环反例 {'→'.join(_cyc['counterexample'][:3])}... · "
           f"零依赖纯静态分析（执行前门禁）")
+
+    # S25: 第四层① 在线调参（Bandit UCB1 + /tune）
+    _tspec = {"name": "tune_demo", "components": {
+        "src": {"type": "power", "label": "task"},
+        "A": {"type": "resistor", "label": "research", "model": "small",
+              "yield": 1.0, "produced_outputs": ["a"]},
+        "B": {"type": "resistor", "label": "analyze", "model": "large",
+              "yield": 1.0, "required_inputs": ["a"],
+              "produced_outputs": ["b"]},
+        "C": {"type": "resistor", "label": "summarize", "model": "small",
+              "yield": 1.0, "required_inputs": ["b"]}},
+        "wires": [["src", "A"], ["A", "B"], ["B", "C"]]}
+    _tune = tune_run(TuneRunRequest(spec=_tspec, iterations=25, seed=7))
+    assert _tune["iterations"] == 25, "S25: 应跑满 25 轮"
+    assert _tune["avg_final_quality"] > 0.5, f"S25: 平均质量应>0.5，实际 {_tune['avg_final_quality']}"
+    assert len(_tune["arm_stats"]) >= 3, "S25: 至少 3 个臂"
+    assert _tune["converged_tiers"], "S25: 应收敛"
+    # Bandit 应收敛到 tool 或 large（SimBackend 确定性：tool 最优）
+    bt = _tune["converged_tiers"].get("research") or \
+        next(iter(_tune["converged_tiers"].values()))
+    assert bt in ("tool", "large"), f"S25: 应收敛到 tool/large，实际 {bt}"
+    print(f"✓ S25 第四层① 在线调参(OnlineTuner): "
+          f"25轮/avg_q={round(_tune['avg_final_quality'],4)} · "
+          f"{len(_tune['arm_stats'])} 臂 · 收敛 {bt} · Bandit UCB1 运行时自适应")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
