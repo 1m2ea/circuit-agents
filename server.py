@@ -51,6 +51,17 @@ class RunStatus(BaseModel):
     finished_at: Optional[str] = None
     result: Optional[dict] = None
 
+class BatchRequest(BaseModel):
+    """⑥ 多任务并行：一次提交多个自然语言任务，并发执行并统一汇聚。"""
+    goals: list[str] = Field(..., description="自然语言任务列表（每个元素一项任务）")
+    max_workers: Optional[int] = Field(None, description="并发线程数上限，默认 min(目标数, 8)")
+    route: bool = Field(True, description="是否走 Router 并联编译")
+    auto_select_models: bool = Field(False, description="是否启用智能模型选型")
+    memory_enabled: bool = Field(True, description="是否启用记忆复用（⑥ 并发写已加线程锁）")
+    data_fill_budget: int = Field(2, description="自动补数重试次数上限")
+    evolve_enabled: bool = Field(True, description="是否启用 3.5 多任务进化")
+    quality_threshold: Optional[float] = Field(None, description="质量门阈值，注入 adc/verify 节点")
+
 # ──────────────────────────────────────────────────────────
 # 应用
 # ──────────────────────────────────────────────────────────
@@ -172,6 +183,27 @@ def index():
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
+
+
+@app.post("/batch")
+def submit_batch(req: BatchRequest):
+    """⑥ 多任务并行：一次提交多个任务，并发编译+执行，返回汇聚结果。
+
+    每个 goal 独立编译进独立电路、独立后端与 state（资源隔离），由 ThreadPoolExecutor
+    并发执行；返回 {total, succeeded, failed, 每 goal 结果, 墙钟/串行耗时, 加速比, 聚合质量}。
+    """
+    from runtime import BatchExecutor
+    be = BatchExecutor(
+        max_workers=req.max_workers,
+        route=req.route,
+        auto_select_models=req.auto_select_models,
+        memory_enabled=req.memory_enabled,
+        data_fill_budget=req.data_fill_budget,
+        evolve_enabled=req.evolve_enabled,
+        quality_threshold=req.quality_threshold,
+    )
+    agg = be.run(req.goals)
+    return agg
 
 
 @app.post("/run", response_model=RunStatus)
@@ -345,6 +377,19 @@ def selftest():
     print(f"✓ S4 端到端：{len(_runs[rid2]['_events'])} 节点事件，"
           f"final_quality={_runs[rid2]['result']['final_quality']:.3f}")
     del _runs[rid2]
+
+    # S5: ⑥ 批量执行（离线：强制 GoalParser 走规则解析，避免真实 LLM 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import BatchExecutor
+    be = BatchExecutor(max_workers=2, memory_enabled=False, evolve_enabled=False)
+    bagg = be.run(["批量任务一", "批量任务二", "批量任务三"])
+    assert bagg["total"] == 3, f"S5: 应有 3 个目标，实际 {bagg['total']}"
+    assert bagg["succeeded"] == 3, f"S5: 应全部成功，实际 {bagg['succeeded']}"
+    assert "batch_id" in bagg and "results" in bagg
+    assert set(bagg["results"].keys()) == {"g0", "g1", "g2"}
+    print(f"✓ S5 ⑥ 批量执行(BatchExecutor): {bagg['total']} 目标并行 → "
+          f"成功 {bagg['succeeded']} · speedup={bagg['speedup']} · "
+          f"聚合质量={bagg['aggregate_final_quality']:.3f}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

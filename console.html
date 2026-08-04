@@ -169,6 +169,21 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
 .topo-label { fill: var(--ink); font-size: 11px; font-family: var(--font); text-anchor: middle; }
 .topo-type { fill: var(--muted); font-size: 9px; font-family: var(--font); text-anchor: middle; }
 .topo-badge { font-size: 14px; font-weight: 700; }
+
+/* ── ⑥ 批量执行面板 ── */
+.batch-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.batch-summary { font-size: 12px; padding: 8px 10px; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border); line-height: 1.6; }
+.batch-summary b { color: var(--ink); }
+.batch-card { font-size: 12px; padding: 8px 10px; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border); line-height: 1.5; }
+.batch-card .bc-head { display: flex; justify-content: space-between; gap: 8px; }
+.batch-card .bc-id { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.batch-card .bc-ok { color: var(--green); }
+.batch-card .bc-err { color: var(--red); }
+.batch-card .bc-q { color: var(--blue); font-weight: 600; }
+.batch-tag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:6px;
+  background: var(--surface-3); color: var(--muted); margin-left:6px; }
 </style>
 </head>
 <body>
@@ -204,6 +219,27 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
         </button>
         <button class="btn btn-ghost" onclick="clearAll()">清空</button>
       </div>
+    </div>
+
+    <!-- ⑥ 多任务并行 -->
+    <div class="left-section">
+      <h2>⚡ 批量执行 <span class="opt-hint">⑥ 多任务并行</span></h2>
+      <textarea id="batchInput" placeholder="每行一个任务，并发执行并统一汇聚：
+分析第一季度销售额
+总结本月用户反馈
+对比两个竞品定价策略"></textarea>
+      <div class="opt-row">
+        <label class="opt-label" for="batchWorkers">并发数</label>
+        <input id="batchWorkers" class="opt-input" type="number" min="1" max="16" step="1" value="4"
+               title="并发线程数上限，默认 4" style="width:72px;" />
+        <span class="opt-hint">默认 min(任务数, 8)</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btnBatch" onclick="submitBatch()">
+          <span id="btnBatchLabel">批量执行</span>
+        </button>
+      </div>
+      <div id="batchResults" class="batch-results"></div>
     </div>
 
     <div class="left-section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
@@ -328,6 +364,75 @@ async function submitGoal() {
     label.textContent = '错误，重试';
     btn.disabled = false;
   }
+}
+
+// ────────────────────────────────────────────────────
+// ⑥ 批量执行
+// ────────────────────────────────────────────────────
+async function submitBatch() {
+  const raw = document.getElementById('batchInput').value.trim();
+  if (!raw) return;
+  const goals = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!goals.length) return;
+
+  const btn = document.getElementById('btnBatch');
+  const label = document.getElementById('btnBatchLabel');
+  btn.disabled = true;
+  label.innerHTML = '<span class="spinner"></span> 执行中…';
+  document.getElementById('batchResults').innerHTML = '';
+
+  const workers = parseInt(document.getElementById('batchWorkers').value, 10);
+  try {
+    const res = await fetch(API + '/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        goals,
+        max_workers: isNaN(workers) ? null : workers,
+        route: true, evolve_enabled: false, memory_enabled: false,
+      })
+    });
+    const agg = await res.json();
+    renderBatch(agg);
+  } catch (e) {
+    console.error(e);
+    document.getElementById('batchResults').innerHTML =
+      `<div class="batch-card bc-err">批量执行失败：${esc(e.message || e)}</div>`;
+  } finally {
+    label.textContent = '批量执行';
+    btn.disabled = false;
+  }
+}
+
+function renderBatch(agg) {
+  const box = document.getElementById('batchResults');
+  const okN = agg.succeeded, failN = agg.failed, tot = agg.total;
+  let html = `<div class="batch-summary">
+    <b>⑥ 批量完成</b>：共 ${tot} 项 · 成功 <b style="color:var(--green)">${okN}</b>
+    · 失败 <b style="color:var(--red)">${failN}</b>
+    <span class="batch-tag">并行 ${agg.parallel ? '是' : '否'}</span>
+    <span class="batch-tag">${agg.max_workers} 线程</span><br/>
+    墙钟 <b>${agg.wall_time_ms}ms</b> · 串行估算 <b>${agg.sequential_est_ms}ms</b>
+    · 加速比 <b>${agg.speedup ?? '—'}</b>
+    · 聚合质量 <b class="bc-q">${agg.aggregate_final_quality}</b>
+    · 聚合成本 <b>${agg.aggregate_cost}</b>
+  </div>`;
+  for (const gid of Object.keys(agg.results || {})) {
+    const r = agg.results[gid];
+    const ok = r.status === 'done';
+    const q = ok ? r.result.final_quality : null;
+    const cost = ok ? r.result.total_cost : null;
+    const goalTxt = esc(r.goal || '').slice(0, 60);
+    html += `<div class="batch-card">
+      <div class="bc-head">
+        <span class="bc-id">${esc(gid)}</span>
+        <span class="${ok ? 'bc-ok' : 'bc-err'}">${ok ? '✓ 成功' : '✗ ' + esc(r.error || '失败')}</span>
+      </div>
+      <div>${goalTxt}${goalTxt.length >= 60 ? '…' : ''}</div>
+      ${ok ? `<div>质量 <span class="bc-q">${q}</span> · 成本 ${cost} · 节点 ${Object.keys(r.result.components || {}).length}</div>` : ''}
+    </div>`;
+  }
+  box.innerHTML = html;
 }
 
 function connectStream(runId) {

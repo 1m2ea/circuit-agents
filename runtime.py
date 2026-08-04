@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+import uuid
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -1671,6 +1673,279 @@ def multi_backend_selftest():
     print("\nmulti_backend 离线自检全部通过 ✓")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# ⑥ 多任务并行：BatchExecutor
+# ───────────────────────────────────────────────────────────────────────────
+class BatchExecutor:
+    """⑥ 多任务并行：多个独立 goal 并发进不同电路，资源隔离，统一汇聚。
+
+    设计要点（第二层边界扩展 · ⑥）：
+      · 每个 goal 独立编译（NL→Goal→spec）并装入独立的 CircuitExecutor，
+        各自持有独立的 SimBackend（隔离随机源 rng）与 state 黑板 → 资源隔离。
+      · 并发通过 ThreadPoolExecutor（I/O 友好；本内核以模拟后端为主，线程安全）。
+        max_workers 默认 = min(目标数, 8)。
+      · 统一汇聚：返回 {total, succeeded, failed, 每个 goal 结果, 墙钟时间,
+        理论串行耗时(上界), 加速比, 并行标志, 聚合质量/成本}。
+      · 零回归：单 goal 批量退化为单电路执行；任一 goal 失败不影响其余(各自 try)。
+      · ⑥ 配套：并发写入 TopologyMemory 已加线程锁（见 topology_memory._MEM_LOCK），
+        不会因并发 record 互相覆盖丢数据。
+    """
+
+    def __init__(self, max_workers: "Optional[int]" = None,
+                 route: bool = True, auto_select_models: bool = False,
+                 memory_enabled: bool = True, data_fill_budget: int = 2,
+                 evolve_enabled: bool = True, quality_threshold: "Optional[float]" = None,
+                 on_goal_done: "Optional[callable]" = None):
+        self.max_workers = max_workers
+        self.route = route
+        self.auto_select_models = auto_select_models
+        self.memory_enabled = memory_enabled
+        self.data_fill_budget = data_fill_budget
+        self.evolve_enabled = evolve_enabled
+        self.quality_threshold = quality_threshold
+        self.on_goal_done = on_goal_done
+        self._events: list = []
+
+    # ---- 归一化输入：str / dict({goal,images?,audio?,goal_id?}) / Goal ----
+    @staticmethod
+    def _normalize(goals):
+        out = []
+        for i, g in enumerate(goals):
+            if isinstance(g, str):
+                out.append({"goal_id": f"g{i}", "goal": g,
+                            "images": None, "audio": None})
+            elif isinstance(g, dict):
+                out.append({
+                    "goal_id": g.get("goal_id", f"g{i}"),
+                    "goal": g.get("goal", ""),
+                    "images": g.get("images"),
+                    "audio": g.get("audio"),
+                })
+            else:  # Goal 对象（compiler.goal.Goal）
+                out.append({"goal_id": f"g{i}",
+                            "goal": getattr(g, "description", str(g)),
+                            "images": None, "audio": None})
+        return out
+
+    # ---- 编译一个 goal 为 spec（复用 _run_goal 同源逻辑）----
+    def _prepare_spec(self, goal_text, images=None, audio=None):
+        from compiler.nl_parser import GoalParser
+        from compiler.compile import compile_goal
+        parser = GoalParser()
+        if images or audio:
+            goal = parser.parse_multimodal(goal_text, images=images, audio=audio)
+        else:
+            goal = parser.parse(goal_text)
+        spec = compile_goal(goal, auto_bind=True, route=self.route,
+                            memory_enabled=self.memory_enabled,
+                            auto_select_models=self.auto_select_models)
+        qt = self.quality_threshold
+        if qt is not None:
+            for comp in spec.get("components", {}).values():
+                if comp.get("type") in ("adc", "verify"):
+                    comp["threshold"] = float(qt)
+        return goal, spec
+
+    # ---- 执行单个 goal（资源隔离：独立 backend + 独立 CircuitExecutor）----
+    def _execute_one(self, goal_id, goal_text, images=None, audio=None):
+        import random
+        _t0 = time.perf_counter()
+        try:
+            goal, spec = self._prepare_spec(goal_text, images, audio)
+            # 隔离随机源：按 (goal_id, goal_text) 派生稳定种子，互不干扰
+            seed = abs(sum(ord(ch) for ch in (goal_id + goal_text))) % (2 ** 31)
+            backend = SimBackend(random.Random(seed))
+            circuit = Circuit(spec, backend)
+            executor = CircuitExecutor(
+                circuit,
+                data_fill_budget=self.data_fill_budget,
+                evolve_enabled=self.evolve_enabled,
+                memory_enabled=self.memory_enabled,
+                auto_select_models=self.auto_select_models,
+            )
+            result = executor.run()
+            # ④ 多模态：透传真实输入模态
+            result["modality"] = getattr(goal, "attachment_type", "text")
+            result["attachments"] = getattr(goal, "attachments", [])
+            if self.on_goal_done is not None:
+                try:
+                    self.on_goal_done(goal_id, result)
+                except Exception:
+                    pass
+            elapsed = (time.perf_counter() - _t0) * 1000.0
+            return {"goal_id": goal_id, "goal": goal_text,
+                    "status": "done", "result": result, "error": None,
+                    "elapsed_ms": round(elapsed, 1)}
+        except Exception as e:
+            elapsed = (time.perf_counter() - _t0) * 1000.0
+            return {"goal_id": goal_id, "goal": goal_text,
+                    "status": "error", "result": None, "error": str(e),
+                    "elapsed_ms": round(elapsed, 1)}
+
+    # ---- 聚合结果 ----
+    def _aggregate(self, n, results, wall_ms, max_workers):
+        succeeded = sum(1 for r in results.values() if r["status"] == "done")
+        failed = n - succeeded
+        agg_quality = 0.0
+        agg_cost = 0.0
+        # 串行成本 = 各 goal 真实执行耗时之和（真正的「若串行会花多久」）。
+        # 远比模拟 tier latency 诚实：parse/compile/execute 的 CPU 开销都计入。
+        seq_ms = sum(r.get("elapsed_ms", 0.0) for r in results.values())
+        for r in results.values():
+            if r["status"] == "done":
+                agg_quality = max(agg_quality, r["result"].get("final_quality", 0.0))
+                agg_cost += r["result"].get("total_cost", 0.0)
+        # speedup = 串行和 / 墙钟：理想并发→接近目标数；串行→≈1。
+        speedup = round(seq_ms / wall_ms, 2) if wall_ms > 0 else None
+        return {
+            "batch_id": uuid.uuid4().hex[:12],
+            "total": n,
+            "succeeded": succeeded,
+            "failed": failed,
+            "parallel": (max_workers > 1 and n > 1),
+            "max_workers": max_workers,
+            "wall_time_ms": round(wall_ms, 1),
+            "sequential_est_ms": round(seq_ms, 1),
+            "speedup": speedup,
+            "aggregate_final_quality": round(agg_quality, 3),
+            "aggregate_cost": round(agg_cost, 4),
+            "results": results,
+        }
+
+    # ---- 主入口：并发执行一批 goal ----
+    def run(self, goals):
+        """goals: list of (str | dict | Goal)。返回汇聚结果 dict（见 _aggregate）。"""
+        tasks = self._normalize(goals)
+        n = len(tasks)
+        if n == 0:
+            return self._aggregate(0, {}, 0.0, 1)
+        max_workers = self.max_workers or min(n, 8)
+
+        results = {}
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {}
+            for t in tasks:
+                fut = ex.submit(self._execute_one, t["goal_id"], t["goal"],
+                                t["images"], t["audio"])
+                fut_map[fut] = t["goal_id"]
+            for fut in fut_map:
+                gid = fut_map[fut]
+                try:
+                    res = fut.result(timeout=120)
+                except Exception as e:
+                    res = {"goal_id": gid, "goal": "", "status": "error",
+                           "result": None, "error": str(e), "elapsed_ms": 0.0}
+                results[gid] = res
+        wall = (time.perf_counter() - t0) * 1000.0
+        return self._aggregate(n, results, wall, max_workers)
+
+    # ---- 流式：按完成顺序逐 goal yield 事件，最后 yield 汇总 ----
+    def run_stream(self, goals):
+        """生成器：每完成一个 goal → yield {"type":"goal_done", ...}；
+        全部完成后 → yield {"type":"batch_result", "summary": {...}}。"""
+        tasks = self._normalize(goals)
+        n = len(tasks)
+        if n == 0:
+            yield {"type": "batch_result",
+                   "summary": self._aggregate(0, {}, 0.0, 1)}
+            return
+        max_workers = self.max_workers or min(n, 8)
+        results = {}
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {}
+            for t in tasks:
+                fut = ex.submit(self._execute_one, t["goal_id"], t["goal"],
+                                t["images"], t["audio"])
+                fut_map[fut] = t["goal_id"]
+            for fut in as_completed(list(fut_map.keys())):
+                gid = fut_map[fut]
+                try:
+                    res = fut.result(timeout=120)
+                except Exception as e:
+                    res = {"goal_id": gid, "goal": "", "status": "error",
+                           "result": None, "error": str(e), "elapsed_ms": 0.0}
+                results[gid] = res
+                self._events.append(res)
+                yield {
+                    "type": "goal_done",
+                    "goal_id": gid,
+                    "goal": res["goal"],
+                    "status": res["status"],
+                    "final_quality": (res["result"].get("final_quality")
+                                     if res["status"] == "done" else None),
+                    "error": res["error"],
+                }
+        wall = (time.perf_counter() - t0) * 1000.0
+        summary = self._aggregate(n, results, wall, max_workers)
+        yield {"type": "batch_result", "summary": summary}
+
+
+def batch_executor_selftest():
+    """⑥ 多任务并行离线自检（无 key/无网）：并发正确性 + 资源隔离 + 汇聚。"""
+    import random
+    # 强制离线解析（避免 env 里的 AGENT_API_KEY 让 GoalParser 走真实 LLM，
+    # 既慢又依赖网络）：BatchExecutor 内部 GoalParser() 默认读该环境变量。
+    os.environ.pop("AGENT_API_KEY", None)
+
+    # 1) 并发执行 N 个独立 goal，全部成功且 key 完整
+    goals = [f"分析第{i}个数据集并总结" for i in range(6)]
+    be = BatchExecutor(max_workers=4, memory_enabled=False, evolve_enabled=False)
+    agg = be.run(goals)
+    assert agg["total"] == 6, f"应有 6 个目标，实际 {agg['total']}"
+    assert agg["succeeded"] == 6, f"应全部成功，实际 succeeded={agg['succeeded']}"
+    assert agg["failed"] == 0
+    assert set(agg["results"].keys()) == {f"g{i}" for i in range(6)}, \
+        "结果应按 goal_id 索引"
+    assert agg["parallel"] is True, "6 目标/4 线程 → parallel 应为 True"
+    # 每个 goal 都产出有效结果
+    for gid, r in agg["results"].items():
+        assert r["status"] == "done"
+        assert r["result"]["final_quality"] > 0
+    print(f"✓ ⑥ 并发执行: {agg['total']} 目标 / {agg['max_workers']} 线程 → "
+          f"成功 {agg['succeeded']}，全部产出有效结果；wall={agg['wall_time_ms']:.0f}ms")
+
+    # 2) 资源隔离：并发 N 个 goal，各自 state 独立（不同对象 + 仅含自身数据）
+    goals2 = ["总结第一段文本A", "总结第二段文本B", "分析并对比两个模型C"]
+    be2 = BatchExecutor(max_workers=3, memory_enabled=False, evolve_enabled=False)
+    agg2 = be2.run(goals2)
+    assert agg2["succeeded"] == 3, "三条正常 goal 应全成功"
+    assert agg2["failed"] == 0
+    states = {gid: r["result"]["state"] for gid, r in agg2["results"].items()}
+    # 对象身份互不相同 → 独立 state 黑板（无共享可变状态 → 并发不串扰）
+    assert len({id(s) for s in states.values()}) == len(states), \
+        "每个 goal 应有独立的 state 对象（资源隔离）"
+    print(f"✓ ⑥ 资源隔离: {agg2['total']} 目标各自独立 state 黑板（对象身份互异）"
+          f"+ 独立编译后端，并发执行互不串扰")
+
+    # 3) 汇聚字段齐全 + speedup 计算
+    assert "wall_time_ms" in agg and "sequential_est_ms" in agg
+    assert agg["speedup"] is not None, "speedup 应已计算"
+    assert agg["aggregate_final_quality"] > 0
+    print(f"✓ ⑥ 汇聚: speedup={agg['speedup']} · 聚合质量={agg['aggregate_final_quality']:.3f}"
+          f" · 聚合成本={agg['aggregate_cost']:.4f}")
+
+    # 4) 单 goal 退化：返回结构一致
+    agg3 = BatchExecutor(memory_enabled=False, evolve_enabled=False).run(["单独一个任务"])
+    assert agg3["total"] == 1 and agg3["succeeded"] == 1
+    assert agg3["parallel"] is False, "单 goal 不应标记并行"
+    print("✓ ⑥ 退化: 单 goal 批量结构一致且 parallel=False（零回归）")
+
+    # 5) 流式 run_stream：按完成顺序 yield + 末尾汇总
+    evs = list(BatchExecutor(memory_enabled=False, evolve_enabled=False)
+               .run_stream(["流式任务A", "流式任务B", "流式任务C"]))
+    goal_dones = [e for e in evs if e["type"] == "goal_done"]
+    batch_res = [e for e in evs if e["type"] == "batch_result"]
+    assert len(goal_dones) == 3, f"应有 3 个 goal_done 事件，实际 {len(goal_dones)}"
+    assert len(batch_res) == 1, "末尾应恰有 1 个 batch_result 汇总"
+    assert batch_res[0]["summary"]["succeeded"] == 3
+    print(f"✓ ⑥ 流式: run_stream 按完成顺序 yield {len(goal_dones)} 个 goal_done "
+          f"+ 1 个 batch_result 汇总")
+
+    print("\n⑥ 多任务并行 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -1681,6 +1956,7 @@ if __name__ == "__main__":
     human_intervention_selftest()
     stream_selftest()
     multi_backend_selftest()
+    batch_executor_selftest()
 
 
 def load(path):

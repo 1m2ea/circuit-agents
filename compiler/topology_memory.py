@@ -20,7 +20,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+
+# ⑥ 多任务并行：record/recall 可能被多个线程同时调用（BatchExecutor 并发执行）。
+# 该锁保护「读 _store + 写文件」的临界区，避免并发 record 互相覆盖丢数据、
+# 以及 recall 读到半写的 _store。细粒度（仅临界区），不影响单线程性能。
+_MEM_LOCK = threading.Lock()
 
 
 class TopologyMemory:
@@ -65,32 +71,36 @@ class TopologyMemory:
         返回 entry dict（或 None 表示记录失败）。零回归：任何异常静默吞掉。
         """
         try:
-            # 提取电阻节点的能力标签
-            components = spec.get("components", {})
-            caps = [c.get("label", "") for c in components.values()
-                    if c.get("type") == "resistor"]
+            # ⑥ 线程安全：临界区内「重新加载 → 追加 → 写回」，
+            # 避免 BatchExecutor 并发执行时各实例 _store 相互独立、互相覆盖丢数据。
+            with _MEM_LOCK:
+                self._store = self._load()
+                # 提取电阻节点的能力标签
+                components = spec.get("components", {})
+                caps = [c.get("label", "") for c in components.values()
+                        if c.get("type") == "resistor"]
 
-            entry = {
-                "goal_desc": (goal_desc or "")[:500],  # 截断防膨胀
-                "spec_name": spec.get("name", ""),
-                "capabilities": caps,
-                "n_nodes": len(components),
-                "spec": spec,
-                "result": {
-                    "success": result.get("success", False),
-                    "final_quality": result.get("final_quality", 0),
-                    "total_latency_ms": result.get("total_latency_ms", 0),
-                    "total_cost": result.get("total_cost", 0),
-                },
-                "failed_nodes": [c for c, v in (result.get("components") or {}).items()
-                                 if not v.get("ok")],
-                "timestamp": time.time(),
-            }
-            self._store["entries"].append(entry)
-            # FIFO 上限 100 条
-            if len(self._store["entries"]) > 100:
-                self._store["entries"] = self._store["entries"][-100:]
-            self._save()
+                entry = {
+                    "goal_desc": (goal_desc or "")[:500],  # 截断防膨胀
+                    "spec_name": spec.get("name", ""),
+                    "capabilities": caps,
+                    "n_nodes": len(components),
+                    "spec": spec,
+                    "result": {
+                        "success": result.get("success", False),
+                        "final_quality": result.get("final_quality", 0),
+                        "total_latency_ms": result.get("total_latency_ms", 0),
+                        "total_cost": result.get("total_cost", 0),
+                    },
+                    "failed_nodes": [c for c, v in (result.get("components") or {}).items()
+                                     if not v.get("ok")],
+                    "timestamp": time.time(),
+                }
+                self._store["entries"].append(entry)
+                # FIFO 上限 100 条
+                if len(self._store["entries"]) > 100:
+                    self._store["entries"] = self._store["entries"][-100:]
+                self._save()
             return entry
         except Exception:
             return None
@@ -105,35 +115,38 @@ class TopologyMemory:
         if not goal_words:
             return None
 
-        best = None
-        best_score = 0.0
-        for entry in self._store.get("entries", []):
-            # 只推荐成功的、质量达标的
-            r = entry.get("result", {})
-            if not r.get("success") or r.get("final_quality", 0) < min_quality:
-                continue
+        # ⑥ 加锁 + 锁内重载：既防止读到并发 record 半写的 _store，也读到最新提交记录
+        with _MEM_LOCK:
+            self._store = self._load()
+            best = None
+            best_score = 0.0
+            for entry in self._store.get("entries", []):
+                # 只推荐成功的、质量达标的
+                r = entry.get("result", {})
+                if not r.get("success") or r.get("final_quality", 0) < min_quality:
+                    continue
 
-            entry_words = set(self._tokenize(entry.get("goal_desc", "")))
-            if not entry_words:
-                continue
+                entry_words = set(self._tokenize(entry.get("goal_desc", "")))
+                if not entry_words:
+                    continue
 
-            # Jaccard 相似度
-            overlap = len(goal_words & entry_words)
-            union = len(goal_words | entry_words)
-            score = overlap / union if union else 0.0
+                # Jaccard 相似度
+                overlap = len(goal_words & entry_words)
+                union = len(goal_words | entry_words)
+                score = overlap / union if union else 0.0
 
-            if score > best_score:
-                best_score = score
-                best = entry
+                if score > best_score:
+                    best_score = score
+                    best = entry
 
-        if best and best_score >= min_similarity:
-            return {
-                "spec": best.get("spec", {}),
-                "score": round(best_score, 3),
-                "original_goal": best.get("goal_desc", ""),
-                "quality": best.get("result", {}).get("final_quality", 0),
-            }
-        return None
+            if best and best_score >= min_similarity:
+                return {
+                    "spec": best.get("spec", {}),
+                    "score": round(best_score, 3),
+                    "original_goal": best.get("goal_desc", ""),
+                    "quality": best.get("result", {}).get("final_quality", 0),
+                }
+            return None
 
     def stats(self) -> dict:
         """返回记忆表统计（条数、成功率、平均质量）。"""
