@@ -540,7 +540,8 @@ class CircuitExecutor:
                  events: "Optional[list]" = None, scope: str = "",
                  verify_backend: "Optional[object]" = None,
                  memory_enabled: bool = True,
-                 human_callback: "Optional[callable]" = None):
+                 human_callback: "Optional[callable]" = None,
+                 auto_select_models: bool = False):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
@@ -574,6 +575,8 @@ class CircuitExecutor:
         self.memory_enabled = memory_enabled
         # D 人机协同：质量门耗尽时调 human_callback 请求人类介入（零回归：None=现行行为）
         self.human_callback = human_callback
+        # ③ 智能模型选型：执行前按复杂度/历史/约束微调每个电阻的 model/skills
+        self.auto_select_models = auto_select_models
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -666,6 +669,16 @@ class CircuitExecutor:
         self._t0 = time.perf_counter()
         out = {}
         layers = self.circuit.layers()
+        # ③ 智能模型选型：执行前按复杂度/历史/约束微调电阻 model/skills
+        if self.auto_select_models:
+            try:
+                from compiler.model_selector import ModelSelector
+                from compiler.topology_memory import TopologyMemory
+                mem = TopologyMemory() if self.memory_enabled else None
+                ms = ModelSelector(memory=mem)
+                ms.apply_to_spec(self.circuit.spec)
+            except Exception:
+                pass  # 选型失败 → 沿用原 spec 不变（零回归）
         self._emit("start",
                    spec=self.circuit.spec.get("name", "unnamed"),
                    nodes=len(self.circuit.components),

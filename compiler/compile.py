@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .binder import Binder
 from .goal import Goal
+from .model_selector import ModelSelector
 from .netlister import Netlister
 from .optimizer import Optimizer
 from .router import Router
@@ -59,13 +60,16 @@ def _infer_evolve_requests(spec):
 
 
 def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
-                 no_adapters: bool = False, memory_enabled: bool = True) -> dict:
+                 no_adapters: bool = False, memory_enabled: bool = True,
+                 auto_select_models: bool = False) -> dict:
     """返回可直接被 runtime.py 加载的 spec dict；附带 binder_report。
 
     route=True 时走 M2 Router（依赖分层 + 并联布线 + 可选格式适配器），
     否则走 M0 Netlister（线性串联）。no_adapters=True 关闭第二层②格式适配器。
     memory_enabled=True 时（C 记忆与学习）：编译前查 TopologyMemory，
     命中成功且高质量的历史拓扑 → 直接复用（标注 memory_hit），跳过重新编译。
+    auto_select_models=True 时（③ 智能模型选型）：编译后用 ModelSelector
+    按复杂度/历史/约束为每个电阻推荐 (tier, skills)，覆盖 Binder 的静态映射。
     """
     # C 记忆与学习：编译前查记忆，命中则复用
     if memory_enabled:
@@ -103,6 +107,17 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
     import re as _re
     if _re.search(r"(人工|人审|需确认|需审核|人工介入|human.{0,4}review)", goal.description or ""):
         spec["human_intervention"] = True
+    # ③ 智能模型选型：编译后按复杂度/历史/约束微调每个电阻的 model/skills
+    if auto_select_models:
+        try:
+            mem = None
+            if memory_enabled:
+                from .topology_memory import TopologyMemory
+                mem = TopologyMemory()
+            ms = ModelSelector(memory=mem)
+            ms.apply_to_spec(spec)
+        except Exception:
+            pass  # 选型失败 → 沿用 Binder 结果（零回归）
     return spec
 
 

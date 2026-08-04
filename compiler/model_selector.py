@@ -1,0 +1,489 @@
+"""
+circuit-agents · compiler.model_selector
+========================================
+M? 阶段：智能模型选型 —— 基于任务复杂度、历史执行数据、成本/延迟约束，
+为每个电阻节点自动推荐 (tier, model, skills)。
+
+选型策略（多因子加权，可在运行时关闭以回到静态映射）：
+  - 复杂度评估：能力数 + 约束密度 → complexity score (0–1)
+  - 历史适配：TopologyMemory 查同类任务历史上哪个 tier 成功率高 → 偏向它
+  - 成本约束：spec.constraints.max_cost/max_latency_ms → 自动降档
+  - 最低质量：spec.constraints.min_quality → 强制不低于某个 tier
+
+与 Binder 的关系：
+  - Binder 做 per-capability 的贪心选型（按 min_quality 取最便宜达标档）
+  - ModelSelector 在此基础上叠加 per-node 的复杂度/历史/成本微调
+  - 默认关闭（auto_select_models=False），零回归
+
+依赖：runtime._TIERS（档位画像）、compiler.llm_agents.CAPABILITY_PROMPTS（技能映射）、
+      compiler.topology_memory.TopologyMemory（历史记录）
+"""
+from __future__ import annotations
+
+import runtime
+
+
+class ModelSelector:
+    """自动为每个电路节点选择最优 (tier, skills) 组合。
+
+    用法
+    ----
+    >>> ms = ModelSelector(memory=TopologyMemory())
+    >>> recs = ms.select(spec)  # {node_id: {"tier": "large", "skills": [...], "model": "..."}}
+    >>> # 然后在 compile_goal 或 CircuitExecutor 中用 recs 覆盖节点的 model/skills 字段
+    """
+
+    # 档位顺序（用于比较"哪个档更高"）
+    _TIER_ORDER = {"small": 0, "large": 1, "tool": 2}
+
+    def __init__(self, memory=None):
+        """
+        Parameters
+        ----------
+        memory : TopologyMemory or None
+            如果提供，查历史记录做自适应推荐；None 则只靠复杂度+约束。
+        """
+        self.memory = memory
+        # 从 runtime 复用档位画像（与 Binder 同源，保证一致）
+        self._tiers = runtime.SimBackend._TIERS
+
+    # ── 公开入口 ──────────────────────────────────────────────
+
+    def select(self, spec: dict) -> dict:
+        """返回 {node_id: {tier, model, skills, reason}} 的推荐字典。
+
+        spec 格式 = compile_goal 的产物（含 capabilities/constraints/components/description）。
+        components 是 {cid: {type, label, model, capability, ...}, ...} 的字典。
+        """
+        caps = spec.get("capabilities", [])
+        constraints = spec.get("constraints", {}) or spec.get("goal", {}).get("constraints", {})
+        goal_desc = spec.get("description", "") or spec.get("name", "")
+        # components 是 dict，只取 type=="resistor" 的条目
+        all_components = spec.get("components", {})
+        resistors = [(cid, comp) for cid, comp in all_components.items()
+                     if comp.get("type") == "resistor"]
+
+        # 1) 复杂度评分
+        complexity = self._complexity_score(caps, constraints)
+
+        # 2) 历史查档（同类任务各能力的历史成功率）
+        history = self._history_stats(goal_desc)
+
+        # 3) 逐节点选型
+        result = {}
+        for cid, comp in resistors:
+            cap = comp.get("capability") or comp.get("label", "")
+            rec = self._select_for_node(cap, complexity, constraints,
+                                        history.get(cap))
+            result[cid] = rec
+
+        return result
+
+    def apply_to_spec(self, spec: dict) -> dict:
+        """直接修改 spec.components 中每个电阻的 model/skills 字段（就地修改 + 返回）。"""
+        recs = self.select(spec)
+        for cid, comp in spec.get("components", {}).items():
+            rec = recs.get(cid)
+            if rec and comp.get("type") == "resistor":
+                comp["model"] = rec["tier"]
+                if rec.get("skills"):
+                    comp["skills"] = rec["skills"]
+                comp["_model_reason"] = rec.get("reason", "")
+        return spec
+
+    # ── 复杂度评估 ────────────────────────────────────────────
+
+    def _complexity_score(self, caps: list, constraints: dict) -> float:
+        """0–1 评分：越高 = 任务越复杂 → 倾向 higher tier。
+
+        因子：
+          - 能力数量（0–0.4）
+          - 约束数量（0–0.3）
+          - min_quality 紧度（0–0.2）
+          - max_latency 紧度（0–0.1）
+        """
+        score = 0.0
+
+        # 能力数：1 个=0, 10+=0.4
+        n = len(caps)
+        score += min(n / 10.0, 1.0) * 0.4
+
+        # 约束数
+        c_keys = ["max_latency_ms", "max_cost", "min_quality", "max_chars"]
+        n_c = sum(1 for k in c_keys if constraints.get(k) is not None)
+        score += (n_c / len(c_keys)) * 0.3
+
+        # min_quality 紧度
+        q = constraints.get("min_quality", 0.0)
+        if q > 0.8:
+            score += 0.2
+        elif q > 0.5:
+            score += 0.1
+
+        # max_latency 紧度（越短越难）
+        lat = constraints.get("max_latency_ms")
+        if lat is not None:
+            if lat < 500:
+                score += 0.1
+            elif lat < 1000:
+                score += 0.05
+
+        return min(score, 1.0)
+
+    # ── 历史查档 ──────────────────────────────────────────────
+
+    def _history_stats(self, goal_desc: str) -> dict:
+        """从 TopologyMemory 查同类任务的历史模型选型。
+
+        返回 {capability_name: {"success_rate": float, "best_tier": str}}。
+        基于 recall() 的最相似条目 + 内存文件全量扫（若可用）。
+        """
+        if not self.memory:
+            return {}
+
+        stats = {}
+
+        # 方式1：recall 返回最相似的一条成功记录
+        recalled = self.memory.recall(goal_desc)
+        if recalled:
+            spec = recalled.get("spec", {})
+            components = spec.get("components", {})
+            quality = recalled.get("quality", 0.5)
+            for cid, node in components.items():
+                if node.get("type") != "resistor":
+                    continue
+                cap = node.get("capability") or node.get("label", "")
+                tier = node.get("model", "small")
+                if cap not in stats:
+                    stats[cap] = {"success_rate": 1.0, "best_tier": tier,
+                                  "quality": quality}
+                elif quality > stats[cap].get("quality", 0):
+                    stats[cap] = {"success_rate": 1.0, "best_tier": tier,
+                                  "quality": quality}
+
+        # 方式2：扫文件内所有成功条目（若 _path 可用）
+        try:
+            mem_path = getattr(self.memory, '_path', None)
+            if mem_path:
+                import json, os
+                if os.path.exists(mem_path):
+                    with open(mem_path, 'r', encoding='utf-8') as f:
+                        raw = json.load(f)
+                    entries = raw.get("entries", [])
+                    for entry in entries:
+                        if not entry.get("result", {}).get("success"):
+                            continue
+                        spec = entry.get("spec", {})
+                        components = spec.get("components", {})
+                        for cid, node in components.items():
+                            if node.get("type") != "resistor":
+                                continue
+                            cap = node.get("capability") or node.get("label", "")
+                            tier = node.get("model", "small")
+                            if cap not in stats:
+                                stats[cap] = {"success_rate": 1.0, "best_tier": tier,
+                                              "quality": entry.get("result", {}).get("quality", 0.5)}
+        except Exception:
+            pass
+
+        return stats
+
+    # ── 逐节点选型 ────────────────────────────────────────────
+
+    def _select_for_node(self, cap: str, complexity: float,
+                         constraints: dict, history: dict) -> dict:
+        """为一个节点推荐 (tier, model, skills, reason)。"""
+        reasons = []
+
+        # 1) 复杂度驱动的基础 tier
+        if complexity < 0.25:
+            base_tier = "small"
+            reasons.append(f"复杂度低({complexity:.2f})→small")
+        elif complexity < 0.55:
+            base_tier = "large"
+            reasons.append(f"复杂度中({complexity:.2f})→large")
+        else:
+            base_tier = "tool"
+            reasons.append(f"复杂度高({complexity:.2f})→tool")
+
+        tier = base_tier
+
+        # 2) min_quality 约束（Binder 已做，这里做二次校验）
+        q_min = constraints.get("min_quality", 0.0)
+        if q_min > 0:
+            # 找到满足 min_quality 的最低 tier
+            candidates = sorted(self._tiers.items(),
+                                key=lambda x: (x[1]["cost"], -x[1]["yld"]))
+            for t, d in candidates:
+                if d["accuracy"] >= q_min:
+                    if self._TIER_ORDER.get(t, 0) > self._TIER_ORDER.get(tier, 0):
+                        tier = t
+                        reasons.append(f"min_quality={q_min}需≥{t}")
+                    break
+
+        # 3) 成本约束降档
+        max_cost = constraints.get("max_cost")
+        if max_cost is not None and max_cost > 0:
+            node_count = max(1, len(constraints.get("capabilities", [])))
+            per_node_budget = max_cost / node_count
+            current_cost = self._tiers.get(tier, {}).get("cost", 0.001)
+            if current_cost > per_node_budget:
+                # 降档到满足预算的最高 tier
+                for t in ["small", "large", "tool"]:
+                    tc = self._tiers.get(t, {}).get("cost", 0.001)
+                    if tc <= per_node_budget:
+                        tier = t
+                        reasons.append(f"max_cost={max_cost}→{t}")
+                        break
+
+        # 4) 延迟约束降档
+        max_lat = constraints.get("max_latency_ms")
+        if max_lat is not None and max_lat > 0:
+            node_count = max(1, len(constraints.get("capabilities", [])))
+            per_node_lat = max_lat / node_count
+            current_lat = self._tiers.get(tier, {}).get("latency", 200)
+            if current_lat > per_node_lat:
+                for t in ["small", "large", "tool"]:
+                    tl = self._tiers.get(t, {}).get("latency", 200)
+                    if tl <= per_node_lat:
+                        tier = t
+                        reasons.append(f"max_lat={max_lat}ms→{t}")
+                        break
+
+        # 5) 历史驱动升档（只升不降）
+        if history:
+            hist_tier = history.get("best_tier", "small")
+            success_rate = history.get("success_rate", 1.0)
+            if self._TIER_ORDER.get(hist_tier, 0) > self._TIER_ORDER.get(tier, 0):
+                if success_rate >= 0.7:
+                    tier = hist_tier
+                    reasons.append(f"历史最佳={hist_tier}(成功率{success_rate:.0%})")
+
+        # 6) 技能推荐
+        skills = self._skills_for(cap, tier)
+
+        return {
+            "tier": tier,
+            "model": tier,  # 实际 model 名由 backend._resolve_model(tier) 解析
+            "skills": skills,
+            "reason": " | ".join(reasons) if reasons else "默认静态映射",
+        }
+
+    # ── 技能匹配 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _skills_for(cap: str, tier: str) -> list:
+        """从 CAPABILITY_PROMPTS 获取该能力在当前档位应绑定的技能列表。
+
+        当前直接返回提示词模板中声明的技能（与 LLMAgentBackend._tools_for 同源）。
+        未来可在此处叠加复杂度/历史过滤。
+        """
+        try:
+            from .llm_agents import CAPABILITY_PROMPTS
+        except ImportError:
+            return []
+        tmpl = CAPABILITY_PROMPTS.get(cap, {})
+        return list(tmpl.get("skills", []))
+
+
+# ── 离线自检 ──────────────────────────────────────────────────
+
+def selftest():
+    """离线验证：选型逻辑合理、零回归路径安全。"""
+    import random as _rng
+    rng = _rng.Random(42)
+
+    # ---- 1) 低复杂度 → small ----
+    spec = {
+        "capabilities": ["summarize"],
+        "constraints": {},
+        "description": "简单摘要",
+        "components": {
+            "summarize": {"type": "resistor", "label": "summarize",
+                          "capability": "summarize", "model": "small"},
+        },
+    }
+    ms = ModelSelector(memory=None)
+    recs = ms.select(spec)
+    assert recs["summarize"]["tier"] == "small", \
+        f"低复杂度应选 small，实际: {recs['summarize']['tier']}"
+    print("✓ 低复杂度 → small")
+
+    # ---- 2) 高复杂度 → tool ----
+    spec["capabilities"] = ["retrieve", "extract", "reason", "calculate",
+                            "verify", "classify", "compare", "organize", "summarize"]
+    spec["description"] = "综合研究报告+对比分析+预测+分解"
+    spec["components"] = {
+        f"n{i}": {"type": "resistor", "label": c, "capability": c, "model": "small"}
+        for i, c in enumerate(spec["capabilities"])
+    }
+    recs = ms.select(spec)
+    first_node = spec["capabilities"][0]
+    first_nid = "n0"
+    assert recs[first_nid]["tier"] in ("large", "tool"), \
+        f"高复杂度应选 large/tool，实际: {recs[first_nid]['tier']}"
+    print("✓ 高复杂度 → large/tool")
+
+    # ---- 3) min_quality 约束 → 强制高 tier ----
+    spec2 = {
+        "capabilities": ["reason"],
+        "constraints": {"min_quality": 0.95},
+        "description": "高精度推理",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "small"},
+        },
+    }
+    recs = ms.select(spec2)
+    # tool accuracy=0.99 ≥ 0.95, large=0.92 < 0.95 → 应升到 tool
+    assert recs["reason"]["tier"] == "tool", \
+        f"min_quality=0.95 应升到 tool，实际: {recs['reason']['tier']}"
+    print("✓ min_quality=0.95 → tool")
+
+    # ---- 4) max_cost 约束 → 降档 ----
+    spec3 = {
+        "capabilities": ["reason", "calculate"],
+        "constraints": {"max_cost": 0.002},  # very tight budget
+        "description": "极低预算推理",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "large"},
+            "calculate": {"type": "resistor", "label": "calculate",
+                          "capability": "calculate", "model": "large"},
+        },
+    }
+    recs = ms.select(spec3)
+    # 每个节点预算 = 0.001，small cost=0.001 刚好
+    assert recs["reason"]["tier"] == "small", \
+        f"max_cost=0.002/2节点 → 应降 small，实际: {recs['reason']['tier']}"
+    print("✓ max_cost 约束 → 降档到 small")
+
+    # ---- 5) max_latency_ms 约束 → 降档 ----
+    spec4 = {
+        "capabilities": ["reason", "calculate"],
+        "constraints": {"max_latency_ms": 500},
+        "description": "超低延迟推理",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "large"},
+            "calculate": {"type": "resistor", "label": "calculate",
+                          "capability": "calculate", "model": "large"},
+        },
+    }
+    recs = ms.select(spec4)
+    # 每个节点预算 250ms，small latency=200 刚好
+    assert recs["reason"]["tier"] == "small", \
+        f"max_lat=500ms/2节点 → 应降 small，实际: {recs['reason']['tier']}"
+    print("✓ max_latency 约束 → 降档到 small")
+
+    # ---- 6) skills 推荐不空 ----
+    spec5 = {
+        "capabilities": ["retrieve"],
+        "constraints": {},
+        "description": "搜索任务",
+        "components": {
+            "retrieve": {"type": "resistor", "label": "retrieve",
+                         "capability": "retrieve", "model": "small"},
+        },
+    }
+    recs = ms.select(spec5)
+    assert "skills" in recs["retrieve"], "应含 skills 字段"
+    assert isinstance(recs["retrieve"]["skills"], list), "skills 应为列表"
+    print(f"✓ skills 推荐: {recs['retrieve']['skills']}")
+
+    # ---- 7) apply_to_spec 就地修改 ----
+    spec6 = {
+        "capabilities": ["reason"],
+        "constraints": {"min_quality": 0.95},
+        "description": "",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "small"},
+            "cap_0": {"type": "capacitor", "label": "merge"},
+        },
+    }
+    ms.apply_to_spec(spec6)
+    assert spec6["components"]["reason"]["model"] == "tool", \
+        f"apply_to_spec 应修改电阻 model，实际: {spec6['components']['reason']['model']}"
+    # 非电阻节点（capacitor）不应被改
+    assert "model" not in spec6["components"]["cap_0"], \
+        "非电阻节点不应被改 model"
+    assert "_model_reason" in spec6["components"]["reason"], "应有 _model_reason"
+    print("✓ apply_to_spec 仅修改电阻节点 + 留 reason 痕迹")
+
+    # ---- 8) 零回归：无 memory 不崩溃 ----
+    ms_none = ModelSelector(memory=None)
+    spec7 = {
+        "capabilities": ["summarize"],
+        "constraints": {},
+        "description": "test",
+        "components": {
+            "s": {"type": "resistor", "label": "summarize",
+                  "capability": "summarize", "model": "small"},
+        },
+    }
+    recs = ms_none.select(spec7)
+    assert recs["s"]["tier"] == "small", "无 memory 应正常选型"
+    print("✓ 无 memory 不崩溃（零回归）")
+
+    # ---- 9) 空节点列表不崩 ----
+    spec8 = {
+        "capabilities": ["reason"],
+        "constraints": {},
+        "description": "test",
+        "components": {
+            "cap_0": {"type": "capacitor"},
+        },
+    }
+    recs = ms_none.select(spec8)
+    assert recs == {}, "无电阻节点应返回空字典"
+    print("✓ 无电阻节点 → 空字典")
+
+    # ---- 10) 与 TopologyMemory 集成 ----
+    from compiler.topology_memory import TopologyMemory
+    import tempfile, os
+    tmp = os.path.join(tempfile.mkdtemp(), "test_mem.json")
+    mem = TopologyMemory(path=tmp)
+    # 记录一条成功历史：reason 用 large 成功
+    mem.record(
+        "分析GDP数据并预测趋势",
+        {
+            "capabilities": ["retrieve", "reason", "predict"],
+            "components": {
+                "reason": {"type": "resistor", "label": "reason", "model": "large"},
+            },
+        },
+        {
+            "success": True,
+            "final_quality": 0.95,
+            "components": {"reason": {"ok": True}},
+        }
+    )
+    ms_hist = ModelSelector(memory=mem)
+    spec10 = {
+        "capabilities": ["retrieve", "reason"],
+        "constraints": {},
+        "description": "分析GDP数据并预测趋势",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "small"},
+        },
+    }
+    recs = ms_hist.select(spec10)
+    # 历史显示 large 成功 → 应升到 large
+    assert recs["reason"]["tier"] == "large", \
+        f"历史最佳=large → 应升档，实际: {recs['reason']['tier']}"
+    print("✓ TopologyMemory 历史驱动升档")
+
+    # 清理临时文件
+    try:
+        os.unlink(tmp)
+        os.rmdir(os.path.dirname(tmp))
+    except Exception:
+        pass
+
+    print("\nmodel_selector 离线自检全部通过 ✓")
+
+
+if __name__ == "__main__":
+    selftest()
