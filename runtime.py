@@ -690,14 +690,22 @@ class CircuitExecutor:
         out = {}
         layers = self.circuit.layers()
         # ③ 智能模型选型：执行前按复杂度/历史/约束微调电阻 model/skills
+        # Phase 2 ③ 增强：接入 ModelMetrics 真实历史，做成功率/延迟/成本多目标再平衡；
+        #   并把 selector 实例提到 if 外，供执行后回填历史（反馈闭环）。
+        _ms = None
+        _model_recs = None
         if self.auto_select_models:
             try:
-                from compiler.model_selector import ModelSelector
+                from compiler.model_selector import ModelSelector, ModelMetrics
                 from compiler.topology_memory import TopologyMemory
                 mem = TopologyMemory() if self.memory_enabled else None
-                ms = ModelSelector(memory=mem)
-                ms.apply_to_spec(self.circuit.spec)
+                _metrics = ModelMetrics(ModelMetrics.DEFAULT_PATH).load() \
+                    if self.memory_enabled else None
+                _ms = ModelSelector(memory=mem, metrics=_metrics)
+                _model_recs = _ms.select(self.circuit.spec)
+                _ms.apply_to_spec(self.circuit.spec)
             except Exception:
+                _ms = None
                 pass  # 选型失败 → 沿用原 spec 不变（零回归）
         self._emit("start",
                    spec=self.circuit.spec.get("name", "unnamed"),
@@ -845,6 +853,12 @@ class CircuitExecutor:
         quality_report = QualityReport.assess(out, self.circuit.components, fq, _report_thr)
         # Phase 2 技能注册表：解析本拓扑引用了哪些技能、哪些待实现（离线安全）
         _skill_used = SkillRegistry().resolve(self.circuit.components, self.evolve_skill)
+        # Phase 2 ③ 模型选型再平衡：反馈闭环——执行后把真实表现回填 ModelMetrics（零回归）
+        if _ms is not None:
+            try:
+                _ms.record_outcomes(self.circuit.components, out, total_lat, total_cost)
+            except Exception:
+                pass
 
         result = {
             "success": all(out[c].ok for c in terminals),
@@ -862,6 +876,7 @@ class CircuitExecutor:
             "failed_nodes": failed_nodes,
             "quality_report": quality_report,
             "skills_used": _skill_used,
+            "model_selection": _model_recs,
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录

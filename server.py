@@ -600,6 +600,56 @@ def skills_resolve(req: GoalRequest):
     return reg.resolve(components, params.get("evolve_skill"))
 
 
+@app.post("/models")
+def list_models():
+    """Phase 2 ③ 模型选型再平衡：返回档位画像 + 当前再平衡权重 + 已记录的历史统计。"""
+    from runtime import SimBackend
+    from compiler.model_selector import ModelSelector, ModelMetrics
+    mm = ModelMetrics(ModelMetrics.DEFAULT_PATH)
+    try:
+        mm.load()
+    except Exception:
+        pass
+    ms = ModelSelector()  # 仅取默认权重，不依赖 memory/metrics
+    tiers = {}
+    for t, d in SimBackend._TIERS.items():
+        tiers[t] = {"cost": d.get("cost"), "latency": d.get("latency"),
+                    "accuracy": d.get("accuracy"), "yld": d.get("yld")}
+    return {
+        "tiers": tiers,
+        "weights": ms._weights,
+        "recorded_stats": mm.global_stats(),
+        "metric_store": ModelMetrics.DEFAULT_PATH,
+    }
+
+
+@app.post("/models/select")
+def select_models(req: GoalRequest):
+    """Phase 2 ③ 模型选型再平衡：编译一个目标为拓扑，按历史成功率/延迟/成本多目标再平衡选档。
+    只编译不执行（离线安全：强制规则解析，无需 LLM/网络）。"""
+    from compiler.nl_parser import GoalParser
+    from compiler.compile import compile_goal
+    from compiler.model_selector import ModelSelector, ModelMetrics
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线规则解析
+    params = req.model_dump()
+    parser = GoalParser()
+    goal = parser.parse(req.goal)
+    spec = compile_goal(
+        goal,
+        auto_bind=True,
+        route=params.get("route", True),
+        memory_enabled=params.get("memory_enabled", True),
+        auto_select_models=params.get("auto_select_models", False),
+    )
+    mm = ModelMetrics(ModelMetrics.DEFAULT_PATH)
+    try:
+        mm.load()
+    except Exception:
+        pass
+    ms = ModelSelector(metrics=mm)
+    return ms.select(spec)
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1005,6 +1055,33 @@ def selftest():
     assert isinstance(_sr["summary"], str) and _sr["summary"], "/skills/resolve 应给总结"
     print(f"✓ S14 Phase2 注册表(SkillRegistry): 在册 {_sk['count']} 个 · "
           f"示例拓扑解析 → {_resolved['summary']}")
+
+    # S15: Phase 2 ③ 模型选型再平衡（真实历史成功率/延迟/成本多目标再平衡）
+    from compiler.model_selector import ModelSelector, ModelMetrics
+    _mm = ModelMetrics(path=None)
+    for _ in range(10):
+        _mm.record("reason", "small", success=False, latency_ms=200, cost=0.001)
+    for _ in range(10):
+        _mm.record("reason", "large", success=True, latency_ms=1500, cost=0.020)
+    _ms15 = ModelSelector(memory=None, metrics=_mm)
+    _spec15 = {
+        "capabilities": ["reason"], "constraints": {}, "description": "稳定推理",
+        "components": {"reason": {"type": "resistor", "label": "reason",
+                                  "capability": "reason", "model": "small"}},
+    }
+    _r15 = _ms15.select(_spec15)
+    assert _r15["reason"]["tier"] != "small", "真实历史 small 失败率高应避开"
+    assert "再平衡" in _r15["reason"]["reason"], "reason 应标注再平衡"
+    # 端点层面：/models 列表 + /models/select 编译目标并选档
+    _md = list_models()
+    assert set(_md["tiers"].keys()) == {"small", "large", "tool"}, "/models 应列三档"
+    assert "weights" in _md and set(_md["weights"].keys()) == {"quality", "latency", "cost"}, \
+        "/models 应返回再平衡权重"
+    _sel = select_models(GoalRequest(goal="分析GDP并预测趋势"))
+    assert isinstance(_sel, dict) and all("tier" in v for v in _sel.values()), \
+        "/models/select 应返回每节点 tier"
+    print(f"✓ S15 Phase2 ③ 模型选型再平衡(ModelMetrics): 历史避坑→{_r15['reason']['tier']} · "
+          f"/models 三档+权重✓ · /models/select 节点数 {len(_sel)}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
