@@ -33,6 +33,7 @@ import urllib.request
 from .goal import Goal
 from .router_auto import dependencies_from_subtasks, _analyze_dependencies
 from .backend_llm import resolve_api_key
+from .multimodal import MultimodalTranscriber
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +124,15 @@ class GoalParser:
     """NL → Goal 的混合解析器（规则兜底 + 可选 LLM 增强）。"""
 
     def __init__(self, api_key=None, base_url=None, model=None,
-                 timeout=60.0, http_post=None):
+                 timeout=60.0, http_post=None, transcriber=None):
         self.api_key = resolve_api_key(api_key)
         self.base_url = (base_url or os.environ.get("AGENT_API_BASE")
                          or "https://api.deepseek.com/v1").rstrip("/")
         self.model = model or "deepseek-chat"
         self.timeout = timeout
         self._http_post = http_post  # 注入式：离线测试用假响应 / 计数
+        # Phase 2 ② 加深④：多模态真视听觉转录器（默认离线占位，可注入真实后端）
+        self.transcriber = transcriber or MultimodalTranscriber()
 
     # ---- 对外入口 ----
     def parse(self, nl: str) -> Goal:
@@ -151,20 +154,20 @@ class GoalParser:
 
     # ---- 多模态入口（④）：图片/语音 → 文本/struct ----
     def parse_multimodal(self, text: str, images=None, audio=None) -> "Goal":
-        """自然语言 + 多模态附件 → Goal。
+        """自然语言 + 多模态附件 → Goal（Phase 2 ② 加深 ④：真视听觉转录）。
 
-        离线（无 api_key）：图片/语音转为描述占位（[图片: x]/[语音: x]）拼入 NL，
-        再走原 parse（规则/LLM）。在线（有 key）：同样走占位文本（本机无 vision
-        依赖），预留 _vision_transcribe 钩子供接真 vision/ASR。
-        在返回的 Goal 上标注 attachment_type(text/image/audio/mixed) 与 attachments 清单。
+        附件先经 `MultimodalTranscriber` 转写为文本（离线→占位描述，真实后端→内容），
+        转录文本拼入 NL（图片描述/语音转录），使后续编译能基于**真实内容**路由。
+        返回的 Goal 标注 attachment_type(text/image/audio/mixed) 与 attachments 清单
+        （每个附件带 transcription/backend/offline 字段，供前端/服务端回显与调试）。
         """
         images = self._norm_attachments(images, "image")
         audio = self._norm_attachments(audio, "audio")
-        # 在线增强钩子（预留）：有 key 时把图片/语音转写为文本描述
-        extra = self._vision_transcribe(images, audio) if (self.api_key and (images or audio)) else None
+        # 真视听觉转录（加深④）：transcriber 产出 transcription（离线占位 / 真实后端）
+        tr = self.transcriber or MultimodalTranscriber()
+        images = tr.transcribe_all(images)
+        audio = tr.transcribe_all(audio)
         combined = self._build_combined(text, images, audio)
-        if extra:
-            combined = combined + "\n" + extra
         g = self.parse(combined)
         if images and audio:
             atype = "mixed"
@@ -197,17 +200,20 @@ class GoalParser:
 
     @staticmethod
     def _build_combined(text, images, audio):
-        """把图片/语音占位拼入 NL（离线降级核心逻辑）。返回组合文本。"""
+        """把图片/语音标记 + 转录文本拼入 NL（离线降级核心逻辑）。返回组合文本。"""
         parts = []
         for a in images:
             parts.append(f"[图片: {a.get('name', '?')}]")
+            if a.get("transcription"):
+                parts.append(f"图片描述: {a['transcription']}")
         for a in audio:
             parts.append(f"[语音: {a.get('name', '?')}]")
+            if a.get("transcription"):
+                parts.append(f"语音转录: {a['transcription']}")
         return "\n".join([p for p in parts if p] + ([text] if text else []))
 
     def _vision_transcribe(self, images, audio):
-        """在线增强钩子：图片→描述、语音→转写。本期返回 None（占位文本已兜底），
-        预留用 self._http_post 调 vision/ASR 模型，失败则降级。"""
+        """（已废弃）原在线增强钩子，现由 MultimodalTranscriber 取代；保留为空操作兼容旧引用。"""
         return None
 
     # ---- 规则解析（兜底，离线） ----
@@ -666,6 +672,39 @@ def selftest():
     assert g17.attachment_type == "text", f"应 text，实际 {g17.attachment_type}"
     assert "retrieve" in g17.capabilities, "纯文本解析能力不应受影响"
     print("✓ ④ 纯文本零回归：attachment_type=text，解析正常")
+
+    # 18) ② 加深④：注入真实 vision 后端 → 转录文本进入 attachments（offline=False）
+    p18 = GoalParser()
+    tr18 = MultimodalTranscriber()
+    tr18.register("image", "vision", lambda n: f"一张显示季度营收的折线图({n})")
+    tr18.set_default("image", "vision")
+    p18.transcriber = tr18
+    g18 = p18.parse_multimodal("分析这张图表趋势", images=["q.png"])
+    assert g18.attachments and "折线图" in g18.attachments[0]["transcription"], \
+        "注入后端应产出真实转录"
+    assert g18.attachments[0]["offline"] is False, "应走真实后端(offline=False)"
+    assert "图片描述" in g18.attachments[0]["transcription"] or "折线图" in (
+        g18.attachments[0]["transcription"]), "transcription 应进附件"
+    print("✓ ② 加深④：注入 vision 后端 → 图片转录进 attachments(offline=False)")
+
+    # 19) ② 加深④：无注入 → 默认离线占位转录（offline=True，绝不崩）
+    p19 = GoalParser()
+    g19 = p19.parse_multimodal("总结这段录音", audio=["m.wav"])
+    assert g19.attachments[0]["offline"] is True, "默认应走离线占位"
+    assert "待识别" in g19.attachments[0]["transcription"], "离线占位应有待识别描述"
+    print("✓ ② 加深④：无注入 → 离线占位转录(offline=True，零回归)")
+
+    # 20) ② 加深④：转录文本进入 NL，使编译能基于内容路由（图文混合带真实转录）
+    p20 = GoalParser()
+    tr20 = MultimodalTranscriber()
+    tr20.register("image", "vision", lambda n: f"从左到右上升的柱状图({n})")
+    tr20.set_default("image", "vision")
+    p20.transcriber = tr20
+    g20 = p20.parse_multimodal("总结趋势", images=["bars.png"], audio=["v.wav"])
+    assert g20.attachment_type == "mixed", "图文混合应为 mixed"
+    assert any("柱状图" in a.get("transcription", "") for a in g20.attachments), \
+        "真实转录应出现在 attachments"
+    print("✓ ② 加深④：图文混合带真实转录(offline 占位+真实后端混合)")
 
     print("\nM4 nl_parser 离线自检全部通过 ✓")
 

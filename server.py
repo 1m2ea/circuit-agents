@@ -650,6 +650,32 @@ def select_models(req: GoalRequest):
     return ms.select(spec)
 
 
+class TranscribeRequest(BaseModel):
+    images: Optional[list] = None
+    audio: Optional[list] = None
+
+
+@app.post("/transcribe")
+def transcribe(req: TranscribeRequest):
+    """Phase 2 ② 加深④ 多模态真视听觉：把图片/语音附件转写为文本。
+
+    离线（无 key）自动回退占位描述；真实后端由调用方经 MultimodalTranscriber.register
+    注入后启用。只转录、不编译，离线安全（强制无网络）。
+    """
+    from compiler.multimodal import MultimodalTranscriber
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线（转录不依赖 LLM 主解析）
+    tr = MultimodalTranscriber()
+    items = ([{"type": "image", "name": i} for i in (req.images or [])]
+             + [{"type": "audio", "name": a} for a in (req.audio or [])])
+    results = tr.transcribe_all(items)
+    return {
+        "count": len(results),
+        "results": results,  # 每项: name/type/transcription/backend/offline
+        "modalities": {"image": tr.backends("image"),
+                       "audio": tr.backends("audio")},
+    }
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1082,6 +1108,19 @@ def selftest():
         "/models/select 应返回每节点 tier"
     print(f"✓ S15 Phase2 ③ 模型选型再平衡(ModelMetrics): 历史避坑→{_r15['reason']['tier']} · "
           f"/models 三档+权重✓ · /models/select 节点数 {len(_sel)}")
+
+    # S16: Phase 2 ② 加深④ 多模态真视听觉（真实转录器 + 离线降级 + /transcribe 端点）
+    from compiler.multimodal import MultimodalTranscriber
+    _tr16 = MultimodalTranscriber()
+    _t16a = _tr16.transcribe({"type": "image", "name": "x.png"})
+    assert _t16a["offline"] is True and _t16a["transcription"], "离线应占位描述"
+    _t16b = transcribe(TranscribeRequest(images=["a.jpg"], audio=["b.wav"]))
+    assert _t16b["count"] == 2 and all("transcription" in r for r in _t16b["results"]), \
+        "/transcribe 应返回每附件转录"
+    assert _t16b["results"][0]["type"] == "image" and _t16b["results"][1]["type"] == "audio", \
+        "/transcribe 应区分模态"
+    print(f"✓ S16 Phase2 ② 多模态真视听觉(MultimodalTranscriber): 离线占位✓ · "
+          f"/transcribe 返回 {_t16b['count']} 条转录(图+音)")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
