@@ -110,6 +110,15 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
             _runs[run_id]["result"] = result
             _runs[run_id]["spec"] = spec
 
+        # ④ 持久化：自动保存到 SQLite
+        try:
+            from execution_store import ExecutionStore
+            store = ExecutionStore("executions.db")
+            store.save(run_id, goal_text, "done", spec,
+                       node_events + list(executor._events), result)
+        except Exception:
+            pass  # 持久化失败不影响主流程
+
     except Exception as e:
         with _lock:
             _runs[run_id]["status"] = "error"
