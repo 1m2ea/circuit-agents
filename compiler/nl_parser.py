@@ -54,6 +54,13 @@ CAPABILITY_VOCAB = {
     "organize": ["整理", "编排", "排版", "梳理", "汇整", "做成", "列成", "列表", "陈列",
                  "organize", "tabulate", "arrange", "compile", "structure"],
     "summarize": ["摘要", "综述", "概括", "提炼", "abstract", "recap", "overview", "synopsis"],
+    # 第一层能力深化（2026-08-04）：三种新电阻类型
+    "compare":   ["对比", "比较", "对照", "比对", "比一比",
+                 "compare", "contrast", "diff"],
+    "predict":   ["预测", "预估", "推演", "预判", "展望", "推测",
+                 "predict", "forecast", "project", "estimate"],
+    "decompose": ["分解", "拆解", "拆分", "分拆", "拆成",
+                 "decompose", "break_down", "split", "factor"],
 }
 
 # 模态词表
@@ -539,6 +546,32 @@ def selftest():
     io_c = g11.component_io.get("reason", {})
     assert io_c.get("input_map") == {"china_gdp_2024": "gdp_china_2024"}, io_c
     print("✓ 子任务分解+命名漂移映射：下游 china_gdp_2024←上游 gdp_china_2024 建边 + input_map 注入 component_io")
+
+    # 12) 第一层能力深化：compare/predict/decompose 三种新电阻类型规则解析
+    p12 = GoalParser()
+    g12 = p12.parse("对比A公司和B公司的财报数据")
+    assert "compare" in g12.capabilities, f"应识别 compare，实际 {g12.capabilities}"
+    print("✓ 新能力 compare：『对比』→ compare 电阻")
+
+    p12b = GoalParser()
+    g12b = p12b.parse("预测明年GDP增速")
+    assert "predict" in g12b.capabilities, f"应识别 predict，实际 {g12b.capabilities}"
+    print("✓ 新能力 predict：『预测』→ predict 电阻")
+
+    p12c = GoalParser()
+    g12c = p12c.parse("把这个问题拆解成三个子问题分别分析")
+    assert "decompose" in g12c.capabilities, f"应识别 decompose，实际 {g12c.capabilities}"
+    print("✓ 新能力 decompose：『拆解』→ decompose 电阻")
+
+    # 13) 新能力在并行 DAG 中归 sink 层（依赖 source）
+    p13 = GoalParser()
+    g13 = p13.parse("同时检索A和B的数据，对比分析")
+    assert "compare" in g13.capabilities, f"应含 compare，实际 {g13.capabilities}"
+    assert "retrieve" in g13.capabilities, "应含 retrieve"
+    # compare 是 sink，应被 retrieve 喂
+    assert any("compare" in edge[1] for edge in g13.dependencies), \
+        f"compare 应作为 sink 依赖 retrieve，实际 deps={g13.dependencies}"
+    print("✓ 新能力 DAG 分层：compare 作为 sink 依赖 source(retrieve)")
 
     print("\nM4 nl_parser 离线自检全部通过 ✓")
 

@@ -33,6 +33,10 @@ CAP_FORMAT = {
     "translate": (STRUCT, STRUCT),
     "organize":  (STRUCT, STRUCT),
     "summarize": (STRUCT, STRUCT),
+    # 第一层能力深化（2026-08-04）：三种新电阻类型的 I/O 格式
+    "compare":   (STRUCT, STRUCT),   # 消费结构化多方数据 → 产出结构化对比结论
+    "predict":   (STRUCT, STRUCT),   # 消费结构化历史数据 → 产出结构化预测结论
+    "decompose": (RAW, STRUCT),      # 消费原始问题文本 → 产出结构化子问题清单
 }
 
 # 合成适配器能力名前缀：Router 据此前缀识别 format_adapter 节点（区别于真实能力电阻）。

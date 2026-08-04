@@ -21,7 +21,7 @@ from .router import Router
 _RESEARCH_CAPS = {"retrieve", "search", "research", "enumerate", "list",
                   "gather", "collect", "scan", "fetch"}
 _ANALYZE_CAPS = {"reason", "analyze", "compare", "synthesize", "evaluate",
-                 "summarize", "review"}
+                 "summarize", "review", "predict", "decompose"}
 _COLLECT_TOKENS = {"list", "options", "candidates", "frameworks", "items",
                    "results", "papers", "sources", "alternatives", "choices",
                    "top", "set", "findings", "catalog"}
@@ -59,12 +59,34 @@ def _infer_evolve_requests(spec):
 
 
 def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
-                 no_adapters: bool = False) -> dict:
+                 no_adapters: bool = False, memory_enabled: bool = True) -> dict:
     """返回可直接被 runtime.py 加载的 spec dict；附带 binder_report。
 
     route=True 时走 M2 Router（依赖分层 + 并联布线 + 可选格式适配器），
     否则走 M0 Netlister（线性串联）。no_adapters=True 关闭第二层②格式适配器。
+    memory_enabled=True 时（C 记忆与学习）：编译前查 TopologyMemory，
+    命中成功且高质量的历史拓扑 → 直接复用（标注 memory_hit），跳过重新编译。
     """
+    # C 记忆与学习：编译前查记忆，命中则复用
+    if memory_enabled:
+        try:
+            from .topology_memory import TopologyMemory
+            mem = TopologyMemory()
+            hit = mem.recall(goal.description)
+            if hit is not None:
+                spec = dict(hit["spec"])
+                spec["memory_hit"] = {
+                    "score": hit["score"],
+                    "original_goal": hit["original_goal"],
+                    "quality": hit["quality"],
+                }
+                spec["binder_report"] = None
+                # 仍重新推断 evolve_requests（记忆里的可能过时）
+                spec["evolve_requests"] = _infer_evolve_requests(spec)
+                return spec
+        except Exception:
+            pass  # 记忆查询失败 → 正常编译（零回归）
+
     report = None
     if auto_bind:
         binder = Binder()
@@ -77,6 +99,10 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
         spec = Netlister().compile(goal)
     spec["binder_report"] = report
     spec["evolve_requests"] = _infer_evolve_requests(spec)  # ① 规划器自动产出
+    # D 人机协同：目标含"人工/人审/需确认/需审核"→ spec 标 human_intervention=True
+    import re as _re
+    if _re.search(r"(人工|人审|需确认|需审核|人工介入|human.{0,4}review)", goal.description or ""):
+        spec["human_intervention"] = True
     return spec
 
 

@@ -538,7 +538,9 @@ class CircuitExecutor:
                  evolve_top_k: int = 3, evolve_skill: str = "web_search",
                  verbose: bool = False, on_event: "Optional[callable]" = None,
                  events: "Optional[list]" = None, scope: str = "",
-                 verify_backend: "Optional[object]" = None):
+                 verify_backend: "Optional[object]" = None,
+                 memory_enabled: bool = True,
+                 human_callback: "Optional[callable]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
@@ -568,6 +570,10 @@ class CircuitExecutor:
         self._results = {}
         self._filled_nodes = set()      # 触发过自动补数闭环的节点（橙虚框）
         self._evolved_from_node = None  # 触发 3.5 进化的来源节点（紫⚠）
+        # C 记忆与学习：执行后记录拓扑+结果，供类似任务复用（零回归：失败静默）
+        self.memory_enabled = memory_enabled
+        # D 人机协同：质量门耗尽时调 human_callback 请求人类介入（零回归：None=现行行为）
+        self.human_callback = human_callback
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -683,6 +689,51 @@ class CircuitExecutor:
                         self._emit("retry", node=cid, ok=sig.ok,
                                    budget_left=b,
                                    filled=sig.meta.get("auto_filled", False))
+                    # D 人机协同：预算耗尽仍 fail → 请求人类介入（零回归：无 callback 则跳过）
+                    if sig.meta.get("gate") == "fail_linear" and self.human_callback:
+                        missing = sig.meta.get("missing", [])
+                        upstream = {k: (v.value if hasattr(v, "value") else str(v))
+                                    for k, v in out.items() if hasattr(v, "value")}
+                        self._emit("human_intervention", node=cid, missing=missing)
+                        try:
+                            decision = self.human_callback(
+                                node=cid, missing=missing,
+                                context=upstream, label=comp.get("label"))
+                        except Exception:
+                            decision = "skip"
+                        if decision == "retry":
+                            # 人类提供了上下文，重跑该节点
+                            sig = self.circuit._run_one(cid, out)
+                            self._emit("human_retry", node=cid, ok=sig.ok)
+                        elif decision == "abort":
+                            self._emit("human_abort", node=cid)
+                            out[cid] = sig
+                            self._emit("layer_done", layer_idx=li)
+                            # 提前终止
+                            self._results = out
+                            terminals = [c for c in self.circuit.components
+                                         if not self.circuit.succ[c]]
+                            fq = max((out[c].quality for c in terminals), default=0.0)
+                            total_cost = sum(s.cost for s in out.values())
+                            total_lat = max((s.latency_ms for s in out.values()), default=0.0)
+                            self._emit("done", total_cost=round(total_cost, 4),
+                                       total_latency_ms=round(total_lat, 1),
+                                       final_quality=round(fq, 3), aborted=True)
+                            return {
+                                "success": False, "final_quality": round(fq, 3),
+                                "total_cost": round(total_cost, 4),
+                                "total_latency_ms": total_lat,
+                                "components": {c: {"ok": s.ok, "quality": round(s.quality, 3),
+                                                   "gate": s.meta.get("gate")}
+                                               for c, s in out.items()},
+                                "state": self.state, "evolved": None,
+                                "iterations": 1, "self_healed": {},
+                                "aborted": True, "abort_node": cid,
+                            }
+                        # "skip" 或其它 → 标记跳过，继续执行
+                        if decision == "skip":
+                            sig.meta["human_skipped"] = True
+                            self._emit("human_skip", node=cid)
                 self._emit("node_done", node=cid, ok=sig.ok,
                            quality=round(sig.quality, 3),
                            retried=(cid in self._filled_nodes))
@@ -737,7 +788,7 @@ class CircuitExecutor:
                    total_cost=round(total_cost, 4),
                    total_latency_ms=round(total_lat, 1),
                    final_quality=round(fq, 3))
-        return {
+        result = {
             "success": all(out[c].ok for c in terminals),
             "final_quality": round(fq, 3),
             "total_cost": round(total_cost, 4),
@@ -750,6 +801,16 @@ class CircuitExecutor:
             "iterations": 1,
             "self_healed": {},
         }
+        # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
+        if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
+            try:
+                from compiler.topology_memory import TopologyMemory
+                mem = TopologyMemory()
+                goal_desc = self.circuit.spec.get("description", "")
+                mem.record(goal_desc, self.circuit.spec, result)
+            except Exception:
+                pass
+        return result
 
     # ---- 3.5 多任务进化增强（D）：泛化触发 + 显式提示 + 阈值可配 ----
     def _countable(self, val):
@@ -1248,12 +1309,127 @@ def hetero_verify_selftest():
     print("✓ C 异构校验：verify 节点走独立 backend，其余走主 backend；未配置则退回（零回归）")
 
 
+def memory_record_selftest():
+    """C 记忆与学习：CircuitExecutor 执行后自动记录到 TopologyMemory。"""
+    import random
+    from compiler.topology_memory import TopologyMemory
+
+    # 用临时文件做隔离测试
+    import tempfile
+    tmp_mem = tempfile.mktemp(suffix=".json")
+    mem = TopologyMemory(path=tmp_mem)
+
+    # 手动 record（模拟 CircuitExecutor.run() 末尾的行为）
+    spec = {
+        "name": "mem_test",
+        "description": "测试记忆记录的简单任务",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "r1": {"type": "resistor", "label": "reason", "model": "small",
+                   "required_inputs": [], "produced_outputs": ["result"]},
+        },
+        "wires": [["src", "r1"]],
+    }
+    result = {"success": True, "final_quality": 0.95,
+              "total_latency_ms": 100, "total_cost": 0.01,
+              "components": {"r1": {"ok": True, "quality": 0.95}}}
+    entry = mem.record("测试记忆记录的简单任务", spec, result)
+    assert entry is not None, "record 应返回 entry"
+    assert entry["capabilities"] == ["reason"]
+    print("✓ C 记忆记录: record 写入 TopologyMemory（能力标签+执行统计）")
+
+    # recall 能命中
+    hit = mem.recall("测试记忆记录的简单任务")
+    assert hit is not None, "recall 应命中刚记录的任务"
+    assert hit["spec"]["name"] == "mem_test"
+    assert hit["quality"] == 0.95
+    print("✓ C 记忆召回: recall 命中历史任务，返回 spec + quality=0.95")
+
+    # 验证 CircuitExecutor.run() 真实写入记忆（用默认路径，跑完检查文件存在）
+    be = SimBackend(rng=random.Random(42))
+    c = Circuit(spec, be)
+    ex = CircuitExecutor(c, memory_enabled=True)
+    res = ex.run()
+    # 默认路径的 .topology_memory.json 应被创建/更新
+    default_mem = TopologyMemory()
+    assert len(default_mem._store["entries"]) >= 1, \
+        "CircuitExecutor.run() 应自动写入记忆"
+    last = default_mem._store["entries"][-1]
+    assert last["result"]["success"] == res["success"]
+    print("✓ C 执行器集成: CircuitExecutor.run() 自动记录到默认 TopologyMemory")
+
+    # 清理临时文件
+    try:
+        import os as _os
+        _os.unlink(tmp_mem)
+    except Exception:
+        pass
+
+
+def human_intervention_selftest():
+    """D 人机协同：质量门耗尽时调 human_callback，支持 retry/skip/abort。"""
+    import random
+    # 构造一个会触发 gate:fail_linear 的电路：
+    # reason 节点声明 required_inputs=["ghost"]，但上游不产出 → 缺字段 → fail_linear
+    spec = {
+        "name": "human_test",
+        "description": "测试人机协同的任务",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "r1": {"type": "resistor", "label": "reason", "model": "small",
+                   "required_inputs": ["ghost_field"],
+                   "produced_outputs": ["result"]},
+        },
+        "wires": [["src", "r1"]],
+    }
+    be = SimBackend(rng=random.Random(0))
+    c = Circuit(spec, be)
+
+    # 场景 1：human_callback 返回 "skip" → 标记跳过，继续执行
+    callback_calls = []
+    def skip_callback(node, missing, context, label):
+        callback_calls.append({"node": node, "missing": missing, "label": label})
+        return "skip"
+
+    ex1 = CircuitExecutor(c, data_fill_budget=0, human_callback=skip_callback,
+                          memory_enabled=False)
+    res1 = ex1.run()
+    assert len(callback_calls) == 1, f"callback 应被调用 1 次，实际 {len(callback_calls)}"
+    assert callback_calls[0]["node"] == "r1"
+    assert "ghost_field" in callback_calls[0]["missing"]
+    print("✓ D skip: callback 被调用，节点标记跳过，执行继续")
+
+    # 场景 2：human_callback 返回 "abort" → 提前终止
+    callback_calls2 = []
+    def abort_callback(node, missing, context, label):
+        callback_calls2.append(node)
+        return "abort"
+
+    ex2 = CircuitExecutor(c, data_fill_budget=0, human_callback=abort_callback,
+                          memory_enabled=False)
+    res2 = ex2.run()
+    assert len(callback_calls2) == 1
+    assert res2.get("aborted") is True, "abort 应返回 aborted=True"
+    assert res2["success"] is False
+    print("✓ D abort: callback 返回 abort → 提前终止，结果 aborted=True")
+
+    # 场景 3：无 callback（None）→ 零回归（现行行为：fail 继续，不调 callback）
+    ex3 = CircuitExecutor(c, data_fill_budget=0, human_callback=None,
+                          memory_enabled=False)
+    res3 = ex3.run()
+    assert res3["success"] is False, "无 callback 时 fail 节点导致 success=False"
+    assert "aborted" not in res3, "无 callback 不应有 aborted 标记"
+    print("✓ D 零回归: 无 human_callback → 现行行为不变（fail 继续，不调 callback）")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
     circuit_executor_evolve_selftest()
     evolve_enhanced_selftest()
     hetero_verify_selftest()
+    memory_record_selftest()
+    human_intervention_selftest()
 
 
 def load(path):

@@ -34,6 +34,7 @@ import ast
 import os
 import re
 import sys
+import tempfile
 import time
 
 # 让模块无论从哪个 cwd 运行都能 import runtime / compiler 包（同 _verify_real.py 自举）
@@ -60,6 +61,8 @@ from compiler.agent_skills import (                     # noqa: E402
 CAPABILITIES = [
     "retrieve", "extract", "calculate", "translate",
     "reason", "classify", "verify", "organize", "summarize",
+    # 第一层能力深化（2026-08-04）：三种新电阻类型
+    "compare", "predict", "decompose",
 ]
 
 CAPABILITY_PROMPTS = {
@@ -134,8 +137,9 @@ CAPABILITY_PROMPTS = {
         ),
         # 技能包：把 retrieve 从"被动接收"升级为"主动获取"——可自行规划搜什么/读什么。
         # web_search/read_page 为联网技能（默认无 key 真实抓取，可切 Tavily API），
-        # query_db 为本地文档检索（零外部依赖）。
-        "skills": ["web_search", "read_page", "query_db"],
+        # query_db 为本地文档检索（零外部依赖），
+        # query_database 为 SQL 查询（B 任务新增，sqlite3 stdlib）。
+        "skills": ["web_search", "read_page", "query_db", "query_database"],
     },
 
     # ---- 结构型：extract / calculate / translate / classify / verify / organize ----
@@ -257,7 +261,77 @@ CAPABILITY_PROMPTS = {
         ),
         # 技能包：organize 从"自由重排"升级为"可套结构模板塑形"（apply_template，
         # 纯 stdlib：bullet/numbered/sections/qa），把零散信息稳定落进统一结构。
-        "skills": ["apply_template"],
+        # B 任务追加 draw_chart（可视化数据）和 send_email（交付结果）。
+        "skills": ["apply_template", "draw_chart", "send_email"],
+    },
+
+    # ---- 第一层能力深化（2026-08-04）：compare / predict / decompose ----
+    "compare": {
+        "role": "对比 Agent（电路中的一个电阻节点）",
+        "system": (
+            "你是电路式多智能体工作流中的一个『对比』节点。上游已经把待比较的多方数据"
+            "（如 A 和 B 的指标、特征、性能等）以纯文本形式送达。\n\n"
+            "你的唯一职责：对上游给定的多方数据做**结构化对比**，找出相同点、差异点和优劣关系，"
+            "产出可供下游（如『推理』或『摘要』节点）直接消费的对比结论。\n\n"
+            "要求：\n"
+            "1. 只比较上游明确提供的数据；禁止引入外部数据或编造指标。\n"
+            "2. 按「维度 → 各方值 → 差异判定」的结构逐维度对比，不要遗漏任何一方。\n"
+            "3. 差异判定用「A > B / A < B / 相当 / 不可比」明确标注，附数值差异。\n"
+            "4. 若某维度某方数据缺失，标「未提供」，不要臆测填充。\n"
+            "5. 最后给出一句话总体结论（谁在哪些维度领先），但不要替下游做最终裁决。\n"
+            "6. 输出纯文本对比表/结论，不要输出代码块 / JSON / 寒暄。"
+        ),
+        "system_short": (
+            "你是对比节点：按维度结构化比较多方数据，标差异方向+数值，缺失标「未提供」，"
+            "末尾一句总体结论不替下游裁决。"
+        ),
+        # 技能包：compare 可用 cross_check 独立核验数据、diff_text 比对文本差异；
+        # B 任务追加 draw_chart 可视化对比结果。
+        "skills": ["cross_check", "diff_text", "draw_chart"],
+    },
+    "predict": {
+        "role": "预测 Agent（电路中的一个电阻节点）",
+        "system": (
+            "你是电路式多智能体工作流中的一个『预测』节点。上游已经把历史数据、趋势信息"
+            "或相关变量以纯文本形式送达。\n\n"
+            "你的唯一职责：基于上游给定的历史/现状数据，进行**审慎的趋势外推或预测**，"
+            "产出可供下游（如『推理』或『摘要』节点）消费的预测结论。\n\n"
+            "要求：\n"
+            "1. 预测必须基于上游提供的数据和明确可推导的趋势；禁止编造数据或引入外部假设。\n"
+            "2. 区分『数据直接支撑的趋势』与『基于趋势的推断』，推断部分标「（推断）」。\n"
+            "3. 给出预测的**时间范围**和**置信度**（高/中/低），并说明主要不确定性来源。\n"
+            "4. 若上游数据不足以支撑预测，明确说「数据不足，无法可靠预测」，不要硬猜。\n"
+            "5. 可用 run_code 做简单的线性外推/增长率计算来辅助量化预测。\n"
+            "6. 输出纯文本预测结论，不要输出代码块 / JSON / 寒暄。"
+        ),
+        "system_short": (
+            "你是预测节点：基于上游数据做趋势外推，标置信度+不确定性，数据不足明说，"
+            "可用 run_code 辅助量化。"
+        ),
+        # 技能包：predict 可用 run_code 做数值外推/回归、calculator 做增长率计算。
+        "skills": ["run_code", "calculator"],
+    },
+    "decompose": {
+        "role": "分解 Agent（电路中的一个电阻节点）",
+        "system": (
+            "你是电路式多智能体工作流中的一个『分解』节点。上游已经把一个复杂问题/任务/系统"
+            "以纯文本形式送达。\n\n"
+            "你的唯一职责：把上游给定的复杂问题**拆解成相互独立、完全穷尽（MECE）的子问题/子任务**，"
+            "产出可供下游（如多个『推理』节点并行处理）消费的结构化分解结果。\n\n"
+            "要求：\n"
+            "1. 只分解上游给定的问题；不引入外部问题或扩大范围。\n"
+            "2. 子问题之间应尽量独立（可并行处理），且合并后覆盖原问题的全部范围（不遗漏）。\n"
+            "3. 每个子问题给出：编号、简述、所需输入、预期产出。\n"
+            "4. 标注子问题之间的依赖关系（若有的话），便于下游编排并行/串行。\n"
+            "5. 若原问题本身已经足够简单（无需分解），直接说明「无需分解」并原样返回。\n"
+            "6. 输出纯文本的子问题清单，不要输出代码块 / JSON / 寒暄。"
+        ),
+        "system_short": (
+            "你是分解节点：把复杂问题拆成 MECE 子问题清单（编号+简述+输入+产出+依赖），"
+            "简单问题直说「无需分解」。"
+        ),
+        # 技能包：decompose 是纯推理型节点，暂无专用技能（B 任务可视情况追加）。
+        "skills": [],
     },
 }
 
@@ -711,15 +785,15 @@ def selftest():
     assert "未注册" in bad, "调用未注册技能应返回可读错误而非崩"
     print("✓ 执行层: execute_skill(run_code) 真跑 Python 返回 42；未注册技能优雅报错")
 
-    # 8c) 技能包扩展：retrieve 声明 web_search/read_page/query_db + _tools_for 返回 3 个 tools
+    # 8c) 技能包扩展：retrieve 声明 web_search/read_page/query_db/query_database + _tools_for 返回 4 个 tools
     rsk = CAPABILITY_PROMPTS["retrieve"].get("skills", [])
-    assert rsk == ["web_search", "read_page", "query_db"], \
+    assert rsk == ["web_search", "read_page", "query_db", "query_database"], \
         f"retrieve 未声明检索技能包: {rsk}"
     rtools2 = be._tools_for({"type": "resistor", "label": "retrieve", "model": "tool"})
-    assert rtools2 and len(rtools2) == 3 and \
-        {t["function"]["name"] for t in rtools2} == {"web_search", "read_page", "query_db"}, \
+    assert rtools2 and len(rtools2) == 4 and \
+        {t["function"]["name"] for t in rtools2} == {"web_search", "read_page", "query_db", "query_database"}, \
         f"retrieve 的 tools schema 不正确: {rtools2}"
-    print("✓ 技能包扩展: retrieve 声明 web_search/read_page/query_db + _tools_for 产出 3 个 tools")
+    print("✓ 技能包扩展: retrieve 声明 web_search/read_page/query_db/query_database + _tools_for 产出 4 个 tools")
 
     # 8d) 执行层：query_db 本地检索（零网络，安全）+ web_search/read_page 联网容错不崩
     local = execute_skill("query_db", '{"query": "circuit"}')
@@ -754,12 +828,13 @@ def selftest():
     print("✓ 第二层技能包: reason+calculator / verify+cross_check+diff_text 声明+执行通过")
 
     # 8f) 第三层技能包：6 个能力均声明对应 skills + _tools_for 返回正确 schema
+    #     （organize 在 B 任务后追加 draw_chart + send_email）
     l3 = {
         "extract": ["extract_fields", "extract_pdf", "extract_ocr"],
         "translate": ["apply_glossary"],
         "classify": ["classify_taxonomy"],
         "calculate": ["unit_convert", "spreadsheet_calc"],
-        "organize": ["apply_template"],
+        "organize": ["apply_template", "draw_chart", "send_email"],
         "summarize": ["apply_style_guide"],
     }
     for cap, expected in l3.items():
@@ -808,6 +883,62 @@ def selftest():
         f"extract_ocr 未优雅降级: {eo}"
     print("✓ 第三层执行层: 7 个纯 stdlib 技能真跑通过 + extract_pdf/extract_ocr 优雅降级")
 
+    # 9b) 第一层能力深化技能包：draw_chart / send_email / query_database
+    # draw_chart：生成 SVG
+    dc = execute_skill("draw_chart",
+                       _json.dumps({"data": '[{"label":"A","value":100},{"label":"B","value":200}]',
+                                    "chart_type": "bar", "title": "Test"}))
+    assert "<svg" in dc and "Test" in dc, f"draw_chart 未生成 SVG: {dc[:80]}"
+    # line/pie 也能正常生成
+    dcl = execute_skill("draw_chart",
+                        _json.dumps({"data": '[{"label":"X","value":3},{"label":"Y","value":7}]',
+                                     "chart_type": "line"}))
+    assert "<svg" in dcl and "polyline" in dcl, f"draw_chart line 未生成: {dcl[:80]}"
+    dcp = execute_skill("draw_chart",
+                        _json.dumps({"data": '[{"label":"P","value":60},{"label":"Q","value":40}]',
+                                     "chart_type": "pie"}))
+    assert "<svg" in dcp and "path" in dcp, f"draw_chart pie 未生成: {dcp[:80]}"
+    print("✓ draw_chart: bar/line/pie 三种图表均生成自包含 SVG")
+
+    # send_email：未配置 → 明确提示不崩
+    se = execute_skill("send_email",
+                       _json.dumps({"to": "test@example.com", "subject": "Test", "body": "Hi"}))
+    assert "未配置" in se or "调用失败" in se or "已发送" in se, \
+        f"send_email 未返回预期结果: {se[:80]}"
+    # 不泄露实际密码值（环境变量名出现在提示中是正常的）
+    assert os.environ.get("SMTP_PASS", "") not in se or not os.environ.get("SMTP_PASS"), \
+        "send_email 返回值不应泄露实际密码值"
+    print("✓ send_email: 未配置时优雅返回提示（不崩溃，不泄露密码值）")
+
+    # query_database：SELECT 查询
+    import sqlite3 as _sqlite3
+    _tmpdb = tempfile.mktemp(suffix=".db")
+    _conn = _sqlite3.connect(_tmpdb)
+    _conn.execute("CREATE TABLE t(id INTEGER, name TEXT)")
+    _conn.execute("INSERT INTO t VALUES (1,'Alice'),(2,'Bob')")
+    _conn.commit()
+    _conn.close()
+    qd = execute_skill("query_database",
+                       _json.dumps({"query": "SELECT * FROM t", "db_path": _tmpdb}))
+    assert "Alice" in qd and "Bob" in qd, f"query_database SELECT 结果异常: {qd[:80]}"
+    # 安全：拒绝非 SELECT
+    qd2 = execute_skill("query_database",
+                        _json.dumps({"query": "DROP TABLE t", "db_path": _tmpdb}))
+    assert "安全拒绝" in qd2, f"query_database 未拒绝 DROP: {qd2[:80]}"
+    os.unlink(_tmpdb)
+    print("✓ query_database: SELECT 正常返回结果 + 安全拒绝非 SELECT 语句")
+
+    # 新技能在 build_tools_schema 中正确注册
+    from compiler.agent_skills import SKILLS as _SK
+    assert "draw_chart" in _SK and "send_email" in _SK and "query_database" in _SK, \
+        "新技能未注册到 SKILLS"
+    # compare 的 skills 含 draw_chart；organize 含 draw_chart+send_email；retrieve 含 query_database
+    assert "draw_chart" in CAPABILITY_PROMPTS["compare"]["skills"]
+    assert "draw_chart" in CAPABILITY_PROMPTS["organize"]["skills"]
+    assert "send_email" in CAPABILITY_PROMPTS["organize"]["skills"]
+    assert "query_database" in CAPABILITY_PROMPTS["retrieve"]["skills"]
+    print("✓ 新技能映射: compare→draw_chart / organize→draw_chart+send_email / retrieve→query_database")
+
     # 9) 真·工具调用循环（注入式假响应：先回 tool_calls，再回终答）
     #    验证：模型发起调用 → 执行层真跑技能 → 结果回灌 → 模型产出融合终答。
     seq = {"n": 0}
@@ -848,6 +979,29 @@ def selftest():
         "映射信息未注入 user：应含 下游名 与 上游名"
     assert "符号映射" in mustr, "应在线性关系契约中标注『符号映射』"
     print("✓ 命名漂移映射注入：电阻提示词显式声明『china_gdp_2024 ← 上游 gdp_china_2024』")
+
+    # 11) 第一层能力深化：compare/predict/decompose 三种新电阻的角色提示词
+    for cap in ("compare", "predict", "decompose"):
+        assert cap in CAPABILITIES, f"{cap} 应在 CAPABILITIES 列表中"
+        assert cap in CAPABILITY_PROMPTS, f"{cap} 应在 CAPABILITY_PROMPTS 中"
+        p = CAPABILITY_PROMPTS[cap]
+        assert "system" in p and "system_short" in p and "skills" in p, \
+            f"{cap} 提示词缺少必要字段"
+        assert isinstance(p["skills"], list), f"{cap} skills 应为 list"
+    # compare 应有 cross_check/diff_text 技能；predict 应有 run_code/calculator
+    assert "cross_check" in CAPABILITY_PROMPTS["compare"]["skills"]
+    assert "run_code" in CAPABILITY_PROMPTS["predict"]["skills"]
+    print("✓ 新能力提示词: compare/predict/decompose 均含 role/system/system_short/skills")
+
+    # 12) 新能力在 LLMAgentBackend 中能正确选词（不回退 _FALLBACK_SYSTEM）
+    be_cmp = LLMAgentBackend(rng=random.Random(0))
+    cmp_sig = be_cmp.run({"type": "resistor", "label": "compare", "model": "small"},
+                         [Signal(value="A:100 B:200", ok=True)])
+    cmp_msgs = be_cmp.render_messages({"type": "resistor", "label": "compare", "model": "small"},
+                                      [Signal(value="A:100 B:200", ok=True)])
+    assert "对比" in cmp_msgs[0]["content"], "compare 节点 system 应含『对比』角色词"
+    assert "对比" not in _FALLBACK_SYSTEM, "不应回退到通用占位提示词"
+    print("✓ 新能力后端选词: compare 节点正确选到角色提示词（非 _FALLBACK_SYSTEM）")
 
     print("\n全部离线自检通过 ✓（未发起任何真实 API 调用）")
 

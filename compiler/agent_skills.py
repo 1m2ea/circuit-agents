@@ -603,6 +603,222 @@ def _apply_style_guide(text: str, guide: str = "concise", max_length: int = 0) -
     return "文体约束：" + "；".join(notes) + f"\n\n{t[:4000]}"
 
 
+# ---------------------------------------------------------------------------
+# 第一层能力深化（2026-08-04）：draw_chart / send_email / query_database
+# ---------------------------------------------------------------------------
+def _draw_chart(data: str, chart_type: str = "bar", title: str = "") -> str:
+    """从结构化数据生成 SVG 图表（纯 stdlib，零外部依赖）。
+
+    data 形如 JSON: [{"label":"A","value":100}, {"label":"B","value":200}]。
+    chart_type ∈ bar/line/pie。返回自包含 SVG 文本。
+    """
+    if not isinstance(data, str) or not data.strip():
+        return "[draw_chart: 空数据，未绘图]"
+    try:
+        items = json.loads(data)
+        if not isinstance(items, list) or not items:
+            return "[draw_chart: 数据非非空列表]"
+    except Exception as e:
+        return f"技能 [draw_chart] 调用失败：JSON 解析错误 {e}"
+
+    ct = (chart_type or "bar").strip().lower()
+    valid = {"bar", "line", "pie"}
+    if ct not in valid:
+        return f"[draw_chart: 未知图表类型 {chart_type!r}；可用 {', '.join(valid)}]"
+
+    # 提取 label/value
+    pairs = []
+    for item in items:
+        lbl = str(item.get("label", item.get("name", "?")))
+        val = item.get("value", item.get("val", 0))
+        try:
+            val = float(val)
+        except Exception:
+            val = 0.0
+        pairs.append((lbl, val))
+
+    if not pairs:
+        return "[draw_chart: 无有效数据点]"
+
+    title = title or "Chart"
+    W, H = 480, 320
+    margin_l, margin_b, margin_t = 50, 40, 30
+    plot_w = W - margin_l - 20
+    plot_h = H - margin_b - margin_t
+    max_val = max(v for _, v in pairs) or 1.0
+
+    svg_parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'viewBox="0 0 {W} {H}" style="font-family:sans-serif;font-size:12px">',
+        f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
+        f'<text x="{W//2}" y="18" text-anchor="middle" font-size="14" '
+        f'font-weight="bold">{html.escape(title)}</text>',
+    ]
+
+    if ct == "bar":
+        bw = plot_w / len(pairs) * 0.7
+        gap = plot_w / len(pairs) * 0.3
+        for i, (lbl, val) in enumerate(pairs):
+            x = margin_l + i * (bw + gap) + gap / 2
+            bh = (val / max_val) * plot_h if max_val else 0
+            y = margin_t + plot_h - bh
+            color = f"hsl({(i * 137) % 360},60%,55%)"
+            svg_parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" '
+                             f'height="{bh:.1f}" fill="{color}" rx="2"/>')
+            svg_parts.append(f'<text x="{x+bw/2:.1f}" y="{margin_t+plot_h+15}" '
+                             f'text-anchor="middle">{html.escape(lbl)}</text>')
+            svg_parts.append(f'<text x="{x+bw/2:.1f}" y="{y-3:.1f}" '
+                             f'text-anchor="middle" font-size="10">{val:g}</text>')
+        # Y 轴
+        svg_parts.append(f'<line x1="{margin_l}" y1="{margin_t}" '
+                         f'x2="{margin_l}" y2="{margin_t+plot_h}" stroke="#999"/>')
+        svg_parts.append(f'<line x1="{margin_l}" y1="{margin_t+plot_h}" '
+                         f'x2="{margin_l+plot_w}" y2="{margin_t+plot_h}" stroke="#999"/>')
+
+    elif ct == "line":
+        pts = []
+        for i, (lbl, val) in enumerate(pairs):
+            x = margin_l + (i / max(len(pairs) - 1, 1)) * plot_w
+            y = margin_t + plot_h - (val / max_val) * plot_h
+            pts.append((x, y))
+            svg_parts.append(f'<text x="{x:.1f}" y="{margin_t+plot_h+15}" '
+                             f'text-anchor="middle" font-size="10">{html.escape(lbl)}</text>')
+        path = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+        svg_parts.append(f'<polyline points="{path}" fill="none" stroke="#4a90d9" '
+                         f'stroke-width="2"/>')
+        for x, y in pts:
+            svg_parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#4a90d9"/>')
+        svg_parts.append(f'<line x1="{margin_l}" y1="{margin_t}" '
+                         f'x2="{margin_l}" y2="{margin_t+plot_h}" stroke="#999"/>')
+        svg_parts.append(f'<line x1="{margin_l}" y1="{margin_t+plot_h}" '
+                         f'x2="{margin_l+plot_w}" y2="{margin_t+plot_h}" stroke="#999"/>')
+
+    elif ct == "pie":
+        total = sum(v for _, v in pairs) or 1.0
+        cx, cy, r = W // 2, H // 2 + 5, min(plot_w, plot_h) // 2
+        angle = -90  # 从顶部开始
+        for i, (lbl, val) in enumerate(pairs):
+            sweep = (val / total) * 360
+            color = f"hsl({(i * 137) % 360},60%,55%)"
+            # 简化：用 stroke-dasharray 画饼图段
+            rad_start = math_radians(angle)
+            rad_end = math_radians(angle + sweep)
+            x1 = cx + r * math_cos(rad_start)
+            y1 = cy + r * math_sin(rad_start)
+            x2 = cx + r * math_cos(rad_end)
+            y2 = cy + r * math_sin(rad_end)
+            large = 1 if sweep > 180 else 0
+            svg_parts.append(
+                f'<path d="M{cx},{cy} L{x1:.1f},{y1:.1f} A{r},{r} 0 {large},1 '
+                f'{x2:.1f},{y2:.1f} Z" fill="{color}" stroke="white" stroke-width="1"/>')
+            # 标签
+            mid = math_radians(angle + sweep / 2)
+            lx = cx + (r + 15) * math_cos(mid)
+            ly = cy + (r + 15) * math_sin(mid)
+            pct = val / total * 100
+            svg_parts.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" '
+                             f'font-size="10">{html.escape(lbl)} {pct:.0f}%</text>')
+            angle += sweep
+
+    svg_parts.append("</svg>")
+    return "\n".join(svg_parts)
+
+
+def _math_radians(deg):
+    import math
+    return math.radians(deg)
+
+
+def _math_cos(rad):
+    import math
+    return math.cos(rad)
+
+
+def _math_sin(rad):
+    import math
+    return math.sin(rad)
+
+
+math_radians = _math_radians
+math_cos = _math_cos
+math_sin = _math_sin
+
+
+def _send_email(to: str, subject: str, body: str) -> str:
+    """通过 SMTP 发送邮件（需环境变量配置 SMTP_HOST/SMTP_USER/SMTP_PASS）。
+
+    未配置时返回明确提示（不崩溃）；配置后用 smtplib 真发。
+    安全：SMTP_PASS 只从环境变量读，绝不记录到日志/返回值。
+    """
+    host = os.environ.get("SMTP_HOST", "")
+    user = os.environ.get("SMTP_USER", "")
+    pwd = os.environ.get("SMTP_PASS", "")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+
+    if not host or not user:
+        return ("技能 [send_email] 未配置：需设环境变量 SMTP_HOST + SMTP_USER + SMTP_PASS。"
+                "配置后即可真实发送邮件。")
+
+    if not to or not subject:
+        return "[send_email: 收件人(to)和主题(subject)不能为空]"
+
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body or "", "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = to
+        with smtplib.SMTP(host, port, timeout=10) as srv:
+            srv.starttls()
+            srv.login(user, pwd)
+            srv.sendmail(user, [to], msg.as_string())
+        return f"邮件已发送：{to} | 主题：{subject}"
+    except Exception as e:
+        return f"技能 [send_email] 调用失败：{type(e).__name__}: {e}"
+
+
+def _query_database(query: str, db_path: str = "") -> str:
+    """执行 SQL 查询（sqlite3 stdlib，零依赖；可选 PostgreSQL/MySQL）。
+
+    db_path 留空 → 读环境变量 DATABASE_PATH（默认 :memory:）。
+    安全：只允许 SELECT 查询（拒绝 INSERT/UPDATE/DELETE/DROP 等）。
+    """
+    if not isinstance(query, str) or not query.strip():
+        return "[query_database: 空 SQL，未执行]"
+
+    # 安全：只允许 SELECT
+    q_upper = query.strip().upper()
+    forbidden = ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
+                 "TRUNCATE", "REPLACE", "ATTACH", "DETACH")
+    for kw in forbidden:
+        if q_upper.startswith(kw):
+            return f"[query_database: 安全拒绝——不允许 {kw} 语句，只允许 SELECT]"
+
+    db_path = db_path or os.environ.get("DATABASE_PATH", ":memory:")
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(query)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        return f"技能 [query_database] 调用失败：{type(e).__name__}: {e}"
+
+    if not rows:
+        return "查询结果：无数据（空集）"
+
+    cols = [d[0] for d in cur.description] if cur.description else []
+    lines = ["\t".join(cols)]
+    for row in rows[:50]:  # 最多返回 50 行
+        lines.append("\t".join(str(v) for v in row))
+    if len(rows) > 50:
+        lines.append(f"...(共 {len(rows)} 行，仅显示前 50 行)")
+    return "查询结果：\n" + "\n".join(lines)
+
+
 # 注册表：新增技能只需在此加一项（并实现 handler）。
 SKILLS = {
     "run_code": {
@@ -872,6 +1088,62 @@ SKILLS = {
             "required": ["text"],
         },
         "handler": _apply_style_guide,
+    },
+    # 第一层能力深化（2026-08-04）：draw_chart / send_email / query_database
+    "draw_chart": {
+        "name": "draw_chart",
+        "description": (
+            "从结构化数据生成 SVG 图表（纯本地，零依赖）：bar（柱状图）/"
+            "line（折线图）/pie（饼图）。data 为 JSON 数组 [{label,value}, ...]。"
+            "compare/organize 节点可用它可视化对比结果。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "data": {"type": "string",
+                          "description": "JSON 数组，如 [{\"label\":\"A\",\"value\":100}]"},
+                "chart_type": {"type": "string",
+                                "description": "图表类型 bar/line/pie（默认 bar）"},
+                "title": {"type": "string", "description": "图表标题（可选）"},
+            },
+            "required": ["data"],
+        },
+        "handler": _draw_chart,
+    },
+    "send_email": {
+        "name": "send_email",
+        "description": (
+            "通过 SMTP 发送邮件：需环境变量 SMTP_HOST + SMTP_USER + SMTP_PASS 配置。"
+            "未配置时返回明确提示不崩溃。organize 节点可用它交付最终结果。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "收件人邮箱地址"},
+                "subject": {"type": "string", "description": "邮件主题"},
+                "body": {"type": "string", "description": "邮件正文"},
+            },
+            "required": ["to", "subject"],
+        },
+        "handler": _send_email,
+    },
+    "query_database": {
+        "name": "query_database",
+        "description": (
+            "执行 SQL SELECT 查询（sqlite3 stdlib，零依赖）：db_path 留空时读 "
+            "DATABASE_PATH 环境变量（默认 :memory:）。安全限制：只允许 SELECT，"
+            "拒绝写入/修改语句。retrieve 节点可用它从数据库取数据。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "SQL SELECT 查询语句"},
+                "db_path": {"type": "string",
+                             "description": "数据库文件路径（可选，默认读 DATABASE_PATH 环境变量）"},
+            },
+            "required": ["query"],
+        },
+        "handler": _query_database,
     },
 }
 

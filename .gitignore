@@ -16,6 +16,9 @@ venv/
 *.swp
 .idea/
 
+# Topology memory cache (auto-generated)
+.topology_memory.json
+
 # Throwaway demo artifacts
 _demo_out.txt
 _mk_pareto.py
