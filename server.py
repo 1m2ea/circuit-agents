@@ -478,6 +478,52 @@ def deploy(req: DeployRequest):
     }
 
 
+# ──────────────────────────────────────────────────────────
+# ⑬ 电路图共享生态：topology/publish · repo · pull
+# ──────────────────────────────────────────────────────────
+
+SHARE_REPO_PATH = ".topology_repo.json"   # ⑬ 本地共享仓库默认路径
+
+
+class SharePublishRequest(BaseModel):
+    """⑬ 发布一份电路拓扑到共享仓库。"""
+    spec: dict = Field(..., description="电路拓扑 Spec")
+    author: str = Field("anonymous", description="作者")
+    tags: list[str] = Field(default_factory=list, description="标签")
+    name: Optional[str] = Field(None, description="拓扑名（默认取 spec.name）")
+
+
+class SharePullRequest(BaseModel):
+    """⑬ 从共享仓库拉取拓扑。"""
+    name: str = Field(..., description="拓扑名")
+
+
+@app.post("/topology/publish")
+def publish_topology(req: SharePublishRequest):
+    """⑬ 发布电路拓扑到本地共享仓库，返回拓扑名。"""
+    from compiler.share import ShareRepo
+    repo = ShareRepo(SHARE_REPO_PATH)
+    name = repo.publish(req.spec, author=req.author, tags=req.tags, name=req.name)
+    return {"name": name, "published": True}
+
+
+@app.get("/topology/repo")
+def list_topology_repo():
+    """⑬ 列出共享仓库中所有拓扑（名称/作者/标签/校验和）。"""
+    from compiler.share import ShareRepo
+    return {"items": ShareRepo(SHARE_REPO_PATH).list()}
+
+
+@app.post("/topology/pull")
+def pull_topology(req: SharePullRequest):
+    """⑬ 从共享仓库拉取拓扑，还原为电路 Spec。"""
+    from compiler.share import ShareRepo
+    try:
+        return {"name": req.name, "spec": ShareRepo(SHARE_REPO_PATH).pull(req.name)}
+    except KeyError:
+        raise HTTPException(404, f"仓库中无此拓扑：{req.name}")
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -796,6 +842,26 @@ def selftest():
     assert "CircuitExecutor" in dresp["runner"]
     assert any(r.startswith("fastapi") for r in dresp["requirements"])
     print("✓ S10 ⑫ 跨平台部署(DeploymentExporter): /deploy 返回 Dockerfile+runner+requirements 预览")
+
+    # S11: ⑬ 电路图共享生态（离线：写入临时仓库，避免污染工作区）
+    os.environ.pop("AGENT_API_KEY", None)
+    import tempfile as _tf
+    _repo_file = _tf.mktemp(suffix=".json")
+    SHARE_REPO_PATH = _repo_file
+    sspec = {"name": "shared_demo", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small",
+              "produced_outputs": ["x"]}},
+        "wires": [["src", "A"]]}
+    pname = publish_topology(SharePublishRequest(spec=sspec, author="carol",
+                                                 tags=["shared"]))["name"]
+    items = list_topology_repo().get("items", [])
+    assert any(it["name"] == pname for it in items), "仓库应含已发布拓扑"
+    pulled = pull_topology(SharePullRequest(name=pname))["spec"]
+    assert pulled == sspec, "pull 应还原原 spec"
+    if os.path.exists(_repo_file):
+        os.unlink(_repo_file)
+    print(f"✓ S11 ⑬ 电路图共享生态(ShareRepo): 发布→列表→拉取 往返成功（{pname}）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
