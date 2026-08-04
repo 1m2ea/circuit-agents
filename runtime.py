@@ -552,6 +552,7 @@ class CircuitExecutor:
                  verify_backend: "Optional[object]" = None,
                  memory_enabled: bool = True,
                  human_callback: "Optional[callable]" = None,
+                 decision_points: "Optional[object]" = None,
                  auto_select_models: bool = False,
                  on_node_done: "Optional[callable]" = None,
                  backend_map: "Optional[dict]" = None):
@@ -590,6 +591,8 @@ class CircuitExecutor:
         self.memory_enabled = memory_enabled
         # D 人机协同：质量门耗尽时调 human_callback 请求人类介入（零回归：None=现行行为）
         self.human_callback = human_callback
+        # ⑧ 加深：决策点暂停——指定节点执行前主动暂停请人类审批（None=不启用主动决策点）
+        self.decision_points = decision_points
         # ③ 智能模型选型：执行前按复杂度/历史/约束微调每个电阻的 model/skills
         self.auto_select_models = auto_select_models
         # ② 流式执行：节点完成回调（供 SSE/run_stream 消费）
@@ -685,6 +688,50 @@ class CircuitExecutor:
         return sig
 
     # ---- 分层 propagate + 闭环补数 ----
+    # ---- ⑧ 加深：决策点判定 + 中止结果（人机协同）----
+    def _is_decision_point(self, cid, comp):
+        """该节点是否为主动决策点（执行前暂停请人类审批）。"""
+        if comp.get("human_decision_point"):       # spec 显式声明
+            return True
+        dp = self.decision_points
+        if dp is None:
+            return False
+        if dp == "all":
+            return True
+        if isinstance(dp, (set, list, tuple)):
+            base = (comp.get("label") or "").split("#")[0]
+            cap = comp.get("capability")
+            return (cid in dp) or (base in dp) or (cap in dp)
+        return False
+
+    def _abort_result(self, cid, out):
+        """人类中止（决策点 abort 或 失败兜底 abort）的统一返回。"""
+        self._emit("human_abort", node=cid)
+        self._emit("layer_done", layer_idx=getattr(self, "_li", None))
+        self._results = out
+        terminals = [c for c in self.circuit.components if not self.circuit.succ[c]]
+        # 决策点 abort 发生在节点执行「前」，下游终端可能尚未进入 out，需容错取值；
+        # 若终端全未执行，则退化为已执行节点的最大质量（反映中止时刻的真实进度）。
+        fq = max((out[c].quality for c in terminals if c in out), default=None)
+        if fq is None:
+            fq = max((s.quality for s in out.values()), default=0.0)
+        total_cost = sum(s.cost for s in out.values())
+        total_lat = max((s.latency_ms for s in out.values()), default=0.0)
+        self._emit("done", total_cost=round(total_cost, 4),
+                   total_latency_ms=round(total_lat, 1),
+                   final_quality=round(fq, 3), aborted=True)
+        return {
+            "success": False, "final_quality": round(fq, 3),
+            "total_cost": round(total_cost, 4),
+            "total_latency_ms": total_lat,
+            "components": {c: {"ok": s.ok, "quality": round(s.quality, 3),
+                               "gate": s.meta.get("gate")}
+                           for c, s in out.items()},
+            "state": self.state, "evolved": None,
+            "iterations": 1, "self_healed": {},
+            "aborted": True, "abort_node": cid,
+        }
+
     def run(self):
         self._t0 = time.perf_counter()
         out = {}
@@ -713,12 +760,39 @@ class CircuitExecutor:
                    layers=len(layers))
 
         for li, layer in enumerate(layers):
+            self._li = li
             self._emit("layer_start", layer_idx=li, nodes=list(layer))
             for cid in layer:
                 comp = self.circuit.components[cid]
                 self._emit("node_start", node=cid, ctype=comp.get("type"),
                            label=comp.get("label"))
-                sig = self.circuit._run_one(cid, out)   # 现有线性关系闸 + backend.run
+                # ⑧ 加深：决策点暂停（主动请求人类审批，而非仅失败兜底）
+                _skip = False
+                if self.human_callback and self._is_decision_point(cid, comp):
+                    _pending = {k: (v.value if hasattr(v, "value") else str(v))
+                                for k, v in out.items() if hasattr(v, "value")}
+                    self._emit("human_decision_point", node=cid, label=comp.get("label"))
+                    try:
+                        _dec = self.human_callback(
+                            node=cid, missing=comp.get("required_inputs", []),
+                            context=_pending, label=comp.get("label"),
+                            decision_point=True)
+                    except Exception:
+                        _dec = "proceed"   # 不兼容的回调 → 默认继续，最不意外
+                    if _dec == "abort":
+                        out[cid] = Signal(value=None, quality=0.0, ok=False,
+                                         meta={"open": "human_abort",
+                                               "decision_point": True})
+                        return self._abort_result(cid, out)
+                    if _dec == "skip":
+                        sig = Signal(value=None, quality=0.0, ok=False,
+                                     meta={"human_skipped": True,
+                                           "decision_point": True})
+                        self._emit("human_skip", node=cid)
+                        _skip = True
+                    # "proceed" 或其它 → 正常执行该节点
+                if not _skip:
+                    sig = self.circuit._run_one(cid, out)   # 现有线性关系闸 + backend.run
                 if sig.meta.get("gate") == "fail_linear":
                     self._emit("gate_fail", node=cid,
                                missing=sig.meta.get("missing", []))
@@ -747,30 +821,8 @@ class CircuitExecutor:
                             sig = self.circuit._run_one(cid, out)
                             self._emit("human_retry", node=cid, ok=sig.ok)
                         elif decision == "abort":
-                            self._emit("human_abort", node=cid)
                             out[cid] = sig
-                            self._emit("layer_done", layer_idx=li)
-                            # 提前终止
-                            self._results = out
-                            terminals = [c for c in self.circuit.components
-                                         if not self.circuit.succ[c]]
-                            fq = max((out[c].quality for c in terminals), default=0.0)
-                            total_cost = sum(s.cost for s in out.values())
-                            total_lat = max((s.latency_ms for s in out.values()), default=0.0)
-                            self._emit("done", total_cost=round(total_cost, 4),
-                                       total_latency_ms=round(total_lat, 1),
-                                       final_quality=round(fq, 3), aborted=True)
-                            return {
-                                "success": False, "final_quality": round(fq, 3),
-                                "total_cost": round(total_cost, 4),
-                                "total_latency_ms": total_lat,
-                                "components": {c: {"ok": s.ok, "quality": round(s.quality, 3),
-                                                   "gate": s.meta.get("gate")}
-                                               for c, s in out.items()},
-                                "state": self.state, "evolved": None,
-                                "iterations": 1, "self_healed": {},
-                                "aborted": True, "abort_node": cid,
-                            }
+                            return self._abort_result(cid, out)
                         # "skip" 或其它 → 标记跳过，继续执行
                         if decision == "skip":
                             sig.meta["human_skipped"] = True
@@ -2014,6 +2066,7 @@ class LongTask:
         self.goal_id = goal_id or f"lt_{uuid.uuid4().hex[:8]}"
         self.circuit = Circuit(spec, self.backend)
         self.pause_requested = False
+        self._wake_at_ms = None       # ⑦ 加深：休眠唤醒时间点
         self.on_node_done = None
         self._out: dict = {}
         self._state = {"_fetched": {}, "_skills_used": [], "_trace": []}
@@ -2042,6 +2095,7 @@ class LongTask:
             "heartbeat_ms": self._now_ms(),
             "created_ms": self._created_ms,
             "finished_ms": self._now_ms() if status == "done" else None,
+            "wake_at_ms": getattr(self, "_wake_at_ms", None),
         }
         with open(self.cp_path, "w", encoding="utf-8") as f:
             json.dump(cp, f, ensure_ascii=False, indent=2)
@@ -2079,6 +2133,86 @@ class LongTask:
     def resume(self):
         self.pause_requested = False
         return self.run(resume=True)
+
+    # ---- ⑦ 加深：自动休眠 + 唤醒（跨小时/天，释放资源后断点续跑）----
+    def run_sleep(self, layers_per_round: int = 1, wake_in_sec: float = 0,
+                  resume: bool = False):
+        """跑最多 layers_per_round 层后主动「休眠」（落盘 checkpoint + 记录唤醒时间）。
+
+        与 run()（一次性跑完）不同，run_sleep 把长任务切成多轮：每轮只推进若干层，
+        然后 status=sleeping 并记下 wake_at_ms，返回让出控制权；到点后由 wake()/调度器
+        唤醒续跑。适用于跨小时/天的任务——休眠期间不占资源，到点自动醒来继续。
+        """
+        cp = self._load_cp() if resume else None
+        if cp is not None:
+            self.goal_id = self.goal_id or cp.get("goal_id")
+            self._created_ms = cp.get("created_ms", self._created_ms)
+            self._out = {cid: _dict_to_sig(d) for cid, d in cp.get("out", {}).items()}
+            self._state = cp.get("state", self._state)
+            done_layers = set(cp.get("done_layers", []))
+            if cp.get("status") == "done":
+                return self._finalize()
+        else:
+            done_layers = set()
+
+        layers = self.circuit.layers()
+        start = (max(done_layers) + 1) if done_layers else 0
+        target = min(start + max(1, layers_per_round), len(layers))
+        for li in range(start, target):
+            for cid in layers[li]:
+                sig = self.circuit._run_one(cid, self._out)
+                self._out[cid] = sig
+                if self.on_node_done is not None:
+                    try:
+                        self.on_node_done(cid, sig,
+                                          {"node": cid, "ok": sig.ok,
+                                           "quality": round(sig.quality, 3)})
+                    except Exception:
+                        pass
+            done_layers.add(li)
+            self._save_cp(done_layers, "running")
+
+        remaining = len(layers) - len(done_layers)
+        if remaining == 0:
+            self._wake_at_ms = None
+            self._save_cp(done_layers, "done")
+            return self._finalize()
+        # 还有剩余 → 休眠，记录唤醒时间
+        self._wake_at_ms = self._now_ms() + int(wake_in_sec * 1000)
+        self._save_cp(done_layers, "sleeping")
+        res = self._result_dict("sleeping", done_layers)
+        res["sleeping"] = True
+        res["wake_at_ms"] = self._wake_at_ms
+        res["due_now"] = (wake_in_sec <= 0)
+        return res
+
+    def should_wake(self, now_ms: "Optional[int]" = None):
+        """是否到了唤醒时间（status=sleeping 且 now >= wake_at）。"""
+        cp = self._load_cp()
+        if cp is None or cp.get("status") != "sleeping":
+            return False
+        wake = cp.get("wake_at_ms")
+        if wake is None:
+            return True
+        return (now_ms if now_ms is not None else self._now_ms()) >= wake
+
+    def wake(self, now_ms: "Optional[int]" = None):
+        """唤醒续跑：未到唤醒时间→返回 sleeping(未到期)；已到期→续跑至完成。"""
+        cp = self._load_cp()
+        if cp is None:
+            return None
+        if cp.get("status") == "done":
+            return self._finalize()
+        if cp.get("status") != "sleeping":
+            return self._result_dict(cp.get("status"), set(cp.get("done_layers", [])))
+        if not self.should_wake(now_ms):
+            r = self._result_dict("sleeping", set(cp.get("done_layers", [])))
+            r["sleeping"] = True
+            r["due_now"] = False
+            return r
+        self._wake_at_ms = None
+        return self.run(resume=True)
+
 
     # ---- 主执行（可续跑）----
     def run(self, resume: bool = False):
@@ -2141,6 +2275,42 @@ class LongTask:
 
     def _finalize(self):
         return self._result_dict("done", set(range(len(self.circuit.layers()))))
+
+
+class LongScheduler:
+    """⑦ 加深：长周期任务调度器——管理多个 LongTask，tick 时唤醒到期的睡眠任务。
+
+    典型用法（进程常驻/定时器驱动）::
+
+        sched = LongScheduler()
+        sched.submit(task, layers_per_round=1, wake_in_sec=60)  # 跑 1 层后睡 60s
+        ...  # 每隔一段时间
+        sched.tick()      # 唤醒所有到期任务续跑；跑完自动出队
+    """
+
+    def __init__(self):
+        self.tasks = {}   # goal_id -> LongTask
+
+    def submit(self, task: "LongTask", layers_per_round: int = 1, wake_in_sec: float = 0):
+        self.tasks[task.goal_id] = task
+        r = task.run_sleep(layers_per_round, wake_in_sec)
+        if r and r.get("status") == "done":
+            self.tasks.pop(task.goal_id, None)
+        return r
+
+    def tick(self, now_ms: "Optional[int]" = None):
+        """唤醒所有到期的睡眠任务并续跑，返回 {goal_id: result}。"""
+        results = {}
+        for gid, t in list(self.tasks.items()):
+            if t.should_wake(now_ms):
+                r = t.wake(now_ms)
+                results[gid] = r
+                if r and r.get("status") == "done":
+                    self.tasks.pop(gid, None)
+        return results
+
+    def status_all(self):
+        return {gid: t.status() for gid, t in self.tasks.items()}
 
 
 def long_task_selftest():
@@ -2220,7 +2390,7 @@ def long_task_selftest():
     with open(cp2, "w", encoding="utf-8") as f:
         json.dump(cp_obj, f)
     assert lt2.is_stalled(), "心跳超 ttl 应判停滞"
-    print(f"✓ ⑦ 心跳: 正常运行 heartbem_age={age}ms 未停滞；"
+    print(f"✓ ⑦ 心跳: 正常运行 heartbeat_age={age}ms 未停滞；"
           f"篡改心跳超 ttl → is_stalled=True（可触发恢复）")
     _os.unlink(cp2)
 
@@ -3196,6 +3366,148 @@ def skill_registry_selftest():
     print("\nPhase 2 技能注册表 离线自检全部通过 ✓")
 
 
+def long_sleep_selftest():
+    """⑦ 加深：长周期休眠唤醒（run_sleep → sleeping → should_wake → wake 续跑 + 调度器）。"""
+    import tempfile
+    spec = {
+        "name": "sleep_demo",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "r1":  {"type": "resistor", "label": "reason#1", "model": "small", "yield": 1.0},
+            "r2":  {"type": "resistor", "label": "reason#2", "model": "small", "yield": 1.0},
+            "r3":  {"type": "resistor", "label": "reason#3", "model": "small", "yield": 1.0},
+        },
+        "wires": [["src", "r1"], ["r1", "r2"], ["r2", "r3"]],
+    }
+    cp = tempfile.mktemp(suffix=".json")
+
+    # 第一轮：只跑 1 层后休眠
+    t = LongTask(spec, checkpoint_path=cp)
+    r1 = t.run_sleep(layers_per_round=1, wake_in_sec=0)
+    assert r1["status"] == "sleeping", "应进入休眠"
+    assert r1["done_layers"] == 1, "第一轮应只完成 1 层"
+    assert r1["due_now"] is True, "wake_in_sec=0 应立即可唤醒"
+    assert t.should_wake(), "should_wake 应立即为真"
+    print("✓ ⑦ 加深：run_sleep 跑 1 层后休眠（status=sleeping, due_now=True）")
+
+    # 唤醒续跑 → 完成
+    r2 = t.wake()
+    assert r2["status"] == "done", "唤醒后应跑完"
+    assert r2["done_layers"] == 4, "应累计完成全部 4 层"
+    print("✓ ⑦ 加深：wake 续跑至完成（done_layers=4，断点续跑不重跑）")
+
+    # 未到期：wake_in_sec 很大 → should_wake 为假，wake 返回仍 sleeping
+    cp2 = tempfile.mktemp(suffix=".json")
+    t2 = LongTask(spec, checkpoint_path=cp2)
+    t2.run_sleep(layers_per_round=1, wake_in_sec=100)   # 100 秒后唤醒
+    assert t2.should_wake() is False, "未到期不应唤醒"
+    r3 = t2.wake()
+    assert r3["status"] == "sleeping" and r3.get("due_now") is False, "未到期 wake 应仍 sleeping"
+    print("✓ ⑦ 加深：未到期 → should_wake=False，wake 仍 sleeping（不误唤醒）")
+
+    # 调度器：submit → tick 唤醒到期任务 → 完成
+    cp3 = tempfile.mktemp(suffix=".json")
+    sched = LongScheduler()
+    t3 = LongTask(spec, checkpoint_path=cp3)
+    sched.submit(t3, layers_per_round=1, wake_in_sec=0)
+    res = sched.tick()
+    assert any(r.get("status") == "done" for r in res.values()), "调度器 tick 应唤醒并跑完"
+    assert sched.status_all() == {}, "完成后应从调度器移除"
+    print("✓ ⑦ 加深：LongScheduler.submit→tick 唤醒到期任务并跑完")
+    for p in (cp, cp2, cp3):
+        try: os.unlink(p)
+        except OSError: pass
+
+    print("✓ ⑦ 长周期休眠唤醒 离线自检通过")
+
+
+def human_decision_point_selftest():
+    """⑧ 加深：决策点暂停（执行前主动请人类审批 proceed/skip/abort + 全节点/all）。"""
+    spec = {
+        "name": "decision_demo",
+        "components": {
+            "src":   {"type": "power", "label": "task"},
+            "reason": {"type": "resistor", "label": "reason", "model": "small",
+                       "yield": 1.0, "human_decision_point": True},
+            "sum":    {"type": "resistor", "label": "summarize", "model": "small", "yield": 1.0},
+        },
+        "wires": [["src", "reason"], ["reason", "sum"]],
+    }
+
+    def make(decision_map):
+        ev = []
+        def cb(node, missing=None, context=None, label=None, decision_point=False):
+            return decision_map.get(node, "proceed")
+        circ = Circuit(spec, SimBackend(random.Random(0)))
+        ex = CircuitExecutor(circ, human_callback=cb, decision_points={"reason"},
+                             on_event=lambda e: ev.append(e))
+        return ex, ev
+
+    # 1) proceed → 正常执行
+    ex, ev = make({"reason": "proceed"})
+    r = ex.run()
+    assert r["success"] is True, "proceed 应正常完成"
+    assert any(e.get("type") == "human_decision_point" for e in ev), "应发出决策点事件"
+    assert r["components"]["reason"]["ok"] is True, "proceed 后该节点应被执行"
+    print("✓ ⑧ 加深：决策点 proceed → 正常执行（发出 human_decision_point）")
+
+    # 2) skip → 该节点跳过，不执行后端
+    ex, ev = make({"reason": "skip"})
+    r = ex.run()
+    assert any(e.get("type") == "human_skip" for e in ev), "应发出 human_skip"
+    assert r["components"]["reason"]["ok"] is False, "skip 后该节点应标记未通过"
+    print("✓ ⑧ 加深：决策点 skip → 节点跳过（不执行后端，继续后续）")
+
+    # 3) abort → 提前终止
+    ex, ev = make({"reason": "abort"})
+    r = ex.run()
+    assert r.get("aborted") is True and r.get("abort_node") == "reason", "应中止于决策点"
+    print("✓ ⑧ 加深：决策点 abort → 提前终止（aborted=True, abort_node=reason）")
+
+    # 4) 零回归：spec 无标记 + 无 decision_points → 完全不暂停（现行行为不变）
+    spec_plain = {
+        "name": "plain_demo",
+        "components": {
+            "src":    {"type": "power", "label": "task"},
+            "reason": {"type": "resistor", "label": "reason", "model": "small", "yield": 1.0},
+            "sum":    {"type": "resistor", "label": "summarize", "model": "small", "yield": 1.0},
+        },
+        "wires": [["src", "reason"], ["reason", "sum"]],
+    }
+    ev4 = []
+    circ4 = Circuit(spec_plain, SimBackend(random.Random(0)))
+    ex4 = CircuitExecutor(circ4, human_callback=lambda **k: "proceed",
+                          on_event=lambda e: ev4.append(e))
+    r4 = ex4.run()
+    assert r4["success"] is True, "无决策点配置应正常完成"
+    assert not any(e.get("type") == "human_decision_point" for e in ev4), "不应发出决策点事件"
+    print("✓ ⑧ 加深：零回归——spec 无标记且无配置时不暂停")
+
+    # 4b) spec 显式标记独立生效：decision_points=None 但 comp 标了 → 仍暂停
+    ev4b = []
+    circ4b = Circuit(spec, SimBackend(random.Random(0)))
+    ex4b = CircuitExecutor(circ4b, human_callback=lambda **k: "proceed",
+                           on_event=lambda e: ev4b.append(e))
+    r4b = ex4b.run()
+    dp4b = [e for e in ev4b if e.get("type") == "human_decision_point"]
+    assert r4b["success"] is True and len(dp4b) == 1 and dp4b[0].get("node") == "reason", \
+        "spec 的 human_decision_point 标记应独立于 decision_points 参数生效"
+    print("✓ ⑧ 加深：spec 声明 human_decision_point → 无需参数即暂停")
+
+    # 5) decision_points="all" → 每个节点都暂停，全部 proceed 仍成功
+    ev5 = []
+    circ5 = Circuit(spec, SimBackend(random.Random(0)))
+    ex5 = CircuitExecutor(circ5, human_callback=lambda **k: "proceed",
+                          decision_points="all", on_event=lambda e: ev5.append(e))
+    r5 = ex5.run()
+    assert r5["success"] is True, "all 决策点全 proceed 应成功"
+    n_dp = sum(1 for e in ev5 if e.get("type") == "human_decision_point")
+    assert n_dp == 3, f"all 应有 3 个节点发决策点事件，实际 {n_dp}"
+    print("✓ ⑧ 加深：decision_points='all' → 每节点暂停（3 个决策点）")
+
+    print("✓ ⑧ 人机协同决策点 离线自检通过")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -3204,10 +3516,12 @@ if __name__ == "__main__":
     hetero_verify_selftest()
     memory_record_selftest()
     human_intervention_selftest()
+    human_decision_point_selftest()
     stream_selftest()
     multi_backend_selftest()
     batch_executor_selftest()
     long_task_selftest()
+    long_sleep_selftest()
     multi_robot_selftest()
     permission_selftest()
     adaptive_topology_selftest()

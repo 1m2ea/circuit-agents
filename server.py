@@ -73,6 +73,8 @@ class LongTaskRequest(BaseModel):
     evolve_enabled: bool = Field(False, description="长任务默认关闭 3.5 进化（聚焦续跑/心跳）")
     quality_threshold: Optional[float] = Field(None, description="质量门阈值")
     ttl_ms: int = Field(60000, description="心跳超时阈值(ms)，超则判停滞可触发恢复")
+    layers_per_round: int = Field(0, description="⑦ 加深：>0 则分轮执行，每轮跑 N 层后休眠（0=一次跑完）")
+    wake_in_sec: float = Field(0, description="⑦ 加深：休眠多久后可被唤醒（秒，0=立即到期）")
 
 
 class AgentSpec(BaseModel):
@@ -264,7 +266,11 @@ def _run_longtask(task_id: str, goal_text: str, params: dict):
             _longtasks[task_id]["task"] = lt
             _longtasks[task_id]["status"] = "running"
             _longtasks[task_id]["checkpoint"] = cp
-        res = lt.run()
+        lpr = int(params.get("layers_per_round", 0) or 0)
+        if lpr > 0:   # ⑦ 加深：分轮执行——跑 N 层后主动休眠，等 /wake 续跑
+            res = lt.run_sleep(lpr, float(params.get("wake_in_sec", 0) or 0))
+        else:
+            res = lt.run()
         with _lock:
             _longtasks[task_id]["status"] = res["status"]
             _longtasks[task_id]["result"] = res
@@ -346,6 +352,33 @@ def resume_longtask(task_id: str):
 
     threading.Thread(target=_resume, daemon=True).start()
     return {"task_id": task_id, "resume_requested": True}
+
+
+@app.post("/longtask/{task_id}/wake")
+def wake_longtask(task_id: str):
+    """⑦ 加深：唤醒一个休眠中的长任务。
+
+    未到唤醒时间 → 返回 sleeping/due_now=False（不误唤醒）；已到期 → 同步续跑至完成。
+    与 /resume 的区别：resume 是「崩溃/暂停后恢复」，wake 是「主动休眠到期后续跑」，
+    休眠期不占线程、不烧 CPU，适合跨天/跨周的长周期任务。
+    """
+    with _lock:
+        rec = _longtasks.get(task_id)
+    if rec is None:
+        raise HTTPException(404, "longtask not found")
+    lt = rec.get("task")
+    if lt is None:
+        raise HTTPException(409, "task not started yet")
+    if not lt.should_wake():
+        st = lt.status()
+        return {"task_id": task_id, "woken": False, "due_now": False,
+                "status": st.get("status"), "done_layers": st.get("done_layers"),
+                "total_layers": st.get("total_layers")}
+    res = lt.wake()
+    with _lock:
+        _longtasks[task_id]["status"] = (res or {}).get("status")
+        _longtasks[task_id]["result"] = res
+    return {"task_id": task_id, "woken": True, "due_now": True, "result": res}
 
 
 # ──────────────────────────────────────────────────────────
@@ -698,6 +731,62 @@ def cluster_run(req: ClusterRequest):
     return coord.run(req.goal, n_workers=n, route=req.route,
                      memory_enabled=req.memory_enabled,
                      auto_select_models=req.auto_select_models)
+
+
+class DecisionRequest(BaseModel):
+    """⑧ 加深：人机协同决策点——执行前在关键节点暂停请人类审批。"""
+    goal: Optional[str] = Field(None, description="自然语言任务（与 spec 二选一）")
+    spec: Optional[dict] = Field(None, description="直接给拓扑 Spec（与 goal 二选一）")
+    decision_points: Optional[object] = Field(
+        None, description="'all' 或节点 id/label 列表；spec 内 human_decision_point 标记也生效")
+    policy: Optional[dict] = Field(
+        None, description="预设策略 {节点: proceed|skip|abort}，模拟人类审批决定")
+    default_action: str = Field("proceed", description="未在 policy 中命中的决策点默认动作")
+    route: bool = Field(True, description="goal 路径是否走 Router 并联编译")
+
+
+@app.post("/decision")
+def decision_run(req: DecisionRequest):
+    """⑧ 加深：带决策点的执行——在关键节点执行「前」暂停，按策略 proceed/skip/abort。
+
+    离线安全（强制规则解析）。这里用 policy 声明式模拟人类审批，便于自动化/回放；
+    真实场景把 human_callback 换成阻塞式人工审批（等待前端点按钮）即可，协议不变。
+    返回结果附 decision_log（每个决策点的节点与动作）与事件流。
+    """
+    import random as _rnd
+    from runtime import Circuit, CircuitExecutor, SimBackend
+    os.environ.pop("AGENT_API_KEY", None)   # 强制离线规则解析
+
+    spec = req.spec
+    if spec is None:
+        if not req.goal:
+            raise HTTPException(400, "goal 与 spec 至少提供一个")
+        from compiler.nl_parser import GoalParser
+        from compiler.compile import compile_goal
+        spec = compile_goal(GoalParser().parse(req.goal), auto_bind=True,
+                            route=req.route, memory_enabled=False)
+
+    policy = req.policy or {}
+    default_action = (req.default_action or "proceed").lower()
+    log, events = [], []
+
+    def _cb(node=None, missing=None, context=None, label=None, decision_point=False):
+        act = policy.get(node) or policy.get(label) or default_action
+        if decision_point:
+            log.append({"node": node, "label": label, "action": act})
+        return act
+
+    dp = req.decision_points
+    if isinstance(dp, (list, tuple)):
+        dp = set(dp)
+    ex = CircuitExecutor(Circuit(spec, SimBackend(_rnd.Random(0))),
+                         human_callback=_cb, decision_points=dp,
+                         on_event=lambda e: events.append(e))
+    res = ex.run()
+    res["decision_log"] = log
+    res["decision_points_hit"] = len(log)
+    res["events"] = events
+    return res
 
 
 class CodegenRequest(BaseModel):
@@ -1185,6 +1274,54 @@ def selftest():
     assert _cge["language"] == "js" and "DONE" in _cge["code"], "/codegen 应返回 JS 源码"
     print(f"✓ S18 Phase2 ④ 跨语言编译器(TopologyCompiler): 三语言(cpp/rust/js) 生成✓ · "
           f"/codegen 返回 JS 源码")
+
+    # S19: Phase 2 ⑦ 加深 长周期休眠唤醒（分轮执行 → 休眠 → /wake 续跑）
+    tid2 = "selftest_sleep"
+    _longtasks[tid2] = {"task": None, "status": "pending", "goal": "休眠唤醒测试",
+                        "result": None, "checkpoint": None, "error": None}
+    _run_longtask(tid2, "分析一份很长的报告并总结要点",
+                  {"route": True, "memory_enabled": False, "evolve_enabled": False,
+                   "layers_per_round": 1, "wake_in_sec": 0})
+    assert _longtasks[tid2]["status"] == "sleeping", \
+        f"S19: 应跑 1 层后休眠，实际 {_longtasks[tid2]['status']}"
+    _sl = _longtasks[tid2]["result"]
+    assert _sl.get("sleeping") is True and _sl.get("due_now") is True, "S19: 应标记休眠且已到期"
+    _done1 = _sl["done_layers"]
+    _wk = wake_longtask(tid2)
+    assert _wk["woken"] is True and _wk["result"]["status"] == "done", \
+        f"S19: 唤醒后应跑完，实际 {_wk['result'].get('status')}"
+    assert _wk["result"]["done_layers"] > _done1, "S19: 唤醒后完成层数应增加（断点续跑）"
+    print(f"✓ S19 Phase2 ⑦加深 长周期休眠唤醒: 跑{_done1}层→休眠 → /wake 续跑至 "
+          f"{_wk['result']['done_layers']} 层 done（休眠期零占用）")
+    try:
+        os.unlink(f"longtask_{tid2}.json")
+    except OSError:
+        pass
+
+    # S20: Phase 2 ⑧ 加深 人机协同决策点（proceed / skip / abort 三态 + 零回归）
+    _dspec = {
+        "name": "dp_demo",
+        "components": {
+            "src":    {"type": "power", "label": "task"},
+            "reason": {"type": "resistor", "label": "reason", "model": "small", "yield": 1.0},
+            "sum":    {"type": "resistor", "label": "summarize", "model": "small", "yield": 1.0},
+        },
+        "wires": [["src", "reason"], ["reason", "sum"]],
+    }
+    _d1 = decision_run(DecisionRequest(spec=_dspec, decision_points=["reason"],
+                                       policy={"reason": "proceed"}))
+    assert _d1["success"] is True and _d1["decision_points_hit"] == 1, "S20: proceed 应正常完成"
+    _d2 = decision_run(DecisionRequest(spec=_dspec, decision_points="all",
+                                       policy={"reason": "abort"}))
+    assert _d2.get("aborted") is True and _d2.get("abort_node") == "reason", \
+        "S20: abort 应中止于该决策点"
+    _d3 = decision_run(DecisionRequest(spec=_dspec, decision_points=["reason"],
+                                       policy={"reason": "skip"}))
+    assert _d3["components"]["reason"]["ok"] is False, "S20: skip 后该节点应标记未通过"
+    _d4 = decision_run(DecisionRequest(spec=_dspec))   # 零回归：无决策点 → 不暂停
+    assert _d4["success"] is True and _d4["decision_points_hit"] == 0, "S20: 无配置不应暂停"
+    print(f"✓ S20 Phase2 ⑧加深 人机协同决策点: proceed/skip/abort 三态生效 · "
+          f"abort_node={_d2['abort_node']} · 零回归(无配置不暂停)")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
