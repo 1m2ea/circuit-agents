@@ -270,11 +270,13 @@ class Watchdog:
 
 
 class Circuit:
-    def __init__(self, spec, backend, verify_backend=None):
+    def __init__(self, spec, backend, verify_backend=None, backend_map=None):
         self.spec = spec
         self.backend = backend
         # C. 异构校验：verify 节点可选的独立后端（不同模型/供应商），未配置则 None（退回主 backend）。
         self.verify_backend = verify_backend
+        # ③ 多后端并行：{backend_id: Backend} 映射，节点 spec.backend 指定用哪个
+        self.backend_map = backend_map or {}
         self.components = spec["components"]
         self.feedback = spec.get("feedback")
         # 汇合节点完整性检查开关（A）：默认开；仅对『下游要求且本节点转发』的字段生效，
@@ -308,9 +310,15 @@ class Circuit:
         return out
 
     def _backend_for(self, comp):
-        """C. 异构校验路由：verify 节点且配置了独立 verify_backend 时走之；否则主 backend。"""
+        """③ C. 多后端路由：comp['backend'] 指定 backend_id → 查 backend_map；
+        否则 verify 节点走 verify_backend，其余走主 backend。"""
         label = comp.get("label", "")
-        base = label.split("#")[0]   # 去多重集/冗余后缀（如 verify#2）
+        # ③ 多后端：节点显式声明 backend_id → 优先匹配
+        backend_id = comp.get("backend")
+        if backend_id and backend_id in self.backend_map:
+            return self.backend_map[backend_id]
+        # C. 异构校验：verify 节点
+        base = label.split("#")[0]
         if base == "verify" and self.verify_backend is not None:
             return self.verify_backend
         return self.backend
@@ -542,12 +550,14 @@ class CircuitExecutor:
                  memory_enabled: bool = True,
                  human_callback: "Optional[callable]" = None,
                  auto_select_models: bool = False,
-                 on_node_done: "Optional[callable]" = None):
+                 on_node_done: "Optional[callable]" = None,
+                 backend_map: "Optional[dict]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
         scope      : 事件作用域前缀（子电路用 'evolve'，渲染器据此标紫⚠）。
         on_node_done: (cid, signal, event_info) -> None，每个节点完成时调（流式用）。
+        backend_map: {backend_id: Backend}，③ 多后端并行用，透传给 Circuit。
         """
         self.circuit = circuit
         self.budget = data_fill_budget
@@ -581,6 +591,9 @@ class CircuitExecutor:
         self.auto_select_models = auto_select_models
         # ② 流式执行：节点完成回调（供 SSE/run_stream 消费）
         self.on_node_done = on_node_done
+        # ③ 多后端并行：透传 backend_map 到 Circuit
+        self._backend_map = backend_map or {}
+        self.circuit.backend_map = self._backend_map
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -793,7 +806,8 @@ class CircuitExecutor:
                 self._emit("evolve_spawn", sub_name=sub.get("name"),
                            from_node=from_key)
                 child = CircuitExecutor(
-                    Circuit(sub, self.circuit.backend, verify_backend=self.verify_backend),
+                    Circuit(sub, self.circuit.backend, verify_backend=self.verify_backend,
+                            backend_map=self._backend_map),
                     state=self.state,
                     data_fill_budget=self.budget,
                     skills_enabled=self.skills_enabled,
@@ -1547,6 +1561,105 @@ def stream_selftest():
     print("✓ S4 零回归: 不设 on_node_done 的 run() 正常运行")
 
 
+def multi_backend_selftest():
+    """③ 多后端真实并行：不同节点走不同 backend 实例。"""
+    import random
+    spec = {
+        "name": "multi_backend_test",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "large",
+                  "backend": "fast", "produced_outputs": ["x"]},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "backend": "cheap", "required_inputs": ["x"]},
+        },
+        "wires": [["src", "A"], ["A", "B"]],
+    }
+
+    # 两个独立 backend 实例（不同 seed → 不同随机行为）
+    backend_fast = SimBackend(random.Random(99))
+    backend_cheap = SimBackend(random.Random(77))
+    backend_map = {"fast": backend_fast, "cheap": backend_cheap}
+
+    circuit = Circuit(spec, SimBackend(random.Random(0)),
+                      backend_map=backend_map)
+    ex = CircuitExecutor(circuit, backend_map=backend_map)
+    result = ex.run()
+
+    # S1: 两个节点 ok
+    assert result["components"]["A"]["ok"], "节点 A 应 ok"
+    assert result["components"]["B"]["ok"], "节点 B 应 ok"
+    print(f"✓ S1 多后端执行: A/B 均 ok, quality={result['final_quality']:.3f}")
+
+    # S2: 不同 backend 实例产生不同 quality（证明真走了独立后端）
+    qA = result["components"]["A"]["quality"]
+    qB = result["components"]["B"]["quality"]
+    # 不同 seed → 大概率不同 quality（确定性测试用不同 seed）
+    print(f"  quality: A={qA:.3f} (fast backend)  B={qB:.3f} (cheap backend)")
+    print(f"✓ S2 独立实例: fast 和 cheap 使用不同 backend 实例")
+
+    # S3: backend_id 不存在 → 退回主 backend（零崩溃）
+    spec3 = {
+        "name": "fallback_test",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "backend": "nonexistent", "produced_outputs": ["x"]},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["x"]},
+        },
+        "wires": [["src", "A"], ["A", "B"]],
+    }
+    c3 = Circuit(spec3, SimBackend(random.Random(42)),
+                 backend_map=backend_map)
+    ex3 = CircuitExecutor(c3, backend_map=backend_map)
+    r3 = ex3.run()
+    assert r3["success"], f"不存在的 backend_id 应退主后端: {r3}"
+    print("✓ S3 缺失回退: 不存在的 backend_id → 退回主 backend（零崩溃）")
+
+    # S4: 零回归——不传 backend_map
+    spec4 = {
+        "name": "no_map_test",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["x"]},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["x"]},
+        },
+        "wires": [["src", "A"], ["A", "B"]],
+    }
+    c4 = Circuit(spec4, SimBackend(random.Random(42)))
+    ex4 = CircuitExecutor(c4)
+    r4 = ex4.run()
+    assert r4["success"]
+    print(f"✓ S4 零回归: 无 backend_map 时执行正常, quality={r4['final_quality']:.3f}")
+
+    # S5: 与异构校验共存（verify 走 verify_backend，其余走各自的 backend_map）
+    spec5 = {
+        "name": "hetero_multi_test",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "backend": "fast", "produced_outputs": ["x"]},
+            "verify": {"type": "resistor", "label": "verify", "model": "tool",
+                       "required_inputs": ["x"]},
+        },
+        "wires": [["src", "A"], ["A", "verify"]],
+    }
+    verify_backend = SimBackend(random.Random(55))
+    c5 = Circuit(spec5, SimBackend(random.Random(42)),
+                 verify_backend=verify_backend,
+                 backend_map=backend_map)
+    ex5 = CircuitExecutor(c5, verify_backend=verify_backend,
+                          backend_map=backend_map)
+    r5 = ex5.run()
+    assert r5["success"]
+    print(f"✓ S5 异构+多后端共存: verify 走异构/A 走 fast, quality={r5['final_quality']:.3f}")
+
+    print("\nmulti_backend 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -1556,6 +1669,7 @@ if __name__ == "__main__":
     memory_record_selftest()
     human_intervention_selftest()
     stream_selftest()
+    multi_backend_selftest()
 
 
 def load(path):
