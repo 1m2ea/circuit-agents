@@ -789,6 +789,43 @@ def decision_run(req: DecisionRequest):
     return res
 
 
+class RLOptimizeRequest(BaseModel):
+    """Phase 2 第三层① RL 优化拓扑：用真实执行 reward 搜索更优结构。"""
+    goal: Optional[str] = Field(None, description="自然语言任务（与 spec 二选一）")
+    spec: Optional[dict] = Field(None, description="直接给拓扑 Spec（与 goal 二选一）")
+    episodes: int = Field(24, description="搜索轮数上限")
+    patience: int = Field(12, description="连续 N 轮无提升即收敛")
+    weights: Optional[dict] = Field(
+        None, description="reward 权重 {quality,cost,latency}，默认 1.0/0.35/0.25")
+    seed: int = Field(0, description="搜索随机种子（可复现）")
+    distill: bool = Field(False, description="是否把最优拓扑沉淀进 TopologyMemory")
+    return_history: bool = Field(False, description="是否返回逐轮搜索轨迹（较大）")
+
+
+@app.post("/rl/optimize")
+def rl_optimize(req: RLOptimizeRequest):
+    """Phase 2 第三层① RL 优化拓扑：UCB1 多臂老虎机 + 爬山，真实执行反馈驱动。
+
+    与 /optimize（Optimizer 解析式估算）的区别：这里**每个候选拓扑都真跑一遍**，
+    reward = 加权(质量, -成本, -延迟)，因此能发现启发式规则看不见的结构性节省
+    （例如「这个 verify 是多余的」「这一步换 small 档质量不掉」）。
+    返回 arm_stats 说明哪类改动真有效，可解释。离线安全（强制规则解析）。
+    """
+    from compiler.rl_optimizer import RLOptimizer
+    os.environ.pop("AGENT_API_KEY", None)
+    target = req.spec if req.spec is not None else req.goal
+    if target is None:
+        raise HTTPException(400, "goal 与 spec 至少提供一个")
+    opt = RLOptimizer(weights=req.weights, seed=req.seed)
+    res = opt.optimize(target, episodes=req.episodes, patience=req.patience)
+    if req.distill:
+        res["distilled"] = opt.distill(
+            res, goal_desc=(req.goal or res["best_spec"].get("name", "rl_optimized")))
+    if not req.return_history:
+        res.pop("history", None)
+    return res
+
+
 class CodegenRequest(BaseModel):
     goal: str
     language: str = "js"  # cpp / rust / js
@@ -1322,6 +1359,32 @@ def selftest():
     assert _d4["success"] is True and _d4["decision_points_hit"] == 0, "S20: 无配置不应暂停"
     print(f"✓ S20 Phase2 ⑧加深 人机协同决策点: proceed/skip/abort 三态生效 · "
           f"abort_node={_d2['abort_node']} · 零回归(无配置不暂停)")
+
+    # S21: Phase 2 第三层① RL 优化拓扑（真实执行 reward 搜索 + /rl/optimize）
+    _rlspec = {
+        "name": "rl_api_demo",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "A":   {"type": "resistor", "label": "research", "model": "large",
+                    "yield": 1.0, "produced_outputs": ["a"]},
+            "B":   {"type": "resistor", "label": "analyze", "model": "large",
+                    "yield": 1.0, "required_inputs": ["a"], "produced_outputs": ["b"]},
+            "V":   {"type": "verify", "label": "verify_b", "threshold": 0.5},
+            "C":   {"type": "resistor", "label": "summarize", "model": "large",
+                    "yield": 1.0, "required_inputs": ["b"]},
+        },
+        "wires": [["src", "A"], ["A", "B"], ["B", "V"], ["V", "C"]],
+    }
+    _rl = rl_optimize(RLOptimizeRequest(spec=_rlspec, episodes=30, patience=15, seed=7))
+    assert _rl["improved"] is True, f"S21: 应搜到更优拓扑（{_rl['improvement']}）"
+    assert _rl["best_reward"] > _rl["baseline_reward"], "S21: 最优 reward 应超基线"
+    assert "history" not in _rl, "S21: 默认不返回逐轮轨迹"
+    assert len(_rl["arm_stats"]) == 5, "S21: 应有 5 个算子的收益统计"
+    print(f"✓ S21 Phase2 三层① RL优化拓扑(RLOptimizer): reward "
+          f"{_rl['baseline_reward']}→{_rl['best_reward']} (+{_rl['improvement']}) · "
+          f"成本 {_rl['baseline']['cost']}→{_rl['best']['cost']} · "
+          f"质量 {_rl['baseline']['quality']}→{_rl['best']['quality']} · "
+          f"{_rl['episodes_run']}轮 · 算子收益可解释")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
