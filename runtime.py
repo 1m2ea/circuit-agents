@@ -843,6 +843,8 @@ class CircuitExecutor:
         # Phase 2 细粒度质量门：逐节点打分 + 分级 + 修复建议（纯函数、离线安全）
         _report_thr = gate_thr if gate_thr is not None else getattr(self, "quality_threshold", None)
         quality_report = QualityReport.assess(out, self.circuit.components, fq, _report_thr)
+        # Phase 2 技能注册表：解析本拓扑引用了哪些技能、哪些待实现（离线安全）
+        _skill_used = SkillRegistry().resolve(self.circuit.components, self.evolve_skill)
 
         result = {
             "success": all(out[c].ok for c in terminals),
@@ -859,6 +861,7 @@ class CircuitExecutor:
             "quality_gate": quality_gate,
             "failed_nodes": failed_nodes,
             "quality_report": quality_report,
+            "skills_used": _skill_used,
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
@@ -2975,6 +2978,209 @@ def quality_gate_selftest():
     print("\nPhase 2 细粒度质量门 离线自检全部通过 ✓")
 
 
+class SkillRegistry:
+    """Phase 2 技能注册表：在 ② 已落地的 `compiler.agent_skills.SKILLS`
+    （真实可执行的技能实现）之上叠加「集中注册 + 查询 + 拓扑技能引用解析」层。
+
+    职责边界：
+     · ② 负责"技能怎么真执行"（handler 实现 + execute_skill 派发）。
+     · 本注册表负责"有哪些技能 / 拓扑用了哪些 / 哪些还没注册（待实现）"，
+       是 introspection 层，纯函数、离线安全，不依赖 LLM/网络。
+     · 解析来源：① 各组件 fillers 中的 `skill`；② 组件级 `skills` 声明（前瞻）；
+       ③ executor 的 evolve_skill 配置。
+    """
+
+    # 技能分类（映射 ② 的技能名 → 能力类别，用于前端分组/统计）
+    _CATEGORY = {
+        "run_code": "compute", "calculator": "compute", "spreadsheet_calc": "compute",
+        "unit_convert": "compute",
+        "query_database": "retrieve", "query_db": "retrieve",
+        "web_search": "retrieve", "read_page": "retrieve",
+        "cross_check": "verify", "diff_text": "verify",
+        "extract_fields": "extract", "extract_pdf": "extract", "extract_ocr": "extract",
+        "apply_glossary": "translate", "classify_taxonomy": "classify",
+        "apply_template": "organize", "apply_style_guide": "summarize",
+        "draw_chart": "visualize", "send_email": "deliver",
+    }
+
+    def __init__(self, extra=None):
+        # 复用 ② 已有技能（真实 handler 实现）
+        from compiler.agent_skills import SKILLS
+        self._skills = {}
+        for name, spec in SKILLS.items():
+            self._skills[name] = {
+                "name": name,
+                "description": spec.get("description", ""),
+                "parameters": spec.get("parameters", {}),
+                "handler": spec.get("handler"),
+                "category": self._CATEGORY.get(name, "general"),
+                "tier": "standard",
+                "implemented": spec.get("handler") is not None,
+            }
+        # 允许预登记"待实现"技能（handler=None），便于 resolve 标记未实现项
+        if extra:
+            for name, meta in extra.items():
+                self.register(name, **meta)
+
+    def register(self, name, description="", parameters=None,
+                 handler=None, category="general", tier="standard"):
+        """集中注册/覆盖一个技能。handler=None 表示"已登记但未实现"（待实现）。"""
+        self._skills[name] = {
+            "name": name,
+            "description": description,
+            "parameters": parameters or {},
+            "handler": handler,
+            "category": category,
+            "tier": tier,
+            "implemented": handler is not None,
+        }
+
+    def get(self, name):
+        """查询单个技能 spec（含 handler/implemented/category 等元数据）。"""
+        return self._skills.get(name)
+
+    def is_registered(self, name):
+        return name in self._skills
+
+    def is_implemented(self, name):
+        spec = self._skills.get(name)
+        return bool(spec and spec.get("handler") is not None)
+
+    def names(self):
+        return list(self._skills.keys())
+
+    def implemented_names(self):
+        return [n for n, s in self._skills.items() if s["implemented"]]
+
+    def list(self):
+        """列出全部已注册技能（含分类/tier/是否已实现），供前端或 /skills 端点。"""
+        return [
+            {"name": n, "category": s["category"], "tier": s["tier"],
+             "implemented": s["implemented"], "description": s["description"]}
+            for n, s in sorted(self._skills.items())
+        ]
+
+    # ---- 拓扑技能引用解析 ----
+    @staticmethod
+    def _extract_skills(components, evolve_skill=None):
+        """从 components dict 解析被引用的技能名（去重保序）。
+        来源：① fillers 的 skill；② 组件级 skills 声明；③ evolve_skill。"""
+        refs = []
+        for _cid, comp in (components or {}).items():
+            if not isinstance(comp, dict):
+                continue
+            # ① fillers
+            fillers = comp.get("fillers") or {}
+            if isinstance(fillers, dict):
+                for _m, f in fillers.items():
+                    if isinstance(f, dict) and f.get("skill"):
+                        refs.append(f["skill"])
+            # ② 组件级 skills（前瞻：节点直接声明它要用的技能集）
+            sk = comp.get("skills")
+            if isinstance(sk, (list, tuple)):
+                refs.extend([s for s in sk if isinstance(s, str)])
+            elif isinstance(sk, str):
+                refs.append(sk)
+        # ③ evolve_skill
+        if evolve_skill:
+            refs.append(evolve_skill)
+        # 去重保序
+        seen, out = set(), []
+        for r in refs:
+            if r and r not in seen:
+                seen.add(r)
+                out.append(r)
+        return out
+
+    def skills_used(self, components, evolve_skill=None):
+        """解析拓扑引用的技能，返回 {references, registered, unregistered}。"""
+        refs = self._extract_skills(components, evolve_skill)
+        registered, unregistered = [], []
+        for r in refs:
+            (registered if r in self._skills else unregistered).append(r)
+        return {
+            "references": refs,
+            "registered": registered,
+            "unregistered": unregistered,
+            "count": len(refs),
+            "registered_count": len(registered),
+            "unregistered_count": len(unregistered),
+        }
+
+    def resolve(self, components, evolve_skill=None):
+        """高层解析：拓扑引用技能 + 注册状态 + 待实现清单 + 总结。纯函数、离线安全。"""
+        su = self.skills_used(components, evolve_skill)
+        # 已注册但未实现的（声明了 handler=None 的 pending 项）
+        pending = [n for n in su["registered"] if not self.is_implemented(n)]
+        return {
+            "references": su["references"],
+            "registered": su["registered"],
+            "unregistered": su["unregistered"],
+            "pending": pending,
+            "count": su["count"],
+            "registered_count": su["registered_count"],
+            "unregistered_count": su["unregistered_count"],
+            "pending_count": len(pending),
+            "summary": (f"引用 {su['count']} 个技能 · 已注册 {su['registered_count']} · "
+                        f"待实现 {su['unregistered_count']}"
+                        + (f" · 已登记未实现 {len(pending)}" if pending else "")),
+        }
+
+
+def skill_registry_selftest():
+    """Phase 2 技能注册表离线自检：复用 ② 技能 / 注册 / 查询 / 拓扑引用解析 / 未注册标记。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    reg = SkillRegistry()
+    # 复用 ② 已有技能：计算器/绘图等应在册且已实现
+    assert reg.is_registered("calculator"), "应复用 ② 的 calculator"
+    assert reg.is_implemented("calculator"), "calculator 应有 handler"
+    assert reg.is_registered("draw_chart"), "应复用 ② 的 draw_chart"
+    assert "web_search" in reg.implemented_names(), "web_search 应已实现"
+    print(f"✓ Phase2 注册表：复用 ② 技能共 {len(reg.implemented_names())} 个已实现在册")
+
+    # 集中注册：动态登记一个"待实现"技能（handler=None）
+    reg.register("my_future_skill", description="示例：尚待实现的技能", handler=None)
+    assert reg.is_registered("my_future_skill")
+    assert not reg.is_implemented("my_future_skill"), "无 handler 应为未实现"
+    assert "my_future_skill" not in reg.implemented_names()
+    print("✓ Phase2 注册表：动态 register 一个待实现技能（handler=None）成功")
+
+    # 拓扑技能引用解析：n1 引用 calculator(已注册) / n2 引用 a_missing_skill(未注册)
+    # n3 通过 skills 声明 cross_check + web_search；evolve_skill=ci_analyze
+    components = {
+        "n1": {"type": "tool", "fillers": {"x": {"skill": "calculator", "args": {"expression": "1+1"}}}},
+        "n2": {"type": "retrieve", "fillers": {"y": {"skill": "a_missing_skill", "args": {}}}},
+        "n3": {"type": "resistor", "skills": ["cross_check", "web_search"]},
+    }
+    r = reg.resolve(components, evolve_skill="ci_analyze")
+    assert "calculator" in r["registered"], "calculator 应判为已注册"
+    assert "a_missing_skill" in r["unregistered"], "a_missing_skill 应判为未注册(待实现)"
+    assert "cross_check" in r["references"] and "web_search" in r["references"]
+    assert "ci_analyze" in r["references"], "evolve_skill 应被纳入引用"
+    assert r["count"] == 5, f"应解析到 5 个引用(去重)，实际 {r['count']}: {r['references']}"
+    assert r["unregistered_count"] == 1 and r["pending_count"] == 0, \
+        f"未注册1/已登记未实现0，实际 {r['unregistered_count']}/{r['pending_count']}"
+    print(f"✓ Phase2 注册表：拓扑引用解析 → {r['summary']}")
+
+    # 注册那枚未实现技能后再解析：应从不注册转为 pending
+    reg.register("a_missing_skill", description="补齐的技能", handler=lambda **k: "ok")
+    r2 = reg.resolve(components, evolve_skill="ci_analyze")
+    assert "a_missing_skill" in r2["registered"], "补齐后应为已注册"
+    assert "a_missing_skill" not in r2["unregistered"], "补齐后不应再判未注册"
+    assert r2["pending_count"] == 0, "补齐后不应有 pending"
+    print("✓ Phase2 注册表：补齐技能后未注册项自动消失（解析随注册表最新状态）")
+
+    # 纯函数 + 可复现：同一注册表 + 同一拓扑，两次解析结果一致（不依赖 LLM/网络）
+    reg3 = SkillRegistry()
+    a = reg3.resolve(components, evolve_skill="ci_analyze")
+    b = reg3.resolve(components, evolve_skill="ci_analyze")
+    assert a == b, "同输入同注册表应得相同解析（纯函数）"
+    print("✓ Phase2 注册表：纯函数可复现（同输入同解析）")
+
+    print("\nPhase 2 技能注册表 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2992,6 +3198,7 @@ if __name__ == "__main__":
     adaptive_topology_selftest()
     self_evolution_selftest()
     quality_gate_selftest()
+    skill_registry_selftest()
 
 
 def load(path):

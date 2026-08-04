@@ -561,6 +561,45 @@ def quality_report(req: GoalRequest):
     return result.get("quality_report", {})
 
 
+@app.post("/skills")
+def list_skills():
+    """Phase 2 技能注册表：列出全部已注册技能（含分类/tier/是否已实现），并复用 ② 已有技能。"""
+    from runtime import SkillRegistry
+    reg = SkillRegistry()
+    skills = reg.list()
+    return {
+        "count": len(skills),
+        "implemented_count": len(reg.implemented_names()),
+        "skills": skills,
+    }
+
+
+@app.post("/skills/resolve")
+def skills_resolve(req: GoalRequest):
+    """Phase 2 技能注册表：编译一个目标为拓扑，解析它引用了哪些技能、哪些待实现。
+
+    只编译不执行（离线安全：强制规则解析，无需 LLM/网络），从拓扑 components 的
+    fillers/skills 抽取技能引用，对照注册表给出 已注册 / 未注册(待实现) 清单。
+    """
+    from compiler.nl_parser import GoalParser
+    from compiler.compile import compile_goal
+    from runtime import SkillRegistry
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线规则解析
+    params = req.model_dump()
+    parser = GoalParser()
+    goal = parser.parse(req.goal)
+    spec = compile_goal(
+        goal,
+        auto_bind=True,
+        route=params.get("route", True),
+        memory_enabled=params.get("memory_enabled", True),
+        auto_select_models=params.get("auto_select_models", False),
+    )
+    components = spec.get("components", {})
+    reg = SkillRegistry()
+    return reg.resolve(components, params.get("evolve_skill"))
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -939,6 +978,33 @@ def selftest():
             "修复建议应指向可落地能力（auto_heal/threshold/tier/重试/上下文）"
     print(f"✓ S13 Phase2 质量门(QualityReport): 总评 {rep['final_score_100']}/100"
           f"（{rep['final_grade']}）· 分级 {rep['counts']} · 修复项 {len(rep['repair_plan'])}")
+
+    # S14: Phase 2 技能注册表（离线：复用 ② 技能 / 集中注册 / 拓扑引用解析 / 未注册标记）
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import SkillRegistry
+    reg = SkillRegistry()
+    assert reg.is_registered("calculator") and reg.is_implemented("calculator"), \
+        "应复用 ② 的 calculator"
+    assert len(reg.implemented_names()) >= 19, "应复用 ② 至少 19 个已实现技能"
+    # 拓扑引用解析：calculator(已注册) + a_missing_skill(未注册，待实现)
+    _comps = {
+        "t1": {"type": "tool", "fillers": {"x": {"skill": "calculator", "args": {}}}},
+        "t2": {"type": "retrieve", "fillers": {"y": {"skill": "a_missing_skill", "args": {}}}},
+    }
+    _resolved = reg.resolve(_comps)
+    assert "calculator" in _resolved["registered"], "calculator 应判已注册"
+    assert "a_missing_skill" in _resolved["unregistered"], "a_missing_skill 应判未注册(待实现)"
+    assert _resolved["unregistered_count"] == 1, "应有 1 个待实现技能"
+    # 端点层面：/skills 列表 + /skills/resolve 编译真实目标并解析
+    _sk = list_skills()
+    assert _sk["count"] >= 19 and any(s["name"] == "calculator" for s in _sk["skills"]), \
+        "/skills 应列出已复用 ② 技能"
+    _sr = skills_resolve(GoalRequest(goal="查一下今年 GDP 并画一张趋势图"))
+    assert {"references", "registered", "unregistered"} <= set(_sr.keys()), \
+        "/skills/resolve 应返回 references/registered/unregistered"
+    assert isinstance(_sr["summary"], str) and _sr["summary"], "/skills/resolve 应给总结"
+    print(f"✓ S14 Phase2 注册表(SkillRegistry): 在册 {_sk['count']} 个 · "
+          f"示例拓扑解析 → {_resolved['summary']}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
