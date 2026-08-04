@@ -116,80 +116,73 @@ _lock = threading.Lock()
 _HERE = Path(__file__).parent
 
 
+def _compile_execute(goal_text, params, on_node_done=None):
+    """同步编译+执行，返回 (result, spec, events)。供 /run 与 /quality/report 复用。"""
+    from compiler.nl_parser import GoalParser
+    from compiler.compile import compile_goal
+    from runtime import Circuit, CircuitExecutor, SimBackend
+    import random
+    parser = GoalParser()
+    images = params.get("images"); audio = params.get("audio")
+    if images or audio:
+        goal = parser.parse_multimodal(goal_text, images=images, audio=audio)
+    else:
+        goal = parser.parse(goal_text)
+    spec = compile_goal(
+        goal,
+        auto_bind=True,
+        route=params.get("route", True),
+        memory_enabled=params.get("memory_enabled", True),
+        auto_select_models=params.get("auto_select_models", False),
+    )
+    qt = params.get("quality_threshold")
+    if qt is not None:
+        for comp in spec.get("components", {}).values():
+            if comp.get("type") in ("adc", "verify"):
+                comp["threshold"] = float(qt)
+    backend = SimBackend(random.Random(int(time.time() * 1000) % (2**31)))
+    circuit = Circuit(spec, backend)
+    events = []
+    def _cb(cid, sig, info):
+        events.append(info)
+        if on_node_done is not None:
+            on_node_done(cid, sig, info)
+    executor = CircuitExecutor(
+        circuit,
+        data_fill_budget=params.get("data_fill_budget", 2),
+        evolve_enabled=params.get("evolve_enabled", True),
+        on_node_done=_cb,
+        memory_enabled=params.get("memory_enabled", True),
+        auto_select_models=params.get("auto_select_models", False),
+    )
+    result = executor.run()
+    result["modality"] = getattr(goal, "attachment_type", "text")
+    result["attachments"] = getattr(goal, "attachments", [])
+    return result, spec, events
+
+
 def _run_goal(goal_text: str, params: dict, run_id: str):
     """后台编译+执行，结果写回 _runs 表。"""
     try:
         with _lock:
             _runs[run_id]["status"] = "running"
-
-        from compiler.nl_parser import GoalParser
-        from compiler.compile import compile_goal
-        from runtime import Circuit, CircuitExecutor, SimBackend
-        import random
-
-        # 编译：NL → Goal → compile（④ 多模态：有附件走 parse_multimodal）
-        parser = GoalParser()
-        images = params.get("images")
-        audio = params.get("audio")
-        if images or audio:
-            goal = parser.parse_multimodal(goal_text, images=images, audio=audio)
-        else:
-            goal = parser.parse(goal_text)
-        spec = compile_goal(
-            goal,
-            auto_bind=True,
-            route=params.get("route", True),
-            memory_enabled=params.get("memory_enabled", True),
-            auto_select_models=params.get("auto_select_models", False),
-        )
-
-        # 质量门阈值注入（前端可调，默认 0.8）：写到 adc/verify 节点的 threshold
-        qt = params.get("quality_threshold")
-        if qt is not None:
-            for comp in spec.get("components", {}).values():
-                if comp.get("type") in ("adc", "verify"):
-                    comp["threshold"] = float(qt)
-
-        # 执行
-        backend = SimBackend(random.Random(int(time.time() * 1000) % (2**31)))
-        circuit = Circuit(spec, backend)
-
         node_events = []
-
         def on_done(cid, sig, info):
             node_events.append(info)
-            # 同时写进 _runs 供 GET /run/{id}/stream 消费
             with _lock:
                 _runs[run_id]["_events"].append(info)
-
-        executor = CircuitExecutor(
-            circuit,
-            data_fill_budget=params.get("data_fill_budget", 2),
-            evolve_enabled=params.get("evolve_enabled", True),
-            on_node_done=on_done,
-            memory_enabled=params.get("memory_enabled", True),
-            auto_select_models=params.get("auto_select_models", False),
-        )
-        result = executor.run()
-        # ④ 多模态：把真实输入模态透传到结果（前端可显示）
-        result["modality"] = getattr(goal, "attachment_type", "text")
-        result["attachments"] = getattr(goal, "attachments", [])
-
+        result, spec, _ = _compile_execute(goal_text, params, on_node_done=on_done)
         with _lock:
             _runs[run_id]["status"] = "done"
             _runs[run_id]["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
             _runs[run_id]["result"] = result
             _runs[run_id]["spec"] = spec
-
-        # ④ 持久化：自动保存到 SQLite
         try:
             from execution_store import ExecutionStore
             store = ExecutionStore("executions.db")
-            store.save(run_id, goal_text, "done", spec,
-                       node_events + list(executor._events), result)
+            store.save(run_id, goal_text, "done", spec, node_events, result)
         except Exception:
             pass  # 持久化失败不影响主流程
-
     except Exception as e:
         with _lock:
             _runs[run_id]["status"] = "error"
@@ -557,6 +550,17 @@ def evolve_suggest(req: EvolveSuggestRequest):
     return {"suggested": ev.suggest(req.spec)}
 
 
+@app.post("/quality/report")
+def quality_report(req: GoalRequest):
+    """Phase 2 细粒度质量门：编译+执行一次，返回 quality_report（逐节点打分/分级/修复建议）。
+
+    直接复用 _compile_execute（与 /run 同一套编译+执行管线），从 result 中取 quality_report。
+    """
+    params = req.model_dump()
+    result, _, _ = _compile_execute(req.goal, params)
+    return result.get("quality_report", {})
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -918,6 +922,23 @@ def selftest():
         "新拓扑应命中已沉淀模板"
     print(f"✓ S12 ⑭ 自我进化(SelfEvolution): 历史蒸馏 {ev_resp['template_count']} 模板"
           f" + 新拓扑命中建议（驱动自动复用）")
+
+    # S13: Phase 2 细粒度质量门（离线：强制规则解析，复用 _compile_execute）
+    os.environ.pop("AGENT_API_KEY", None)
+    rep = quality_report(GoalRequest(goal="画一张销售趋势图并做质量校验",
+                                      quality_threshold=0.8))
+    assert "final_score" in rep and "final_grade" in rep, "报告应含总评分与总评级"
+    assert set(rep["counts"].keys()) == {"pass", "marginal", "fail"}, "counts 应含三类"
+    assert sum(rep["counts"].values()) == len(rep["nodes"]), "counts 之和应等于节点数"
+    assert rep["final_grade"] in ("A", "B", "C", "D"), "总评级应在 A/B/C/D"
+    assert isinstance(rep["repair_plan"], list), "repair_plan 应为列表"
+    # 修复建议应可落地（指向现有能力）：auto_heal(⑪) / threshold 注入 / 换 tier(③) / 重试 / 补上下文(④)
+    if rep["repair_plan"]:
+        _joined = " ".join(rep["repair_plan"])
+        assert any(k in _joined for k in ("auto_heal", "threshold", "tier", "重试", "上下文")), \
+            "修复建议应指向可落地能力（auto_heal/threshold/tier/重试/上下文）"
+    print(f"✓ S13 Phase2 质量门(QualityReport): 总评 {rep['final_score_100']}/100"
+          f"（{rep['final_grade']}）· 分级 {rep['counts']} · 修复项 {len(rep['repair_plan'])}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

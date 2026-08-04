@@ -835,10 +835,14 @@ class CircuitExecutor:
         gate_nodes = [(c, comp) for c, comp in self.circuit.components.items()
                       if comp.get("type") in ("adc", "verify")]
         quality_gate = None
+        gate_thr = None
         if gate_nodes:
-            thr = max(comp.get("threshold", 0.8) for _, comp in gate_nodes)
-            quality_gate = {"threshold": round(thr, 3), "passed": fq >= thr}
+            gate_thr = max(comp.get("threshold", 0.8) for _, comp in gate_nodes)
+            quality_gate = {"threshold": round(gate_thr, 3), "passed": fq >= gate_thr}
         failed_nodes = [c for c in terminals if not out[c].ok]
+        # Phase 2 细粒度质量门：逐节点打分 + 分级 + 修复建议（纯函数、离线安全）
+        _report_thr = gate_thr if gate_thr is not None else getattr(self, "quality_threshold", None)
+        quality_report = QualityReport.assess(out, self.circuit.components, fq, _report_thr)
 
         result = {
             "success": all(out[c].ok for c in terminals),
@@ -854,6 +858,7 @@ class CircuitExecutor:
             "self_healed": {},
             "quality_gate": quality_gate,
             "failed_nodes": failed_nodes,
+            "quality_report": quality_report,
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
@@ -2817,6 +2822,159 @@ def self_evolution_selftest():
     print("\n⑭ 自我进化 离线自检全部通过 ✓")
 
 
+class QualityReport:
+    """Phase 2 细粒度质量门：把二元 quality_gate 升级为「逐节点打分 + 分级 + 修复建议」。
+
+    核心价值：不再只判 pass/fail，而是给出『为什么不过 + 往哪个方向修』，
+    直接服务于『减少重试次数』。纯函数、离线安全（不依赖网络/LLM）。
+
+    分级（score ∈ [0,1]）：A≥0.90 优 / B≥0.75 良 / C≥0.60 边际 / D<0.60 失败。
+    status：fail=节点开路(ok=False)；marginal=低于质量门阈值或低于 C 级；其余 pass。
+    """
+
+    GRADE_A = 0.90
+    GRADE_B = 0.75
+    GRADE_C = 0.60
+
+    # 节点类型 → 该类节点常见的修复动作（与现有能力对齐，确保建议可落地）
+    _REPAIR = {
+        "adc":       ["放宽该节点 threshold 或增强输入数据", "换更高 tier 模型提升识别准确度"],
+        "verify":    ["放宽/收紧 threshold 以匹配验收标准", "补充验收上下文后重试"],
+        "resistor":  ["增加并行冗余分支（auto_heal）或提高重试次数", "换更高 tier 模型"],
+        "capacitor": ["增加并行冗余分支（auto_heal）", "检查汇合输入完整性"],
+        "inductor":  ["检查上游供电稳定性后重试"],
+        "tool":      ["检查工具参数/权限，或补充上下文", "换 tool tier 或重试"],
+        "skill":     ["检查技能参数与权限", "提供更多上下文后重试"],
+        "power":     ["检查上游数据源可用性"],
+        "opamp":     ["检查放大链路输入/偏置"],
+        "diode":     ["检查极性/输入有效性"],
+    }
+
+    @classmethod
+    def _grade(cls, score):
+        if score >= cls.GRADE_A:
+            return "A"
+        if score >= cls.GRADE_B:
+            return "B"
+        if score >= cls.GRADE_C:
+            return "C"
+        return "D"
+
+    @classmethod
+    def _status(cls, sig, score, gate_thr):
+        if not sig.ok:
+            return "fail"
+        if gate_thr is not None and score < gate_thr:
+            return "marginal"
+        if score < cls.GRADE_C:
+            return "marginal"
+        return "pass"
+
+    @classmethod
+    def _suggest(cls, ctype, status):
+        base = cls._REPAIR.get(ctype, ["重试该节点或检查上游依赖", "补充上下文/输入后重试"])
+        if status == "fail":
+            return list(base)            # 失败给前两条修复方向
+        if status == "marginal":
+            return [base[0]]             # 边际只给首要建议
+        return []                        # pass 无需修复
+
+    @classmethod
+    def assess(cls, out, components, final_quality, threshold=None):
+        """out: {cid: Signal}; components: {cid: comp dict}; final_quality: float(0~1)。
+        返回 QualityReport dict（纯函数，可复现，利于 A/B 对比）。"""
+        nodes = {}
+        repair = []
+        counts = {"pass": 0, "marginal": 0, "fail": 0}
+        for cid, sig in out.items():
+            comp = components.get(cid, {})
+            ctype = comp.get("type", "unknown")
+            score = float(sig.quality) if sig.ok else 0.0
+            gate_thr = comp.get("threshold") if ctype in ("adc", "verify") else None
+            status = cls._status(sig, score, gate_thr)
+            counts[status] += 1
+            sugs = cls._suggest(ctype, status)
+            nodes[cid] = {
+                "type": ctype,
+                "label": comp.get("label", cid),
+                "ok": sig.ok,
+                "score": round(score, 3),
+                "score_100": round(score * 100, 1),
+                "grade": cls._grade(score),
+                "status": status,
+                "suggestions": sugs,
+            }
+            for s in sugs:
+                if s not in repair:
+                    repair.append(s)
+        fq = float(final_quality)
+        passed = (threshold is None) or (fq >= threshold)
+        return {
+            "final_score": round(fq, 3),
+            "final_score_100": round(fq * 100, 1),
+            "final_grade": cls._grade(fq),
+            "threshold": (round(threshold, 3) if threshold is not None else None),
+            "passed": passed,
+            "counts": counts,
+            "nodes": nodes,
+            "repair_plan": repair,
+            "summary": (f"总评分 {round(fq*100,1)}/100（{cls._grade(fq)}）· "
+                        f"通过 {counts['pass']} · 边际 {counts['marginal']} · 失败 {counts['fail']}"),
+        }
+
+
+def quality_gate_selftest():
+    """Phase 2 细粒度质量门离线自检：打分 / 分级 / 修复建议 / 聚合 / 纯函数可复现。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    def sig(ok, quality):
+        return Signal(ok=ok, quality=quality)
+
+    components = {
+        "src":  {"type": "power", "label": "src"},
+        "adc":  {"type": "adc", "label": "adc", "threshold": 0.8},
+        "R1":   {"type": "resistor", "label": "R1", "model": "small"},
+        "tool": {"type": "tool", "label": "tool"},
+        "cap":  {"type": "capacitor", "label": "cap"},
+    }
+
+    # 场景1：全高分 → 通过(A) · 修复计划空
+    out1 = {
+        "src": sig(True, 0.95), "adc": sig(True, 0.92),
+        "R1": sig(True, 0.88), "tool": sig(True, 0.90), "cap": sig(True, 0.85),
+    }
+    r1 = QualityReport.assess(out1, components, 0.90, threshold=0.8)
+    assert r1["passed"] is True, "全高分应通过"
+    assert r1["final_grade"] == "A", f"总分0.9应为A，实际 {r1['final_grade']}"
+    assert r1["counts"]["pass"] == 5, f"5 节点应全 pass，实际 {r1['counts']}"
+    assert r1["repair_plan"] == [], "全过不应有修复计划"
+    print("✓ Phase2 质量门：全过高分 → 通过(A) · 修复计划空")
+
+    # 场景2：边际2 + 失败1 → 不通过 · 分级/修复建议命中
+    out2 = {
+        "src": sig(True, 0.95), "adc": sig(True, 0.72),   # 边际(低于 gate 0.8)
+        "R1": sig(False, 0.0),                             # 失败
+        "tool": sig(True, 0.90), "cap": sig(True, 0.55),   # 边际(<C 级 0.6)
+    }
+    r2 = QualityReport.assess(out2, components, 0.70, threshold=0.8)
+    assert r2["passed"] is False, "总分0.7<0.8 应不通过"
+    assert r2["counts"]["fail"] == 1 and r2["counts"]["marginal"] == 2, \
+        f"失败1+边际2，实际 {r2['counts']}"
+    assert any("threshold" in s for s in r2["nodes"]["adc"]["suggestions"]), \
+        "adc 边际应给 threshold 修复建议"
+    assert any("冗余" in s or "auto_heal" in s for s in r2["nodes"]["R1"]["suggestions"]), \
+        "R1 失败应建议冗余分支/重试"
+    assert len(r2["repair_plan"]) > 0, "有失败/边际应有修复计划"
+    print(f"✓ Phase2 质量门：边际2+失败1 → 不通过 · 分级/修复建议命中（{r2['counts']}）")
+
+    # 场景3：纯函数可复现（同输入同输出，利于 A/B 对比）
+    r3 = QualityReport.assess(out2, components, 0.70, threshold=0.8)
+    assert r3 == r2, "同输入应得相同报告（纯函数）"
+    print("✓ Phase2 质量门：纯函数可复现（同输入同报告）")
+
+    print("\nPhase 2 细粒度质量门 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2833,6 +2991,7 @@ if __name__ == "__main__":
     permission_selftest()
     adaptive_topology_selftest()
     self_evolution_selftest()
+    quality_gate_selftest()
 
 
 def load(path):
