@@ -233,7 +233,7 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
           <span class="r-label">总延迟</span>
           <span class="r-value r-cost" id="rLatency">--</span>
         </div>
-        <div class="r-item" id="rStatus" style="font-size:12px;"></div>
+        <div class="r-item" id="rStatus" style="flex-basis:100%;font-size:12px;line-height:1.5;"></div>
       </div>
     </div>
   </div>
@@ -437,9 +437,28 @@ function onResult(result) {
   document.getElementById('rCost').textContent = '$' + (r.total_cost || 0).toFixed(4);
   document.getElementById('rLatency').textContent = (r.total_latency_ms || 0).toFixed(0) + 'ms';
   document.getElementById('rNodes').textContent = Object.keys(r.components || {}).length;
-  document.getElementById('rStatus').innerHTML = r.success
-    ? '<span style="color:var(--teal)">✓ 执行成功</span>'
-    : '<span style="color:var(--red)">✗ 部分失败</span>';
+
+  // 状态精准区分：成功 / 质量门未通过 / 部分节点失败 / 错误
+  const gate = r.quality_gate;
+  const failed = (r.failed_nodes || []).join(', ');
+  const fq = (r.final_quality || 0).toFixed(3);
+  let html, color;
+  if (r.success) {
+    html = '✓ 执行成功';
+    color = 'var(--teal)';
+  } else if (gate && !gate.passed) {
+    const thr = (gate.threshold || 0).toFixed(3);
+    html = `⚠ 完成 · 质量门未通过 (${fq} &lt; ${thr})`
+         + (failed ? `<br><span style="font-size:10px;opacity:.75">未达标节点: ${failed}</span>` : '');
+    color = 'var(--orange)';
+  } else if (failed) {
+    html = `⚠ 完成 · 部分节点失败 (${failed})`;
+    color = 'var(--orange)';
+  } else {
+    html = '⚠ 完成 · 未达标';
+    color = 'var(--orange)';
+  }
+  document.getElementById('rStatus').innerHTML = `<span style="color:${color}">${html}</span>`;
   document.getElementById('resultBar').style.opacity = '1';
 
   document.getElementById('btnRun').disabled = false;

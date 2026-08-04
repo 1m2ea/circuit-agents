@@ -828,6 +828,15 @@ class CircuitExecutor:
                    total_cost=round(total_cost, 4),
                    total_latency_ms=round(total_lat, 1),
                    final_quality=round(fq, 3))
+        # 诊断信息：质量门阈值 + 失败节点（供前端精准展示，零回归）
+        gate_nodes = [(c, comp) for c, comp in self.circuit.components.items()
+                      if comp.get("type") in ("adc", "verify")]
+        quality_gate = None
+        if gate_nodes:
+            thr = max(comp.get("threshold", 0.8) for _, comp in gate_nodes)
+            quality_gate = {"threshold": round(thr, 3), "passed": fq >= thr}
+        failed_nodes = [c for c in terminals if not out[c].ok]
+
         result = {
             "success": all(out[c].ok for c in terminals),
             "final_quality": round(fq, 3),
@@ -840,6 +849,8 @@ class CircuitExecutor:
             "evolved": self.state.get("_evolved"),
             "iterations": 1,
             "self_healed": {},
+            "quality_gate": quality_gate,
+            "failed_nodes": failed_nodes,
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
