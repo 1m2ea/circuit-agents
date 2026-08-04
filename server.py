@@ -74,6 +74,21 @@ class LongTaskRequest(BaseModel):
     quality_threshold: Optional[float] = Field(None, description="质量门阈值")
     ttl_ms: int = Field(60000, description="心跳超时阈值(ms)，超则判停滞可触发恢复")
 
+
+class AgentSpec(BaseModel):
+    """⑨ 多机器人协同：单个 agent 的描述。"""
+    name: str = Field(..., description="agent 名称（唯一）")
+    spec: dict = Field(..., description="该 agent 的电路拓扑 Spec")
+    provides: list[str] = Field(default_factory=list, description="本 agent 产出的产物(artifact)名")
+    needs: list[str] = Field(default_factory=list, description="本 agent 依赖的上游产物名")
+    entry: Optional[str] = Field(None, description="注入黑板产物的入口节点 id（默认拓扑第0层首节点）")
+
+
+class MultiRobotRequest(BaseModel):
+    """⑨ 多机器人协同：多个 agent 共享黑板协作。"""
+    agents: list[AgentSpec] = Field(..., description="参与协作的 agent 列表")
+    seed_base: int = Field(0, description="各 agent 后端 rng 种子基（资源隔离+可复现）")
+
 # ──────────────────────────────────────────────────────────
 # 应用
 # ──────────────────────────────────────────────────────────
@@ -340,6 +355,23 @@ def resume_longtask(task_id: str):
     return {"task_id": task_id, "resume_requested": True}
 
 
+# ──────────────────────────────────────────────────────────
+# ⑨ 多机器人协同：multirobot（共享黑板编排）
+# ──────────────────────────────────────────────────────────
+
+@app.post("/multirobot")
+def submit_multirobot(req: MultiRobotRequest):
+    """⑨ 多机器人协同：多个 agent 共享黑板协作，中间产物跨 agent 流转。
+
+    按 needs→provides 拓扑序启动各 agent（每个 agent 独立 Circuit + 独立后端，资源隔离），
+    上游产物经黑板注入下游 agent 入口节点，实现子电路间协作。返回协作序、黑板快照、各 agent 结果。
+    """
+    from runtime import MultiRobotCoordinator
+    agents = [a.model_dump() for a in req.agents]
+    coord = MultiRobotCoordinator(agents, seed_base=req.seed_base)
+    return coord.run()
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -563,6 +595,39 @@ def selftest():
     assert r_r["status"] == "done" and r_r["done_layers"] == 3
     print(f"✓ S6 ⑦ 长周期任务: 后台执行 done · 心跳正常 · 暂停→resume 续跑完成"
           f"（done_layers 1→3）")
+
+    # S7: ⑨ 多机器人协同（离线：显式 agent spec，无 LLM 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import MultiRobotCoordinator
+    agents = [
+        {"name": "researcher", "provides": ["plan"], "needs": [],
+         "spec": {"name": "research", "components": {
+             "src": {"type": "power", "label": "src"},
+             "A": {"type": "resistor", "label": "A", "model": "small",
+                   "produced_outputs": ["plan"]}},
+             "wires": [["src", "A"]]}},
+        {"name": "writer", "provides": ["draft"], "needs": ["plan"],
+         "spec": {"name": "write", "components": {
+             "src2": {"type": "power", "label": "src2"},
+             "W": {"type": "resistor", "label": "W", "model": "small",
+                   "required_inputs": ["plan"], "produced_outputs": ["draft"]}},
+             "wires": [["src2", "W"]]}},
+        {"name": "reviewer", "provides": ["verdict"], "needs": ["draft"],
+         "spec": {"name": "review", "components": {
+             "src3": {"type": "power", "label": "src3"},
+             "R": {"type": "resistor", "label": "R", "model": "small",
+                   "required_inputs": ["draft"], "produced_outputs": ["verdict"]}},
+             "wires": [["src3", "R"]]}},
+    ]
+    coord = MultiRobotCoordinator(agents)
+    cres = coord.run()
+    assert cres["order"] == ["researcher", "writer", "reviewer"], \
+        f"S7: 协作序错误 {cres['order']}"
+    assert set(cres["blackboard"].keys()) == {"plan", "draft", "verdict"}, \
+        f"S7: 黑板产物缺失 {set(cres['blackboard'].keys())}"
+    assert cres["agents"]["writer"]["success"], "S7: writer 应协作成功"
+    print(f"✓ S7 ⑨ 多机器人协同(MultiRobotCoordinator): {cres['agent_count']} agent 经"
+          f"黑板流转 → 序={cres['order']} · 黑板={list(cres['blackboard'].keys())}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

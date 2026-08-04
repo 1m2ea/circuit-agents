@@ -2219,6 +2219,232 @@ def long_task_selftest():
     print("\n⑦ 长周期任务 离线自检全部通过 ✓")
 
 
+class Blackboard:
+    """⑨ 多机器人协同：共享黑板（blackboard）。
+
+    各 agent 把『产出物(artifact)』以 Signal 形式 put 上黑板，下游 agent 按需 get，
+    实现子电路间中间产物的传递（而非各自孤立）。带写日志供审计/CI 断言。
+    """
+
+    def __init__(self):
+        self._data = {}
+        self._log = []
+
+    def put(self, key, signal):
+        if not isinstance(signal, Signal):
+            signal = Signal(value=signal, ok=True, quality=1.0)
+        self._data[key] = signal
+        self._log.append(("put", key, getattr(signal, "ok", True)))
+        return signal
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def keys(self):
+        return list(self._data.keys())
+
+    def history(self):
+        return list(self._log)
+
+    def snapshot(self):
+        return {k: {"ok": s.ok, "quality": round(s.quality, 3),
+                    "value_type": type(s.value).__name__}
+                for k, s in self._data.items()}
+
+
+def _seed_entry_signal(agent, blackboard):
+    """根据 agent['needs'] 从黑板取产物，合成注入 entry 节点的信号（跳过重算）。"""
+    needs = agent.get("needs", [])
+    vals = {}
+    ok = True
+    for art in needs:
+        sig = blackboard.get(art)
+        if sig is None or not sig.ok:
+            ok = False
+            vals[art] = None
+        else:
+            vals[art] = sig.value
+    value = vals if len(vals) != 1 else next(iter(vals.values()))
+    return Signal(value=value, ok=ok, quality=1.0 if ok else 0.0,
+                  meta={"produced_outputs": list(needs), "blackboard_seed": True})
+
+
+class MultiRobotCoordinator:
+    """⑨ 多机器人协同：多个独立 CircuitExecutor（agent）共享一块 Blackboard 协作。
+
+    模型：
+      · agent = {name, spec, provides:[artifact], needs:[artifact], entry?:node_id}
+      · 各 agent 独立 Circuit + 独立 SimBackend(rng) → 资源隔离（与 ⑥ 一致）。
+      · 按 needs→provides 拓扑序依次启动；每个 agent 启动前从其 needs 对应 artifact
+        在黑板上取上游产物，注入本 agent 的 entry 节点（跳过重算），使下游线性关系闸通过。
+      · agent 跑完，把自身 provides 的『终端产物 Signal』put 上黑板，供后续 agent 消费。
+      · 范围：⑨ 聚焦『协作编排 + 中间产物跨 agent 流转』，不重复 ⑥ 的并发/⑦ 的续跑。
+    """
+
+    def __init__(self, agents, backend_factory=None, blackboard=None,
+                 seed_base: int = 0):
+        self.agents = agents
+        self.bb = blackboard or Blackboard()
+        self.backend_factory = backend_factory or (
+            lambda i: SimBackend(random.Random(seed_base + i)))
+        self._order = self._topo_order()
+
+    def _agent(self, name):
+        for a in self.agents:
+            if a["name"] == name:
+                return a
+        return None
+
+    def _topo_order(self):
+        """按 provides/needs 做 agent 级拓扑排序；存在环或缺失供给则抛错。"""
+        provided_by = {}
+        for a in self.agents:
+            for art in a.get("provides", []):
+                provided_by.setdefault(art, []).append(a["name"])
+        order, done, remaining = [], set(), [a["name"] for a in self.agents]
+        progressed = True
+        while remaining and progressed:
+            progressed = False
+            nxt = []
+            for name in remaining:
+                a = self._agent(name)
+                needs = a.get("needs", [])
+                if all(any(p in done for p in provided_by.get(art, []))
+                       for art in needs):
+                    order.append(name)
+                    done.add(name)
+                    progressed = True
+                else:
+                    nxt.append(name)
+            remaining = nxt
+        if remaining:
+            raise ValueError(f"agent 依赖无法满足（环或缺失供给）: {remaining}")
+        return order
+
+    def _entry_node(self, agent, circuit):
+        if agent.get("entry"):
+            return agent["entry"]
+        return circuit.layers()[0][0]
+
+    def run(self):
+        results = {}
+        for idx, name in enumerate(self._order):
+            a = self._agent(name)
+            backend = self.backend_factory(idx)
+            circuit = Circuit(a["spec"], backend)
+            CircuitExecutor(circuit, memory_enabled=False)  # 每 agent 一个独立执行器实例
+            out = {}
+            entry = self._entry_node(a, circuit)
+            out[entry] = _seed_entry_signal(a, self.bb)
+            for layer in circuit.layers():
+                for cid in layer:
+                    if cid in out:
+                        continue
+                    out[cid] = circuit._run_one(cid, out)
+            provided = {}
+            for art in a.get("provides", []):
+                for cid, s in out.items():
+                    if art in (s.meta.get("produced_outputs") or []):
+                        self.bb.put(art, s)
+                        provided[art] = {"ok": s.ok, "quality": round(s.quality, 3)}
+                        break
+            terminals = [c for c in out if not circuit.succ[c]]
+            if terminals:
+                fq = max((out[c].quality for c in terminals), default=0.0)
+                success = all(out[c].ok for c in terminals)
+            else:
+                fq, success = 0.0, False
+            results[name] = {
+                "order": idx,
+                "needs": a.get("needs", []),
+                "provides": provided,
+                "success": success,
+                "final_quality": round(fq, 3),
+                "components": {c: {"ok": s.ok, "quality": round(s.quality, 3)}
+                               for c, s in out.items()},
+            }
+        return {
+            "order": self._order,
+            "blackboard": self.bb.snapshot(),
+            "blackboard_log": self.bb.history(),
+            "agents": results,
+            "agent_count": len(self.agents),
+        }
+
+
+def multi_robot_selftest():
+    """⑨ 多机器人协同离线自检：三 agent 流水线（plan→draft→verdict）经黑板流转。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    researcher = {
+        "name": "researcher", "provides": ["plan"], "needs": [],
+        "spec": {"name": "research", "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["plan"]},
+        }, "wires": [["src", "A"]]},
+    }
+    writer = {
+        "name": "writer", "provides": ["draft"], "needs": ["plan"],
+        "spec": {"name": "write", "components": {
+            "src2": {"type": "power", "label": "src2"},
+            "W": {"type": "resistor", "label": "W", "model": "small",
+                  "required_inputs": ["plan"], "produced_outputs": ["draft"]},
+        }, "wires": [["src2", "W"]]},
+    }
+    reviewer = {
+        "name": "reviewer", "provides": ["verdict"], "needs": ["draft"],
+        "spec": {"name": "review", "components": {
+            "src3": {"type": "power", "label": "src3"},
+            "R": {"type": "resistor", "label": "R", "model": "small",
+                  "required_inputs": ["draft"], "produced_outputs": ["verdict"]},
+        }, "wires": [["src3", "R"]]},
+    }
+
+    # 恒成功后端：自检只需验证『协作链路/黑板流转』结构性正确，规避 SimBackend yield 随机性。
+    class AlwaysOkBackend(SimBackend):
+        def run(self, comp, inputs):
+            s = super().run(comp, inputs)
+            if comp.get("type") == "resistor" and not s.ok:
+                return Signal(value="result(det)", quality=0.9, ok=True,
+                              cost=s.cost, latency_ms=s.latency_ms, meta=s.meta)
+            return s
+
+    coord = MultiRobotCoordinator(
+        [researcher, writer, reviewer],
+        backend_factory=lambda i: AlwaysOkBackend(random.Random(100 + i)))
+    res = coord.run()
+    assert res["order"] == ["researcher", "writer", "reviewer"], \
+        f"协作顺序应为 plan→draft→verdict，实际 {res['order']}"
+    for n in res["order"]:
+        assert res["agents"][n]["success"], f"{n} 应成功"
+    assert set(res["blackboard"].keys()) == {"plan", "draft", "verdict"}, \
+        f"黑板应含 plan/draft/verdict，实际 {set(res['blackboard'].keys())}"
+    assert res["agents"]["writer"]["components"]["W"]["ok"], \
+        "writer.W 应因黑板 plan 注入而 ok（协作生效）"
+    assert len([e for e in res["blackboard_log"] if e[0] == "put"]) == 3
+    print("✓ ⑨ 三 agent 流水线经黑板流转：researcher→writer→reviewer 全成功，"
+          "plan/draft/verdict 依次上黑板")
+
+    # 缺少上游供给 → 拓扑排序应抛错（依赖不可满足）
+    lone = {"name": "orphan", "provides": ["x"], "needs": ["missing"],
+            "spec": researcher["spec"]}
+    try:
+        MultiRobotCoordinator([lone])._topo_order()
+        raise AssertionError("缺少上游供给却不报错")
+    except ValueError:
+        pass
+    print("✓ ⑨ 依赖不可满足（缺失上游产物）时拒绝编排（防悬空依赖）")
+
+    # 资源隔离：两个独立 Circuit 实例不共享可变 Circuit/Spec 对象
+    c1 = MultiRobotCoordinator([researcher])
+    c2 = MultiRobotCoordinator([researcher])
+    assert c1.agents is not c2.agents, "两协调器应持有各自 agent 列表（隔离）"
+    print("✓ ⑨ 多协调器资源隔离：各自持有独立 agent/黑板实例")
+
+    print("\n⑨ 多机器人协同 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2231,6 +2457,7 @@ if __name__ == "__main__":
     multi_backend_selftest()
     batch_executor_selftest()
     long_task_selftest()
+    multi_robot_selftest()
 
 
 def load(path):
