@@ -676,6 +676,30 @@ def transcribe(req: TranscribeRequest):
     }
 
 
+class ClusterRequest(BaseModel):
+    goal: str
+    n_workers: Optional[int] = 2
+    route: Optional[bool] = True
+    memory_enabled: Optional[bool] = False
+    auto_select_models: Optional[bool] = False
+
+
+@app.post("/cluster")
+def cluster_run(req: ClusterRequest):
+    """Phase 2 ③ 分布式执行：把目标编译为拓扑，按弱连通分量分片，多 worker 并发执行并聚合。
+
+    离线安全（强制规则解析，无需 LLM/网络）。真实远程 transport 由调用方注入
+    ClusterCoordinator(transport=...)，协调协议不变。
+    """
+    from compiler.cluster import ClusterCoordinator
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线规则解析
+    n = req.n_workers or 2
+    coord = ClusterCoordinator(n_workers=n)
+    return coord.run(req.goal, n_workers=n, route=req.route,
+                     memory_enabled=req.memory_enabled,
+                     auto_select_models=req.auto_select_models)
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1121,6 +1145,17 @@ def selftest():
         "/transcribe 应区分模态"
     print(f"✓ S16 Phase2 ② 多模态真视听觉(MultimodalTranscriber): 离线占位✓ · "
           f"/transcribe 返回 {_t16b['count']} 条转录(图+音)")
+
+    # S17: Phase 2 ③ 分布式执行（WCC 分片 + 多 worker 并发 + 聚合 + /cluster 端点）
+    from compiler.cluster import ClusterCoordinator
+    _c17 = ClusterCoordinator(n_workers=2).run("查中国GDP总量并预测趋势", n_workers=2)
+    assert _c17["worker_count"] >= 1 and "per_worker" in _c17, "应分布式执行并聚合"
+    assert _c17["final_quality"] >= 0, "聚合质量应非负"
+    _cr = cluster_run(ClusterRequest(goal="分析两份报告并总结", n_workers=2))
+    assert _cr["worker_count"] >= 1 and len(_cr["per_worker"]) >= 1, \
+        "/cluster 应返回分片结果"
+    print(f"✓ S17 Phase2 ③ 分布式执行(ClusterCoordinator): worker={_cr['worker_count']} · "
+          f"聚合质量={_cr['final_quality']} · per_worker={len(_cr['per_worker'])}")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
