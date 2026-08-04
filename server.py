@@ -372,6 +372,39 @@ def submit_multirobot(req: MultiRobotRequest):
     return coord.run()
 
 
+# ──────────────────────────────────────────────────────────
+# ⑩ 安全与权限：permission（越权校验 + 执行期拦截）
+# ──────────────────────────────────────────────────────────
+
+class PermissionRequest(BaseModel):
+    """⑩ 安全与权限：提交一份电路拓扑与已获权限，校验越权并模拟拦截执行。"""
+    spec: dict = Field(..., description="电路拓扑 Spec（节点可声明 required_permissions）")
+    granted: list[str] = Field(default_factory=list, description="本次会话已获权限集合")
+
+
+@app.post("/permission")
+def check_permission(req: PermissionRequest):
+    """⑩ 校验整图权限：返回 authorized / denied（越权节点+缺失权限），并模拟『带拦截』执行。
+
+    越权节点经 guard_backend 返回开路信号（gate=permission_denied）不实际执行；
+    授权节点正常；据此暴露最小权限下的真实执行结果。
+    """
+    from runtime import PermissionGate, Circuit, SimBackend
+    import random
+    gate = PermissionGate(set(req.granted))
+    spec = req.spec
+    guarded = gate.guard_backend(SimBackend(random.Random(0)), spec)
+    out, _, _ = Circuit(spec, guarded).propagate()
+    components = {c: {"ok": s.ok, "quality": round(s.quality, 3),
+                     "gate": s.meta.get("gate")}
+                  for c, s in out.items()}
+    return {
+        "authorized": gate.authorize(spec),
+        "denied": gate.denied(spec),
+        "components": components,
+    }
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -628,6 +661,28 @@ def selftest():
     assert cres["agents"]["writer"]["success"], "S7: writer 应协作成功"
     print(f"✓ S7 ⑨ 多机器人协同(MultiRobotCoordinator): {cres['agent_count']} agent 经"
           f"黑板流转 → 序={cres['order']} · 黑板={list(cres['blackboard'].keys())}")
+
+    # S8: ⑩ 安全与权限（离线：显式 spec，无 LLM 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import PermissionGate
+    psec = {"name": "secure", "components": {
+        "src": {"type": "power", "label": "src"},
+        "mail": {"type": "resistor", "label": "mail", "model": "tool",
+                 "required_permissions": ["email:send"], "produced_outputs": ["sent"]},
+        "db": {"type": "resistor", "label": "db", "model": "tool",
+               "required_permissions": ["db:query"], "produced_outputs": ["rows"]},
+        "safe": {"type": "resistor", "label": "safe", "model": "small",
+                 "produced_outputs": ["ok"]}},
+        "wires": [["src", "mail"], ["src", "db"], ["src", "safe"]]}
+    # 未授权 → mail/db 越权；授权 db:query → mail 仍越权、db 正常
+    pr1 = check_permission(PermissionRequest(spec=psec, granted=[]))
+    assert not pr1["authorized"] and "mail" in pr1["denied"] and "db" in pr1["denied"]
+    pr2 = check_permission(PermissionRequest(spec=psec, granted=["db:query"]))
+    assert pr2["components"]["mail"]["gate"] == "permission_denied", "mail 应被拦截"
+    assert pr2["components"]["db"]["ok"], "db 已授权应正常"
+    assert pr2["components"]["safe"]["ok"], "safe 无权限声明应正常"
+    print(f"✓ S8 ⑩ 安全与权限(PermissionGate): 越权识别+拦截生效 "
+          f"（denied={pr1['denied']}）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

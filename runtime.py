@@ -2445,6 +2445,124 @@ def multi_robot_selftest():
     print("\n⑨ 多机器人协同 离线自检全部通过 ✓")
 
 
+class PermissionGate:
+    """⑩ 安全与权限：节点/skill 声明所需权限，执行前校验 granted 集合，未授权则拦截。
+
+    设计（第二层边界扩展 · ⑩）：
+      · 节点 spec 可声明 required_permissions: [perm,...]（如 "email:send" / "db:query"）。
+      · granted：本次执行会话已获得的权限集合（由上层鉴权注入，默认空=全部拦截）。
+      · authorize(spec)：整图是否都授权（无越权节点）。
+      · denied(spec)：列出越权节点及其缺失权限（审计/报错用）。
+      · guard_backend(backend, spec)：返回包装后端，越权节点直接返回开路信号（不执行），
+        诚实上抛 gate=permission_denied；授权节点正常执行。实现『默认拒绝/最小权限』。
+      · 范围：⑩ 聚焦权限校验与执行期拦截，不实现鉴权发放流程（留给接入层/SSO）。
+    """
+
+    def __init__(self, granted: "set[str]" = None):
+        self.granted = set(granted or [])
+
+    def _req_map(self, spec):
+        return {cid: set(comp.get("required_permissions") or [])
+                for cid, comp in spec["components"].items()}
+
+    def required(self, spec):
+        return self._req_map(spec)
+
+    def denied(self, spec):
+        out = {}
+        for cid, req in self._req_map(spec).items():
+            miss = req - self.granted
+            if miss:
+                out[cid] = sorted(miss)
+        return out
+
+    def authorize(self, spec) -> bool:
+        return len(self.denied(spec)) == 0
+
+    def guard_backend(self, backend, spec):
+        req_by_label = {comp.get("label"): set(comp.get("required_permissions") or [])
+                        for comp in spec["components"].values()}
+        granted = self.granted
+
+        class _Guarded(Backend):
+            def run(self, comp, inputs):
+                perms = req_by_label.get(comp.get("label"), set())
+                miss = perms - granted
+                if miss:
+                    return Signal(value=None, quality=0.0, ok=False, cost=0.0,
+                                  latency_ms=0.0,
+                                  meta={"gate": "permission_denied",
+                                        "missing": sorted(miss),
+                                        "node": comp.get("label")})
+                return backend.run(comp, inputs)
+
+        return _Guarded()
+
+
+def permission_selftest():
+    """⑩ 安全与权限离线自检：越权识别 + 授权通过 + 执行期拦截（默认拒绝）。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    spec = {"name": "secure", "components": {
+        "src": {"type": "power", "label": "src"},
+        "mail": {"type": "resistor", "label": "mail", "model": "tool",
+                 "required_permissions": ["email:send"], "produced_outputs": ["sent"]},
+        "db": {"type": "resistor", "label": "db", "model": "tool",
+               "required_permissions": ["db:query"], "produced_outputs": ["rows"]},
+        "safe": {"type": "resistor", "label": "safe", "model": "small",
+                 "produced_outputs": ["ok"]},
+    }, "wires": [["src", "mail"], ["src", "db"], ["src", "safe"]]}
+
+    # 1) 默认无权限 → mail/db 越权
+    gate0 = PermissionGate()
+    denied = gate0.denied(spec)
+    assert "mail" in denied and "db" in denied, "mail/db 应被识别为越权"
+    assert denied["mail"] == ["email:send"], f"mail 缺失应为 email:send，实际 {denied['mail']}"
+    assert not gate0.authorize(spec), "未授权时整图不应通过"
+    print("✓ ⑩ 未授权时 mail/db 越权被识别（email:send / db:query）")
+
+    # 2) 授予权限 → 全部授权
+    gate1 = PermissionGate({"email:send", "db:query"})
+    assert gate1.authorize(spec), "授予后应整图授权通过"
+    assert gate1.denied(spec) == {}, "授予后不应有越权"
+    print("✓ ⑩ 授予 email:send+db:query 后整图授权通过")
+
+    # 3) 拦截生效：仅授予 db:query → mail 越权开路，db/safe 正常
+    class OkBackend(SimBackend):
+        def run(self, comp, inputs):
+            s = super().run(comp, inputs)
+            if comp.get("type") == "resistor" and not s.ok:
+                return Signal(value="x", quality=0.9, ok=True, cost=s.cost,
+                              latency_ms=s.latency_ms, meta=s.meta)
+            return s
+
+    gate = PermissionGate({"db:query"})
+    guarded = gate.guard_backend(OkBackend(random.Random(0)), spec)
+    out, _, _ = Circuit(spec, guarded).propagate()
+    assert not out["mail"].ok, "mail 应因越权被拦截(开路)"
+    assert out["mail"].meta.get("gate") == "permission_denied", "应上抛 permission_denied"
+    assert out["db"].ok, "db 已授权应正常执行"
+    assert out["safe"].ok, "safe 无权限声明应正常执行"
+    print("✓ ⑩ 拦截生效：越权节点 mail 开路(gate=permission_denied)，"
+          "授权节点 db/safe 正常执行")
+
+    # 4) 默认拒绝：越权节点不触达后端执行（最小权限）
+    calls = []
+    class TracingBackend(SimBackend):
+        def run(self, comp, inputs):
+            calls.append(comp.get("label"))
+            return super().run(comp, inputs)
+
+    gate2 = PermissionGate(set())  # 全拦
+    guarded2 = gate2.guard_backend(TracingBackend(random.Random(1)), spec)
+    Circuit(spec, guarded2).propagate()
+    assert "mail" not in calls and "db" not in calls, \
+        f"越权节点不应执行后端：calls={calls}"
+    print("✓ ⑩ 默认拒绝：越权节点 mail/db 未触达后端执行（最小权限）")
+
+    print("\n⑩ 安全与权限 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2458,6 +2576,7 @@ if __name__ == "__main__":
     batch_executor_selftest()
     long_task_selftest()
     multi_robot_selftest()
+    permission_selftest()
 
 
 def load(path):
