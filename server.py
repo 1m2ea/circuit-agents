@@ -1013,6 +1013,39 @@ def tune_run(req: TuneRunRequest):
             if len(results) > 10 else results}
 
 
+# ============================================================================
+# Phase 2+ 第四层② 编译成静态图（拓扑 → 纯 Python 函数）
+# ============================================================================
+
+class StaticGraphRequest(BaseModel):
+    """Phase 2+ 第四层②：编译 spec 为纯 Python 函数（零 LLM 调用）。"""
+    spec: dict = Field(..., description="待编译的拓扑 spec")
+    seed: int = Field(42, description="随机种子（默认 42，确定性）")
+
+
+@app.post("/static-graph/compile")
+def static_graph_compile(req: StaticGraphRequest):
+    """第四层② 编译成静态图：把拓扑 spec 编译为纯 Python 函数源码。
+
+    内联 SimBackend 完整确定性语义（所有 11 种元件类型 + aggregate + TIERS +
+    feedback/self_heal），拓扑序（Kahn 分层）烘焙进代码，零运行时图遍历。
+    生成代码零外部依赖（仅标准库 random/json/math），可独立执行、可 pickle 分发。
+
+    返回：code（Python 源码）、function_name（`run_task`）、seed、topology name。
+    调用方 exec(code) 后调用 run_task(task: str) -> dict 即可执行。
+    """
+    from compiler.static_graph import StaticGraphCompiler
+    os.environ.pop("AGENT_API_KEY", None)
+    comp = StaticGraphCompiler()
+    code, fname = comp.emit(req.spec, seed=req.seed)
+    return {"code": code,
+            "function_name": fname,
+            "seed": req.seed,
+            "topology": req.spec.get("name", "unnamed"),
+            "standalone": True,
+            "zero_llm": True}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1694,6 +1727,33 @@ def selftest():
     print(f"✓ S25 第四层① 在线调参(OnlineTuner): "
           f"25轮/avg_q={round(_tune['avg_final_quality'],4)} · "
           f"{len(_tune['arm_stats'])} 臂 · 收敛 {bt} · Bandit UCB1 运行时自适应")
+
+    # S26: 第四层② 编译成静态图（拓扑 → 纯 Python 函数 + /static-graph/compile）
+    _sg_spec = {
+        "name": "sg_demo",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "A": {"type": "resistor", "label": "retrieve", "model": "small", "accuracy": 0.70, "recovery": 0.3},
+            "B": {"type": "resistor", "label": "reason", "model": "large", "accuracy": 0.92},
+            "adc": {"type": "adc", "threshold": 0.6},
+        },
+        "wires": [["src", "A"], ["A", "B"], ["B", "adc"]],
+    }
+    _sg = static_graph_compile(StaticGraphRequest(spec=_sg_spec, seed=42))
+    assert _sg["standalone"] and _sg["zero_llm"], "S26: 应标注 standalone + zero_llm"
+    assert "def run_task" in _sg["code"], "S26: 应包含 run_task 函数"
+    assert "_run_component" in _sg["code"] and "_TIERS" in _sg["code"], "S26: 应内联完整运行时"
+    assert _sg["function_name"] == "run_task", "S26: 函数名应为 run_task"
+    assert _sg["seed"] == 42, "S26: seed 应透传"
+    # 验证生成代码可 exec 并执行
+    _sg_ns = {}
+    exec(_sg["code"], _sg_ns)
+    _sg_result = _sg_ns["run_task"]("test task")
+    assert isinstance(_sg_result, dict) and "final_quality" in _sg_result, "S26: exec 后应返回结果 dict"
+    assert _sg_result["final_quality"] > 0, "S26: 静态执行质量应 > 0"
+    print(f"✓ S26 第四层② 编译成静态图(StaticGraphCompiler): "
+          f"独立 Python 函数 · 质量={round(_sg_result['final_quality'],3)} · "
+          f"成本=¥{_sg_result['total_cost']:.4f} · 零 LLM 确定性")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
