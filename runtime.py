@@ -35,6 +35,88 @@ DEGRADED_CONSEC = 3
 _WD_SAMPLES_CAP = 20
 
 
+# ──────────────────────────────────────────────────────────
+# ③ 自主发现新元件类型 —— composite 模板全局注册表 + 内联展开
+# ──────────────────────────────────────────────────────────
+
+_COMPONENT_LIBRARY: dict = {}       # name -> template dict
+
+
+def register_component_template(template: dict) -> None:
+    """注册一个 composite 模板到全局库（component_miner.wrap 调用）。"""
+    _COMPONENT_LIBRARY[template["name"]] = template
+
+
+def _expand_composites(spec: dict) -> dict:
+    """把 spec 里的 composite 节点内联展开为原子元件。
+
+    无 composite（或全局库为空）→ 原样返回同一对象（零成本、零回归）。
+    有 composite → 深拷贝展开：外部边 P→C 重连为 P→C.entry / C.exit→Q，
+    内部边照搬（节点 id 加前缀 C_ 防冲突）。
+    """
+    if not _COMPONENT_LIBRARY:
+        return spec                         # 零回归快速路径
+    comps = spec.get("components", {})
+    has_composite = any(
+        (c.get("type") == "composite") or c.get("template") or c.get("composite")
+        for c in comps.values())
+    if not has_composite:
+        return spec
+
+    new_comps: dict = {}
+    new_wires: list = []
+    remap: dict = {}                        # 原 cid -> {"entry":[...], "exit":[...]}
+
+    for cid, comp in comps.items():
+        tname = comp.get("template") or comp.get("composite")
+        tmpl = _COMPONENT_LIBRARY.get(tname) if tname else None
+        if tmpl is None and comp.get("type") == "composite":
+            # 声明了 composite 但库里没模板 → 保留原样（不展开，执行时按未知类型处理）
+            new_comps[cid] = comp
+            remap[cid] = cid
+            continue
+        if tmpl is None:
+            new_comps[cid] = comp
+            remap[cid] = cid
+            continue
+        # 展开
+        prefix = cid + "_"
+        for iname, icomp in tmpl["internal_components"].items():
+            new_comps[prefix + iname] = dict(icomp)
+        for a, b in tmpl["internal_wires"]:
+            new_wires.append([prefix + a, prefix + b])
+        remap[cid] = {
+            "entry": [prefix + e for e in tmpl["entry_nodes"]],
+            "exit": [prefix + e for e in tmpl["exit_nodes"]],
+        }
+
+    # 重连外部边
+    for a, b in spec.get("wires", []):
+        ra = remap.get(a, a)
+        rb = remap.get(b, b)
+        a_outs = ra["exit"] if isinstance(ra, dict) else [ra]
+        b_ins = rb["entry"] if isinstance(rb, dict) else [rb]
+        for ao in a_outs:
+            for bi in b_ins:
+                new_wires.append([ao, bi])
+
+    new_spec = dict(spec)
+    new_spec["components"] = new_comps
+    new_spec["wires"] = new_wires
+    # feedback 边也要重映射（如果 feedback 指向 composite 节点）
+    fb = spec.get("feedback")
+    if fb:
+        nfb = dict(fb)
+        fa = remap.get(fb.get("from"))
+        if isinstance(fa, dict) and fa["exit"]:
+            nfb["from"] = fa["exit"][0]
+        fb_to = remap.get(fb.get("to"))
+        if isinstance(fb_to, dict) and fb_to["entry"]:
+            nfb["to"] = fb_to["entry"][0]
+        new_spec["feedback"] = nfb
+    return new_spec
+
+
 @dataclass
 class Signal:
     """The 'current' flowing through a wire: a structured, typed message."""
@@ -274,6 +356,8 @@ class Watchdog:
 
 class Circuit:
     def __init__(self, spec, backend, verify_backend=None, backend_map=None):
+        # ③ 自主发现新元件类型：composite 节点内联展开（无 composite 时原样返回，零回归）
+        spec = _expand_composites(spec)
         self.spec = spec
         self.backend = backend
         # C. 异构校验：verify 节点可选的独立后端（不同模型/供应商），未配置则 None（退回主 backend）。

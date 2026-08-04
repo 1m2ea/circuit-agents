@@ -879,6 +879,46 @@ def federated_round(req: FederatedRequest):
     return res
 
 
+class ComponentDiscoverRequest(BaseModel):
+    """Phase 2 第三层③ 自主发现新元件类型：从历史拓扑挖掘频繁子图并封装。"""
+    history: list = Field(..., description="历史拓扑列表 [{spec:{...}} 或直接 spec]")
+    min_support: int = Field(3, description="子图跨任务出现次数下限")
+    max_size: int = Field(4, description="子图节点数上限（2~max_size）")
+    register: bool = Field(True, description="是否注册到全局 ComponentLibrary（注册后可被 compile 引用）")
+
+
+@app.post("/components/discover")
+def components_discover(req: ComponentDiscoverRequest):
+    """Phase 2 第三层③ 自主发现新元件类型：挖掘频繁子图 → 封装 composite → 注册。
+
+    与 ⑭ SelfEvolution（/evolve/suggest 边级 motif 建议）的区别：
+    ⑭ 只建议「你的拓扑有高频边」，不改 spec；本端点把「反复出现的完整子链」
+    封装成可执行的新元件类型并注册，compile 可直接用 type:composite 引用，
+    Circuit 构造时自动内联展开为原子元件（零运行时改动）。
+
+    离线安全（纯本地子图枚举 + 排列同构判定，无 key、无网络）。
+    """
+    from compiler.component_miner import mine, wrap, discover_and_register
+    os.environ.pop("AGENT_API_KEY", None)
+    if req.register:
+        templates = discover_and_register(
+            req.history, min_support=req.min_support, max_size=req.max_size)
+    else:
+        motifs = mine(req.history, min_support=req.min_support,
+                      max_size=req.max_size)
+        templates = [wrap(m, register=False) for m in motifs]
+    return {"templates": templates, "count": len(templates),
+            "registered": req.register}
+
+
+@app.get("/components/library")
+def components_library():
+    """查看当前已注册的 composite 模板（③ 自主发现新元件类型）。"""
+    from runtime import _COMPONENT_LIBRARY
+    return {"templates": list(_COMPONENT_LIBRARY.values()),
+            "count": len(_COMPONENT_LIBRARY)}
+
+
 class CodegenRequest(BaseModel):
     goal: str
     language: str = "js"  # cpp / rust / js
@@ -1477,6 +1517,50 @@ def selftest():
           f"全局学到 analyze→{_fed['best_tier']['tier']}"
           f"(成功率 {round(_fed['best_tier']['success_rate'], 4)}) · "
           f"原始任务描述零外泄 · ε 记账未超支 · 单方拒聚合")
+
+    # S23: Phase 2 第三层③ 自主发现新元件类型（挖掘+封装+注册+内联展开真执行）
+    from runtime import _COMPONENT_LIBRARY as _CL, Circuit as _Circ, \
+        SimBackend as _SB, CircuitExecutor as _CE
+    _CL.clear()                                   # 干净起点
+    _rvs = lambda nm, tier="small": {            # noqa: E731 research→verify→summarize
+        "name": nm, "spec": {"name": nm, "components": {
+            "src": {"type": "power", "label": "task"},
+            "R": {"type": "resistor", "label": "research", "model": tier,
+                  "yield": 1.0, "produced_outputs": ["raw"]},
+            "V": {"type": "verify", "label": "verify", "threshold": 0.5},
+            "S": {"type": "resistor", "label": "summarize", "model": tier,
+                  "yield": 1.0, "required_inputs": ["raw"],
+                  "produced_outputs": ["summary"]}},
+            "wires": [["src", "R"], ["R", "V"], ["V", "S"]]}}
+    _disc = components_discover(ComponentDiscoverRequest(
+        history=[_rvs("h1"), _rvs("h2"), _rvs("h3", "large")],
+        min_support=3, max_size=4, register=True))
+    assert _disc["count"] >= 1, f"S23: 应挖出≥1 个模板，实际 {_disc['count']}"
+    assert _disc["registered"] is True, "S23: 应已注册"
+    _tmpl = _disc["templates"][0]
+    assert _tmpl["name"] in _CL, "S23: 模板应在全局库"
+    # composite 真执行：一个节点代替 R→V→S，展开后与原子版结果一致
+    import random as _rnd
+    _be_a = _SB(_rnd.Random(42))
+    _res_a = _CE(_Circ(_rvs("atomic")["spec"], _be_a)).run()
+    _be_c = _SB(_rnd.Random(42))                  # 同种子可复现
+    _res_c = _CE(_Circ({"name": "comp_demo", "components": {
+        "src": {"type": "power", "label": "task"},
+        "C": {"type": "composite", "template": _tmpl["name"], "label": "rvs"}},
+        "wires": [["src", "C"]]}, _be_c)).run()
+    assert _res_c["success"] == _res_a["success"], \
+        f"S23: composite 展开后执行结果应与原子版一致"
+    assert abs(_res_c["final_quality"] - _res_a["final_quality"]) < 1e-9, \
+        f"S23: 质量应一致 (composite={_res_c['final_quality']} atomic={_res_a['final_quality']})"
+    _lib = components_library()
+    assert _lib["count"] >= 1, "S23: /components/library 应能查到已注册模板"
+    print(f"✓ S23 Phase2 三层③ 自主发现新元件类型(ComponentMiner): "
+          f"挖掘 {_disc['count']} 个模板 · 顶级 {_tmpl['name']}"
+          f"(size={len(_tmpl['internal_components'])} support={_tmpl['support']}) · "
+          f"composite 内联展开后真执行 success={_res_c['success']} "
+          f"quality={round(_res_c['final_quality'], 4)} 与原子版一致 · "
+          f"library 查询 {_lib['count']} 个")
+    _CL.clear()                                   # 清理不污染后续
 
     print("\nserver.py 离线自检全部通过 ✓")
 
