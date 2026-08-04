@@ -1072,6 +1072,59 @@ def causal_analyze(req: CausalAnalyzeRequest):
     return analyzer.analyze(req.spec, req.execution_result)
 
 
+# ============================================================================
+# Phase 2+ 第四层④ 异构硬件后端（Ollama 本地模型 Backend）
+# ============================================================================
+
+class OllamaRunRequest(BaseModel):
+    """Phase 2+ 第四层④：Ollama 本地模型后端执行。"""
+    spec: dict = Field(..., description="拓扑 spec")
+    host: Optional[str] = Field(None, description="Ollama 服务地址（默认 http://localhost:11434）")
+    model_map: Optional[dict] = Field(None, description="tier→模型名映射（默认 qwen2.5 系列）")
+    seed: int = Field(0, description="随机种子（fallback SimBackend 用）")
+    api_mode: str = Field("native", description="API 模式: native(/api/chat) 或 openai(/v1/chat/completions)")
+
+
+@app.post("/ollama/run")
+def ollama_run(req: OllamaRunRequest):
+    """第四层④ 异构硬件后端：用 Ollama 本地模型执行电路拓扑。
+
+    - resistor 节点 → Ollama REST API 本地推理（零 API 费用）
+    - 其余组件 → SimBackend 确定性语义
+    - 连接失败 → 降级到 SimBackend（graceful fallback）
+    - 适合隐私敏感/离线/成本敏感/边缘设备场景
+
+    返回：执行结果 + OllamaBackend 统计（calls/successes/fallbacks/avg_latency）
+    """
+    from compiler.ollama_backend import OllamaBackend
+    from runtime import Circuit, SimBackend, CircuitExecutor
+    import random as _rnd
+    os.environ.pop("AGENT_API_KEY", None)
+
+    be = OllamaBackend(
+        rng=_rnd.Random(req.seed),
+        host=req.host,
+        model_map=req.model_map,
+        api_mode=req.api_mode,
+        fallback=SimBackend(_rnd.Random(req.seed)),
+    )
+    circ = Circuit(req.spec, be)
+    result = CircuitExecutor(circ).run()
+    return {"result": result, "ollama_stats": be.stats(),
+            "host": be.host, "model_map": be.model_map}
+
+
+@app.post("/ollama/health")
+def ollama_health(req: OllamaRunRequest):
+    """检查 Ollama 服务可达性 + 已安装模型列表。"""
+    from compiler.ollama_backend import OllamaBackend
+    os.environ.pop("AGENT_API_KEY", None)
+    be = OllamaBackend(host=req.host, model_map=req.model_map)
+    ok, detail = be.health_check()
+    return {"reachable": ok, "detail": detail,
+            "host": be.host, "model_map": be.model_map}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1810,6 +1863,39 @@ def selftest():
           f"瓶颈={_ca['bottleneck_label']} · "
           f"因果贡献=+{round(_ca['max_impact'],3)} · "
           f"反事实推理({len(_ca['bottlenecks'])} 节点)")
+
+    # S28: 第四层④ 异构硬件后端（Ollama 本地模型 + /ollama/run + /ollama/health）
+    # 离线验证：注入假响应，不依赖真实 Ollama 运行
+    from compiler.ollama_backend import OllamaBackend as _OBE
+    _oll_spec = {
+        "name": "ollama_demo",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "ret": {"type": "resistor", "label": "retrieve", "model": "small"},
+            "rsn": {"type": "resistor", "label": "reason", "model": "large"},
+            "adc": {"type": "adc", "threshold": 0.5},
+        },
+        "wires": [["src", "ret"], ["ret", "rsn"], ["rsn", "adc"]],
+    }
+    # 注入假响应测试 OllamaBackend 核心逻辑
+    _fake_resp = {"model": "qwen2.5:7b",
+                  "message": {"role": "assistant", "content": "本地推理结果"},
+                  "done": True, "prompt_eval_count": 20, "eval_count": 5}
+    _oll_be = _OBE(rng=__import__("random").Random(0),
+                   http_post=lambda u, h, b: _fake_resp,
+                   fallback=__import__("runtime", fromlist=["SimBackend"]).SimBackend(
+                       __import__("random").Random(0)))
+    from runtime import Circuit as _OC, CircuitExecutor as _OCE
+    _oll_circ = _OC(_oll_spec, _oll_be)
+    _oll_result = _OCE(_oll_circ).run()
+    _oll_stats = _oll_be.stats()
+    assert _oll_stats["calls"] >= 2, f"S28: 应至少调用 2 次 Ollama: {_oll_stats}"
+    assert _oll_stats["successes"] >= 2, f"S28: 应至少成功 2 次: {_oll_stats}"
+    assert _oll_be.model_map["small"] == "qwen2.5:7b", "S28: 默认模型映射"
+    print(f"✓ S28 第四层④ Ollama后端(OllamaBackend): "
+          f"calls={_oll_stats['calls']} · success={_oll_stats['successes']} · "
+          f"成本=¥0（本地免费） · native API · fallback=SimBackend · "
+          f"模型映射 small→qwen2.5:7b large→qwen2.5:14b")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
