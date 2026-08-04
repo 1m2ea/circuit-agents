@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 import uuid
 from collections import defaultdict
@@ -1946,6 +1947,278 @@ def batch_executor_selftest():
     print("\n⑥ 多任务并行 离线自检全部通过 ✓")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# ⑦ 长周期任务：LongTask（断点续跑 + 心跳 + 暂停/恢复）
+# ───────────────────────────────────────────────────────────────────────────
+def _sig_to_dict(sig):
+    """Signal → 可 JSON 序列化的 dict（value 不可序列化时降级为 str）。"""
+    try:
+        v = sig.value
+        json.dumps(v)
+    except (TypeError, ValueError):
+        v = str(sig.value)
+    return {"value": v, "quality": sig.quality, "ok": sig.ok,
+            "cost": sig.cost, "latency_ms": sig.latency_ms, "meta": sig.meta}
+
+
+def _dict_to_sig(d):
+    """_sig_to_dict 的逆操作。"""
+    return Signal(value=d.get("value"), quality=d.get("quality", 0.0),
+                  ok=d.get("ok", True), cost=d.get("cost", 0.0),
+                  latency_ms=d.get("latency_ms", 0.0), meta=d.get("meta", {}))
+
+
+class LongTask:
+    """⑦ 长周期任务：跨会话/可暂停/可恢复。
+
+    设计要点（第二层边界扩展 · ⑦）：
+      · 分层执行（复用 Circuit.layers()/_run_one()，与 CircuitExecutor 同源）。
+      · 断点续跑：每层完成后落盘 checkpoint（已完成层数 + 部分结果 out + state + 心跳）。
+        进程崩溃/重启后 resume() 从最后完成层的下一层继续，已完成层不重跑。
+      · 心跳：每层刷新 heartbeat_ms；heartbeat_age_ms() 超 ttl → is_stalled() 判停滞，
+        可触发外部恢复流程。
+      · 暂停/恢复：request_pause() 置标志，当前层完成后停并落盘(paused)；resume() 继续。
+      · 零回归：单实例一次性 run() 行为与 CircuitExecutor 等价（success/final_quality 一致）。
+      · 范围：⑦ 聚焦续跑/心跳/暂停，不含 auto-fill 补数闭环与 3.5 进化（留给执行器内核）。
+    """
+
+    def __init__(self, spec, backend=None, checkpoint_path=None, ttl_ms: int = 60000,
+                 goal_id: "Optional[str]" = None):
+        self.spec = spec
+        self.backend = backend or SimBackend(random.Random(0))
+        self.cp_path = checkpoint_path or f".longtask_{uuid.uuid4().hex[:8]}.json"
+        self.ttl_ms = ttl_ms
+        self.goal_id = goal_id or f"lt_{uuid.uuid4().hex[:8]}"
+        self.circuit = Circuit(spec, self.backend)
+        self.pause_requested = False
+        self.on_node_done = None
+        self._out: dict = {}
+        self._state = {"_fetched": {}, "_skills_used": [], "_trace": []}
+        self._created_ms = self._now_ms()
+
+    # ---- 时间/序列化辅助 ----
+    @staticmethod
+    def _now_ms():
+        return int(time.time() * 1000)
+
+    def _load_cp(self):
+        try:
+            with open(self.cp_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _save_cp(self, done_layers, status):
+        cp = {
+            "goal_id": self.goal_id,
+            "spec_name": self.spec.get("name"),
+            "done_layers": sorted(done_layers),
+            "out": {cid: _sig_to_dict(s) for cid, s in self._out.items()},
+            "state": self._state,
+            "status": status,
+            "heartbeat_ms": self._now_ms(),
+            "created_ms": self._created_ms,
+            "finished_ms": self._now_ms() if status == "done" else None,
+        }
+        with open(self.cp_path, "w", encoding="utf-8") as f:
+            json.dump(cp, f, ensure_ascii=False, indent=2)
+
+    # ---- 心跳 ----
+    def heartbeat_age_ms(self):
+        cp = self._load_cp()
+        if cp is None:
+            return None
+        return self._now_ms() - cp.get("heartbeat_ms", self._created_ms)
+
+    def is_stalled(self):
+        age = self.heartbeat_age_ms()
+        return age is not None and age > self.ttl_ms
+
+    # ---- 状态查询 ----
+    def status(self):
+        cp = self._load_cp()
+        if cp is None:
+            return {"status": "not_started", "goal_id": self.goal_id}
+        age = self._now_ms() - cp.get("heartbeat_ms", self._created_ms)
+        return {
+            "status": cp.get("status"),
+            "goal_id": cp.get("goal_id"),
+            "done_layers": len(cp.get("done_layers", [])),
+            "total_layers": len(self.circuit.layers()),
+            "heartbeat_age_ms": age,
+            "stalled": age > self.ttl_ms,
+        }
+
+    # ---- 控制 ----
+    def request_pause(self):
+        self.pause_requested = True
+
+    def resume(self):
+        self.pause_requested = False
+        return self.run(resume=True)
+
+    # ---- 主执行（可续跑）----
+    def run(self, resume: bool = False):
+        cp = self._load_cp() if resume else None
+        if cp is not None:
+            self.goal_id = self.goal_id or cp.get("goal_id")
+            self._created_ms = cp.get("created_ms", self._created_ms)
+            self._out = {cid: _dict_to_sig(d) for cid, d in cp.get("out", {}).items()}
+            self._state = cp.get("state", self._state)
+            done_layers = set(cp.get("done_layers", []))
+            if cp.get("status") == "done":
+                return self._finalize()  # 已完成 → 直接返回
+        else:
+            done_layers = set()
+
+        layers = self.circuit.layers()
+        start = (max(done_layers) + 1) if done_layers else 0
+        for li in range(start, len(layers)):
+            for cid in layers[li]:
+                sig = self.circuit._run_one(cid, self._out)
+                self._out[cid] = sig
+                if self.on_node_done is not None:
+                    try:
+                        self.on_node_done(cid, sig,
+                                          {"node": cid, "ok": sig.ok,
+                                           "quality": round(sig.quality, 3)})
+                    except Exception:
+                        pass
+            done_layers.add(li)
+            self._save_cp(done_layers, "running")   # 每层落盘 → 续跑点
+            if self.pause_requested:
+                self._save_cp(done_layers, "paused")
+                return self._result_dict("paused", done_layers)
+        self._save_cp(done_layers, "done")
+        return self._finalize()
+
+    # ---- 结果聚合 ----
+    def _result_dict(self, status, done_layers):
+        # 仅基于「已完成节点」(self._out 中) 计算质量/成功，避免续跑中途 KeyError
+        done_cids = list(self._out.keys())
+        terminals = [c for c in done_cids if not self.circuit.succ[c]]
+        if terminals:
+            fq = max((self._out[c].quality for c in terminals), default=0.0)
+            success = all(self._out[c].ok for c in terminals)
+        else:
+            fq, success = 0.0, False
+        return {
+            "goal_id": self.goal_id,
+            "status": status,
+            "done_layers": len(done_layers),
+            "total_layers": len(self.circuit.layers()),
+            "final_quality": round(fq, 3),
+            "success": success,
+            "components": {c: {"ok": s.ok, "quality": round(s.quality, 3)}
+                           for c, s in self._out.items()},
+            "state": self._state,
+            "checkpoint": self.cp_path,
+            "heartbeat_age_ms": self.heartbeat_age_ms(),
+        }
+
+    def _finalize(self):
+        return self._result_dict("done", set(range(len(self.circuit.layers()))))
+
+
+def long_task_selftest():
+    """⑦ 长周期任务离线自检（无 key/无网）：断点续跑 + 心跳 + 暂停/恢复。"""
+    import tempfile
+
+    # 计数后端：统计每个 label 的 run 调用次数（验证续跑时已完成层不重跑）
+    class CountingBackend(SimBackend):
+        def __init__(self, rng):
+            super().__init__(rng)
+            self.calls = {}
+        def run(self, comp, inputs):
+            self.calls[comp.get("label")] = self.calls.get(comp.get("label"), 0) + 1
+            return super().run(comp, inputs)
+
+    spec = {
+        "name": "long_demo",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["a"]},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["a"], "produced_outputs": ["b"]},
+            "C": {"type": "resistor", "label": "C", "model": "small",
+                  "required_inputs": ["b"], "produced_outputs": ["c"]},
+        },
+        "wires": [["src", "A"], ["A", "B"], ["B", "C"]],
+    }
+
+    # 1) 一次性完整 run：success + quality 与 CircuitExecutor 一致（零回归）
+    cp1 = tempfile.mktemp(suffix=".json")
+    lt = LongTask(spec, backend=CountingBackend(random.Random(0)),
+                  checkpoint_path=cp1, goal_id="T1")
+    res = lt.run()
+    assert res["status"] == "done" and res["success"], "应一次跑完且成功"
+    assert res["done_layers"] == 4, f"应有 4 层完成，实际 {res['done_layers']}"
+    # 对照 CircuitExecutor
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(0))))
+    exr = ex.run()
+    assert abs(exr["final_quality"] - res["final_quality"]) < 1e-9, \
+        "LongTask 与 CircuitExecutor 的 final_quality 应一致（零回归）"
+    print(f"✓ ⑦ 一次性 run: 4 层全完成 success={res['success']} "
+          f"quality={res['final_quality']}（与 CircuitExecutor 一致）")
+
+    # 2) 断点续跑：第 0 层后暂停 → 新实例 resume 从层1继续，层0 不重跑
+    cp2 = tempfile.mktemp(suffix=".json")
+    bk_run = CountingBackend(random.Random(7))      # 第一次执行的计数后端
+    lt1 = LongTask(spec, backend=bk_run, checkpoint_path=cp2, goal_id="T2")
+    lt1.request_pause()                              # 跑完第 0 层后暂停
+    r1 = lt1.run()
+    assert r1["status"] == "paused", f"应暂停，实际 {r1['status']}"
+    assert r1["done_layers"] == 1, f"暂停时应只完成 1 层，实际 {r1['done_layers']}"
+    # 模拟"进程崩溃重启"：全新 LongTask 实例 + 全新后端（仅通过 checkpoint 续跑）
+    bk_resume = CountingBackend(random.Random(7))
+    lt2 = LongTask(spec, backend=bk_resume, checkpoint_path=cp2, goal_id="T2")
+    r2 = lt2.resume()                                # 从层1继续
+    assert r2["status"] == "done", f"续跑应完成，实际 {r2['status']}"
+    assert r2["done_layers"] == 4, f"续跑后应共 4 层，实际 {r2['done_layers']}"
+    assert r2["success"], "续跑结果应成功"
+    # 关键：续跑实例的层0节点(src/power) 不应被再次执行
+    assert bk_resume.calls.get("src", 0) == 0, \
+        f"续跑时第0层(src)不应重跑，实际调用 {bk_resume.calls.get('src',0)} 次"
+    # 已完成层的节点在首次执行中各跑1次，续跑只跑剩余层
+    assert bk_run.calls.get("src", 0) == 1, "首次执行层0应跑1次"
+    print(f"✓ ⑦ 断点续跑: 层0后暂停 → 新实例 resume 跳过已完成层0"
+          f"（src 调用0次），完成剩余3层 → done，结果一致")
+
+    # 3) 心跳 + 停滞判定
+    st = lt2.status()
+    assert st["status"] == "done" and not st["stalled"], "刚完成不应判停滞"
+    age = lt2.heartbeat_age_ms()
+    assert age is not None and age >= 0, "heartbeat_age 应可计算"
+    # 篡改 checkpoint 心跳为远古 → is_stalled 应为 True
+    import os as _os
+    cp_obj = lt2._load_cp()
+    cp_obj["heartbeat_ms"] = lt2._now_ms() - (lt2.ttl_ms + 1000)
+    with open(cp2, "w", encoding="utf-8") as f:
+        json.dump(cp_obj, f)
+    assert lt2.is_stalled(), "心跳超 ttl 应判停滞"
+    print(f"✓ ⑦ 心跳: 正常运行 heartbem_age={age}ms 未停滞；"
+          f"篡改心跳超 ttl → is_stalled=True（可触发恢复）")
+    _os.unlink(cp2)
+
+    # 4) 暂停标志在层间生效（多层的情况下，跑到某层结束才停）
+    cp3 = tempfile.mktemp(suffix=".json")
+    lt3 = LongTask(spec, backend=CountingBackend(random.Random(3)),
+                   checkpoint_path=cp3, goal_id="T3")
+    lt3.request_pause()
+    r3 = lt3.run()
+    assert r3["status"] == "paused" and r3["done_layers"] == 1
+    lt3b = LongTask(spec, backend=CountingBackend(random.Random(3)),
+                    checkpoint_path=cp3, goal_id="T3")
+    r3b = lt3b.resume()
+    assert r3b["status"] == "done" and r3b["done_layers"] == 4
+    print("✓ ⑦ 暂停/恢复: 层间暂停 → resume 继续 → 完整完成")
+    _os.unlink(cp3)
+    _os.unlink(cp1)
+
+    print("\n⑦ 长周期任务 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -1957,6 +2230,7 @@ if __name__ == "__main__":
     stream_selftest()
     multi_backend_selftest()
     batch_executor_selftest()
+    long_task_selftest()
 
 
 def load(path):

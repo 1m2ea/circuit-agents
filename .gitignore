@@ -19,6 +19,10 @@ venv/
 # Topology memory cache (auto-generated)
 .topology_memory.json
 
+# ⑦ 长周期任务 checkpoint 文件（运行时生成，含断点续跑状态）
+.longtask_*.json
+longtask_*.json
+
 # Throwaway demo artifacts
 _demo_out.txt
 _mk_pareto.py

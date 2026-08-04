@@ -62,6 +62,18 @@ class BatchRequest(BaseModel):
     evolve_enabled: bool = Field(True, description="是否启用 3.5 多任务进化")
     quality_threshold: Optional[float] = Field(None, description="质量门阈值，注入 adc/verify 节点")
 
+
+class LongTaskRequest(BaseModel):
+    """⑦ 长周期任务：提交一个可暂停/可恢复的长任务。"""
+    goal: str = Field(..., description="自然语言任务描述")
+    route: bool = Field(True, description="是否走 Router 并联编译")
+    auto_select_models: bool = Field(False, description="是否启用智能模型选型")
+    memory_enabled: bool = Field(True, description="是否启用记忆复用")
+    data_fill_budget: int = Field(2, description="自动补数重试次数上限")
+    evolve_enabled: bool = Field(False, description="长任务默认关闭 3.5 进化（聚焦续跑/心跳）")
+    quality_threshold: Optional[float] = Field(None, description="质量门阈值")
+    ttl_ms: int = Field(60000, description="心跳超时阈值(ms)，超则判停滞可触发恢复")
+
 # ──────────────────────────────────────────────────────────
 # 应用
 # ──────────────────────────────────────────────────────────
@@ -82,6 +94,7 @@ app.add_middleware(
 
 # 内存存储（生产环境应换 SQLite/Redis）
 _runs: dict[str, dict] = {}
+_longtasks: dict[str, dict] = {}   # ⑦ 长周期任务实例表：id -> {task, status, goal, result, checkpoint, error}
 _lock = threading.Lock()
 
 # 静态文件根目录
@@ -204,6 +217,127 @@ def submit_batch(req: BatchRequest):
     )
     agg = be.run(req.goals)
     return agg
+
+
+# ──────────────────────────────────────────────────────────
+# ⑦ 长周期任务：start / pause / resume / status
+# ──────────────────────────────────────────────────────────
+
+def _run_longtask(task_id: str, goal_text: str, params: dict):
+    """后台线程：编译+执行长任务（分层 + 每层层间落盘 checkpoint，支持暂停/续跑）。"""
+    try:
+        from compiler.nl_parser import GoalParser
+        from compiler.compile import compile_goal
+        from runtime import LongTask, SimBackend
+        import random
+
+        parser = GoalParser()
+        goal = parser.parse(goal_text)
+        spec = compile_goal(
+            goal, auto_bind=True, route=params.get("route", True),
+            memory_enabled=params.get("memory_enabled", True),
+            auto_select_models=params.get("auto_select_models", False),
+        )
+        qt = params.get("quality_threshold")
+        if qt is not None:
+            for comp in spec.get("components", {}).values():
+                if comp.get("type") in ("adc", "verify"):
+                    comp["threshold"] = float(qt)
+
+        cp = f"longtask_{task_id}.json"
+        lt = LongTask(
+            spec,
+            backend=SimBackend(random.Random(int(time.time() * 1000) % (2 ** 31))),
+            checkpoint_path=cp,
+            ttl_ms=params.get("ttl_ms", 60000),
+            goal_id=task_id,
+        )
+        with _lock:
+            _longtasks[task_id]["task"] = lt
+            _longtasks[task_id]["status"] = "running"
+            _longtasks[task_id]["checkpoint"] = cp
+        res = lt.run()
+        with _lock:
+            _longtasks[task_id]["status"] = res["status"]
+            _longtasks[task_id]["result"] = res
+    except Exception as e:
+        with _lock:
+            _longtasks[task_id]["status"] = "error"
+            _longtasks[task_id]["error"] = str(e)
+
+
+@app.post("/longtask")
+def submit_longtask(req: LongTaskRequest):
+    """⑦ 提交一个长周期任务，后台分层执行；返回 task_id 供 pause/resume/status。"""
+    task_id = uuid.uuid4().hex[:12]
+    with _lock:
+        _longtasks[task_id] = {"task": None, "status": "pending", "goal": req.goal,
+                               "result": None, "checkpoint": None, "error": None}
+    params = req.model_dump()
+    t = threading.Thread(target=_run_longtask, args=(task_id, req.goal, params), daemon=True)
+    t.start()
+    return {"task_id": task_id, "status": "pending"}
+
+
+@app.get("/longtask/{task_id}")
+def get_longtask(task_id: str):
+    """查询长任务实时状态：心跳年龄、已完成层数、是否停滞、结果。"""
+    with _lock:
+        rec = _longtasks.get(task_id)
+    if rec is None:
+        raise HTTPException(404, "longtask not found")
+    lt = rec.get("task")
+    st = lt.status() if lt is not None else {"status": rec.get("status")}
+    return {
+        "task_id": task_id,
+        "status": st.get("status"),
+        "heartbeat_age_ms": st.get("heartbeat_age_ms"),
+        "done_layers": st.get("done_layers"),
+        "total_layers": st.get("total_layers"),
+        "stalled": st.get("stalled"),
+        "result": rec.get("result"),
+        "error": rec.get("error"),
+    }
+
+
+@app.post("/longtask/{task_id}/pause")
+def pause_longtask(task_id: str):
+    """请求暂停：当前层完成后停并落盘（paused）。"""
+    with _lock:
+        rec = _longtasks.get(task_id)
+    if rec is None:
+        raise HTTPException(404, "longtask not found")
+    lt = rec.get("task")
+    if lt is None:
+        raise HTTPException(409, "task not started yet")
+    lt.request_pause()
+    return {"task_id": task_id, "paused_requested": True}
+
+
+@app.post("/longtask/{task_id}/resume")
+def resume_longtask(task_id: str):
+    """从断点恢复：读取 checkpoint 继续剩余层（不重跑已完成层）。"""
+    with _lock:
+        rec = _longtasks.get(task_id)
+    if rec is None:
+        raise HTTPException(404, "longtask not found")
+    lt = rec.get("task")
+    if lt is None:
+        raise HTTPException(409, "task not started yet")
+
+    def _resume():
+        try:
+            res = lt.resume()
+            with _lock:
+                _longtasks[task_id]["status"] = res["status"]
+                _longtasks[task_id]["result"] = res
+        except Exception as e:
+            with _lock:
+                _longtasks[task_id]["status"] = "error"
+                _longtasks[task_id]["error"] = str(e)
+
+    threading.Thread(target=_resume, daemon=True).start()
+    return {"task_id": task_id, "resume_requested": True}
 
 
 @app.post("/run", response_model=RunStatus)
@@ -390,6 +524,45 @@ def selftest():
     print(f"✓ S5 ⑥ 批量执行(BatchExecutor): {bagg['total']} 目标并行 → "
           f"成功 {bagg['succeeded']} · speedup={bagg['speedup']} · "
           f"聚合质量={bagg['aggregate_final_quality']:.3f}")
+
+    # S6: ⑦ 长周期任务（离线：强制规则解析）
+    import threading as _th
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import LongTask
+    tid = "selftest_lt"
+    _longtasks[tid] = {"task": None, "status": "pending", "goal": "长任务测试",
+                       "result": None, "checkpoint": None, "error": None}
+    _run_longtask(tid, "分析一份很长的报告并总结要点",
+                  {"route": False, "memory_enabled": False,
+                   "auto_select_models": False, "ttl_ms": 60000})
+    # _run_longtask 是同步函数（非线程），直接读结果
+    assert _longtasks[tid]["status"] == "done", \
+        f"S6: 应跑完，实际 {_longtasks[tid]['status']}: {_longtasks[tid].get('error')}"
+    assert _longtasks[tid]["result"]["done_layers"] >= 1
+    # 状态查询
+    st = _longtasks[tid]["task"].status()
+    assert st["status"] == "done" and not st["stalled"]
+    # 断点续跑：暂停→恢复
+    tid2 = "selftest_lt2"
+    _longtasks[tid2] = {"task": None, "status": "pending", "goal": "长任务续跑",
+                        "result": None, "checkpoint": None, "error": None}
+    # 用共享 LongTask 实例：先 pause 后 run，再 resume
+    from runtime import SimBackend
+    import random as _rnd
+    lt_inst = LongTask({"name": "lt", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["a"]},
+        "B": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["a"], "produced_outputs": ["b"]},
+    }, "wires": [["src", "A"], ["A", "B"]]}, backend=SimBackend(_rnd.Random(0)),
+        checkpoint_path=f"longtask_{tid2}.json", goal_id=tid2)
+    lt_inst.request_pause()
+    r_p = lt_inst.run()
+    assert r_p["status"] == "paused" and r_p["done_layers"] == 1
+    r_r = lt_inst.resume()
+    assert r_r["status"] == "done" and r_r["done_layers"] == 3
+    print(f"✓ S6 ⑦ 长周期任务: 后台执行 done · 心跳正常 · 暂停→resume 续跑完成"
+          f"（done_layers 1→3）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
