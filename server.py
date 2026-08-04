@@ -1046,6 +1046,32 @@ def static_graph_compile(req: StaticGraphRequest):
             "zero_llm": True}
 
 
+# ============================================================================
+# Phase 2+ 第四层③ 执行历史因果分析（反事实推理定位瓶颈）
+# ============================================================================
+
+class CausalAnalyzeRequest(BaseModel):
+    """Phase 2+ 第四层③：执行历史因果分析。"""
+    spec: dict = Field(..., description="拓扑 spec")
+    execution_result: dict = Field(..., description="CircuitExecutor.run() 的返回结果")
+
+
+@app.post("/causal/analyze")
+def causal_analyze(req: CausalAnalyzeRequest):
+    """第四层③ 执行历史因果分析：反事实推理定位质量瓶颈节点。
+
+    对每个节点做反事实推演："如果该节点质量=1.0，最终质量会是多少？"
+    因果贡献 = 反事实最终质量 - 真实最终质量。
+    贡献最大的节点 = 瓶颈节点（提升它能带来最大全局收益）。
+
+    纯分析推演（O(V+E) per counterfactual），不重新执行电路。
+    """
+    from compiler.causal_analyzer import CausalAnalyzer
+    os.environ.pop("AGENT_API_KEY", None)
+    analyzer = CausalAnalyzer()
+    return analyzer.analyze(req.spec, req.execution_result)
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1754,6 +1780,36 @@ def selftest():
     print(f"✓ S26 第四层② 编译成静态图(StaticGraphCompiler): "
           f"独立 Python 函数 · 质量={round(_sg_result['final_quality'],3)} · "
           f"成本=¥{_sg_result['total_cost']:.4f} · 零 LLM 确定性")
+
+    # S27: 第四层③ 执行历史因果分析（反事实推理 + /causal/analyze）
+    from runtime import Circuit as _SC, SimBackend as _SBE, CircuitExecutor as _SCE
+    import random as _sr
+    _ca_spec = {
+        "name": "causal_demo",
+        "components": {
+            "src": {"type": "power", "label": "task"},
+            "ret": {"type": "resistor", "label": "retrieve", "model": "small", "accuracy": 0.70, "recovery": 0.3},
+            "rsn": {"type": "resistor", "label": "reason", "model": "large", "accuracy": 0.92},
+            "sum": {"type": "resistor", "label": "summarize", "model": "small", "accuracy": 0.55},
+            "adc": {"type": "adc", "threshold": 0.5},
+        },
+        "wires": [["src", "ret"], ["ret", "rsn"], ["rsn", "sum"], ["sum", "adc"]],
+    }
+    _ca_be = _SBE(_sr.Random(42))
+    _ca_circ = _SC(_ca_spec, _ca_be)
+    _ca_result = _SCE(_ca_circ).run()
+    _ca = causal_analyze(CausalAnalyzeRequest(spec=_ca_spec, execution_result=_ca_result))
+    assert _ca["bottlenecks"], "S27: 应有瓶颈分析结果"
+    assert _ca["bottleneck_node"] is not None, "S27: 应定位瓶颈节点"
+    assert _ca["max_impact"] > 0, f"S27: 应有正因果贡献: {_ca['max_impact']}"
+    _ca_bn0 = _ca["bottlenecks"][0]
+    assert _ca_bn0["impact"] == _ca["max_impact"], "S27: 排名第1应等于 max_impact"
+    assert "瓶颈" in _ca["analysis"], "S27: 分析摘要应含'瓶颈'"
+    print(f"✓ S27 第四层③ 因果分析(CausalAnalyzer): "
+          f"最终质量={round(_ca['actual_final_quality'],3)} · "
+          f"瓶颈={_ca['bottleneck_label']} · "
+          f"因果贡献=+{round(_ca['max_impact'],3)} · "
+          f"反事实推理({len(_ca['bottlenecks'])} 节点)")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
