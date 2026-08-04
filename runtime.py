@@ -2713,6 +2713,110 @@ def adaptive_topology_selftest():
     print("\n⑪ 自适应拓扑 离线自检全部通过 ✓")
 
 
+class SelfEvolution:
+    """⑭ 自我进化：扫描执行历史，蒸馏高频结构模式为新拓扑模板/技能。
+
+    设计（第三层范式升级 · ⑭）：
+      · 把每份历史拓扑拆成『边 motif』（无序组件类型对，如 power→resistor），统计跨任务频次。
+      · 频次 ≥ min_support 的 motif 升华为『可复用拓扑模板/技能』（含骨架 spec + 示例，
+        可交给 ⑬ 共享生态分发；可交给 ⑥ 批量/⑪ 自适应复用）。
+      · suggest(spec)：给定新拓扑，返回其中已沉淀的可复用模板（驱动自动复用/推荐）。
+      · 范围：⑭ 聚焦『从历史蒸馏可复用模式』，不含在线微调权重（留给模型层）。
+    """
+
+    def __init__(self, history=None, min_support: int = 2):
+        self.history = list(history or [])
+        self.min_support = min_support
+        self.templates = self.distill()
+
+    @staticmethod
+    def _type(comp):
+        return comp.get("type", "unknown")
+
+    @staticmethod
+    def _motifs(spec):
+        comps = spec.get("components", {})
+        out = []
+        for a, b in spec.get("wires", []):
+            ta = SelfEvolution._type(comps.get(a, {}))
+            tb = SelfEvolution._type(comps.get(b, {}))
+            out.append(tuple(sorted([ta, tb])))
+        return out
+
+    def distill(self):
+        counts = {}
+        first_example = {}
+        for item in self.history:
+            spec = item.get("spec", item) if isinstance(item, dict) else item
+            for m in self._motifs(spec):
+                counts[m] = counts.get(m, 0) + 1
+                if m not in first_example:
+                    first_example[m] = spec
+        templates = []
+        for m, c in counts.items():
+            if c >= self.min_support:
+                templates.append({
+                    "id": "motif:" + "+".join(m),
+                    "motif": list(m),
+                    "support": c,
+                    "example": first_example.get(m),
+                })
+        templates.sort(key=lambda t: -t["support"])
+        return templates
+
+    def suggest(self, spec):
+        motifs = set(self._motifs(spec))
+        known = {tuple(t["motif"]) for t in self.templates}
+        hit = motifs & known
+        return [t for t in self.templates if tuple(t["motif"]) in hit]
+
+
+def self_evolution_selftest():
+    """⑭ 自我进化离线自检：历史蒸馏高频 motif 模板 + 新拓扑建议。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    def mk(name, n):
+        comps = {"src": {"type": "power", "label": "src"}}
+        wires = []
+        prev = "src"
+        for i in range(n):
+            cid = f"R{i}"
+            comps[cid] = {"type": "resistor", "label": cid, "model": "small",
+                          "produced_outputs": [f"o{i}"]}
+            wires.append([prev, cid])
+            prev = cid
+        return {"name": name, "spec": {"name": name, "components": comps, "wires": wires}}
+
+    # 历史：3 个任务都含 power→resistor motif；1 个稀有 opamp→resistor
+    hist = [mk("t1", 2), mk("t2", 3), mk("t3", 1)]
+    hist.append({"name": "r1", "spec": {
+        "name": "r1", "components": {
+            "o": {"type": "opamp", "label": "o"},
+            "r": {"type": "resistor", "label": "r", "model": "small"}},
+        "wires": [["o", "r"]]}})
+
+    ev = SelfEvolution(hist, min_support=2)
+    mot = {tuple(t["motif"]) for t in ev.templates}
+    assert ("power", "resistor") in mot, "power→resistor 应被蒸馏为模板"
+    pr = [t for t in ev.templates if t["motif"] == ["power", "resistor"]][0]
+    assert pr["support"] >= 3, f"power→resistor 支持度应≥3，实际 {pr['support']}"
+    rare_mot = [t for t in ev.templates if "opamp" in t["motif"]]
+    assert not rare_mot, "仅出现 1 次的 opamp→resistor 不应成模板（低于 min_support）"
+    print(f"✓ ⑭ 蒸馏：{len(ev.templates)} 个高频 motif 模板"
+          f"（power→resistor 支持度={pr['support']}；稀有 opamp→resistor 已过滤）")
+
+    # suggest：新拓扑含 power→resistor → 命中模板；陌生拓扑无建议
+    sug = ev.suggest(mk("new", 2)["spec"])
+    assert any(t["motif"] == ["power", "resistor"] for t in sug), "新拓扑应命中已知模板"
+    alien = {"name": "a", "components": {
+        "x": {"type": "diode", "label": "x"},
+        "y": {"type": "diode", "label": "y"}}, "wires": [["x", "y"]]}
+    assert ev.suggest(alien) == [], "无已知 motif 的拓扑不应有建议"
+    print("✓ ⑭ suggest：新拓扑命中已沉淀模板；陌生拓扑无建议（驱动自动复用）")
+
+    print("\n⑭ 自我进化 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2728,6 +2832,7 @@ if __name__ == "__main__":
     multi_robot_selftest()
     permission_selftest()
     adaptive_topology_selftest()
+    self_evolution_selftest()
 
 
 def load(path):

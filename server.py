@@ -524,6 +524,39 @@ def pull_topology(req: SharePullRequest):
         raise HTTPException(404, f"仓库中无此拓扑：{req.name}")
 
 
+# ──────────────────────────────────────────────────────────
+# ⑭ 自我进化：evolve（历史蒸馏可复用模板）
+# ──────────────────────────────────────────────────────────
+
+class EvolveRequest(BaseModel):
+    """⑭ 自我进化：提交执行历史，蒸馏高频结构模式为可复用模板。"""
+    history: list[dict] = Field(..., description="执行历史（每项 {name, spec} 或纯 spec）")
+    min_support: int = Field(2, description="motif 达此频次才升华为模板")
+
+
+class EvolveSuggestRequest(BaseModel):
+    """⑭ 自我进化：给定新拓扑 + 历史，返回其中已沉淀的可复用模板。"""
+    spec: dict = Field(..., description="新电路拓扑 Spec")
+    history: list[dict] = Field(default_factory=list, description="执行历史")
+    min_support: int = Field(2, description="motif 最小支持度")
+
+
+@app.post("/evolve")
+def evolve(req: EvolveRequest):
+    """⑭ 蒸馏历史中的高频边 motif 为可复用拓扑模板（含骨架与示例）。"""
+    from runtime import SelfEvolution
+    ev = SelfEvolution(req.history, min_support=req.min_support)
+    return {"templates": ev.templates, "template_count": len(ev.templates)}
+
+
+@app.post("/evolve/suggest")
+def evolve_suggest(req: EvolveSuggestRequest):
+    """⑭ 给定新拓扑，返回其中已沉淀的可复用模板（驱动自动复用/推荐）。"""
+    from runtime import SelfEvolution
+    ev = SelfEvolution(req.history, min_support=req.min_support)
+    return {"suggested": ev.suggest(req.spec)}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -862,6 +895,29 @@ def selftest():
     if os.path.exists(_repo_file):
         os.unlink(_repo_file)
     print(f"✓ S11 ⑬ 电路图共享生态(ShareRepo): 发布→列表→拉取 往返成功（{pname}）")
+
+    # S12: ⑭ 自我进化（离线：显式历史，无 LLM 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    def _mk(n):
+        return {"name": f"h{n}", "spec": {"name": f"h{n}", "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["x"]}}, "wires": [["src", "A"]]}}
+    ev_hist = [_mk(i) for i in range(3)]
+    ev_resp = evolve(EvolveRequest(history=ev_hist, min_support=2))
+    assert ev_resp["template_count"] >= 1, "应蒸馏出至少 1 个模板"
+    assert any(t["motif"] == ["power", "resistor"] for t in ev_resp["templates"]), \
+        "power→resistor 应被蒸馏为模板"
+    sg = evolve_suggest(EvolveSuggestRequest(
+        spec={"name": "n", "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["x"]}}, "wires": [["src", "A"]]},
+        history=ev_hist, min_support=2))
+    assert any(t["motif"] == ["power", "resistor"] for t in sg["suggested"]), \
+        "新拓扑应命中已沉淀模板"
+    print(f"✓ S12 ⑭ 自我进化(SelfEvolution): 历史蒸馏 {ev_resp['template_count']} 模板"
+          f" + 新拓扑命中建议（驱动自动复用）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
