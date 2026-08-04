@@ -541,11 +541,13 @@ class CircuitExecutor:
                  verify_backend: "Optional[object]" = None,
                  memory_enabled: bool = True,
                  human_callback: "Optional[callable]" = None,
-                 auto_select_models: bool = False):
+                 auto_select_models: bool = False,
+                 on_node_done: "Optional[callable]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
         scope      : 事件作用域前缀（子电路用 'evolve'，渲染器据此标紫⚠）。
+        on_node_done: (cid, signal, event_info) -> None，每个节点完成时调（流式用）。
         """
         self.circuit = circuit
         self.budget = data_fill_budget
@@ -577,6 +579,8 @@ class CircuitExecutor:
         self.human_callback = human_callback
         # ③ 智能模型选型：执行前按复杂度/历史/约束微调每个电阻的 model/skills
         self.auto_select_models = auto_select_models
+        # ② 流式执行：节点完成回调（供 SSE/run_stream 消费）
+        self.on_node_done = on_node_done
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -750,6 +754,15 @@ class CircuitExecutor:
                 self._emit("node_done", node=cid, ok=sig.ok,
                            quality=round(sig.quality, 3),
                            retried=(cid in self._filled_nodes))
+                # ② 流式执行：通知外部观察者（SSE/run_stream）
+                if self.on_node_done is not None:
+                    try:
+                        self.on_node_done(cid, sig, {"node": cid, "ok": sig.ok,
+                                         "quality": round(sig.quality, 3),
+                                         "value": getattr(sig, "value", None),
+                                         "retried": (cid in self._filled_nodes)})
+                    except Exception:
+                        pass
                 out[cid] = sig
             self._emit("layer_done", layer_idx=li)
 
@@ -824,6 +837,54 @@ class CircuitExecutor:
             except Exception:
                 pass
         return result
+
+    # ---- ② 流式执行：逐节点 yield 结果（供 SSE/API 消费）----
+    def run_stream(self):
+        """流式执行生成器：每完成一个节点就 yield 事件 dict，最后 yield 完整结果。
+
+        用法:
+          for event in executor.run_stream():
+              if event["type"] == "node_done":
+                  print(f"  ✓ {event['node']} ok={event['ok']}")
+              elif event["type"] == "result":
+                  print(f"  最终品质={event['result']['final_quality']}")
+        """
+        import threading
+        queue = []
+        done = threading.Event()
+
+        def _cb(cid, sig, info):
+            info["type"] = "node_done"
+            queue.append(info)
+
+        # 临时安装回调，执行完毕后恢复
+        prev_cb = self.on_node_done
+        self.on_node_done = _cb
+        result = None
+
+        def _runner():
+            nonlocal result
+            result = self.run()
+            done.set()
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+
+        # 轮询 yield 节点事件（50ms 间隔，非忙等）
+        idx = 0
+        while not done.is_set():
+            while idx < len(queue):
+                yield queue[idx]
+                idx += 1
+            import time
+            time.sleep(0.05)
+        # 排空最后一批
+        while idx < len(queue):
+            yield queue[idx]
+            idx += 1
+        # 最后 yield 结果
+        self.on_node_done = prev_cb  # 恢复
+        yield {"type": "result", "result": result}
 
     # ---- 3.5 多任务进化增强（D）：泛化触发 + 显式提示 + 阈值可配 ----
     def _countable(self, val):
@@ -1435,6 +1496,57 @@ def human_intervention_selftest():
     print("✓ D 零回归: 无 human_callback → 现行行为不变（fail 继续，不调 callback）")
 
 
+def stream_selftest():
+    """② 流式执行：on_node_done 回调 + run_stream 生成器。"""
+    import random
+    spec = {
+        "name": "stream_test",
+        "components": {
+            "src": {"type": "power", "label": "src"},
+            "A": {"type": "resistor", "label": "A", "model": "small",
+                  "produced_outputs": ["x"]},
+            "B": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["x"]},
+        },
+        "wires": [["src", "A"], ["A", "B"]],
+    }
+    circuit = Circuit(spec, SimBackend(random.Random(42)))
+
+    # S1: on_node_done 回调
+    events = []
+    ex = CircuitExecutor(circuit, on_node_done=lambda c, s, i: events.append(i))
+    result = ex.run()
+    assert len(events) == 3, f"期望 3 节点回调，实际 {len(events)}"
+    node_ids = [e["node"] for e in events]
+    assert "src" in node_ids and "A" in node_ids and "B" in node_ids
+    assert all(e["ok"] for e in events), "所有节点应 ok"
+    print(f"✓ S1 on_node_done: {len(events)} 节点回调全部触发，ok 全部 True")
+
+    # S2: run_stream 生成器
+    circuit2 = Circuit(spec, SimBackend(random.Random(42)))
+    ex2 = CircuitExecutor(circuit2)
+    streamed = list(ex2.run_stream())
+    node_evts = [e for e in streamed if e["type"] == "node_done"]
+    result_evts = [e for e in streamed if e["type"] == "result"]
+    assert len(node_evts) == 3, f"期望 3 节点流事件，实际 {len(node_evts)}"
+    assert len(result_evts) == 1, f"期望 1 结果事件，实际 {len(result_evts)}"
+    assert result_evts[0]["result"]["final_quality"] > 0
+    print(f"✓ S2 run_stream: {len(node_evts)} 节点 + 1 结果 yield")
+
+    # S3: run_stream 结果与 run() 一致
+    r1 = result["final_quality"]
+    r2 = result_evts[0]["result"]["final_quality"]
+    assert abs(r1 - r2) < 0.001, f"run()={r1:.3f} vs run_stream()={r2:.3f} 不一致"
+    print(f"✓ S3 一致性: run()={r1:.3f} == run_stream()={r2:.3f}")
+
+    # S4: 零回归：不设 on_node_done 的 run() 仍然正常
+    ex3 = CircuitExecutor(Circuit(spec, SimBackend(random.Random(42))))
+    r3 = ex3.run()
+    assert r3["final_quality"] > 0
+    assert r3["success"], "正常 run() 不应受影响"
+    print("✓ S4 零回归: 不设 on_node_done 的 run() 正常运行")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -1443,6 +1555,7 @@ if __name__ == "__main__":
     hetero_verify_selftest()
     memory_record_selftest()
     human_intervention_selftest()
+    stream_selftest()
 
 
 def load(path):
