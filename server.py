@@ -937,6 +937,29 @@ def codegen_run(req: CodegenRequest):
     return {"language": lang, "code": code, "runnable": True}
 
 
+class VerifyRequest(BaseModel):
+    """Phase 2 第三层④ 形式化验证：执行前符号验证拓扑。"""
+    spec: dict = Field(..., description="待验证的拓扑 spec")
+    tier_stats: Optional[dict] = Field(
+        None, description="可选自定义档位统计 {tier:{accuracy,cost,latency_ms}}")
+
+
+@app.post("/verify")
+def verify_topology(req: VerifyRequest):
+    """Phase 2 第三层④ 形式化验证（内建符号验证器）：执行前证明拓扑正确性。
+
+    6 个维度：无环性 / 可达性 / 数据流输入完备性 / 死锁自由 / 资源上界 / 质量下界。
+    每维 pass/fail + 反例路径。零外部依赖（纯静态分析，不执行、不依赖 LLM/网络）。
+
+    与 runtime 自检的区别：runtime 是**执行后**验证（跑一遍看结果）；本端点是
+    **执行前**符号推理（不跑，纯静态分析），适合零容错场景的前置门禁。
+    """
+    from compiler.formal_verifier import FormalVerifier
+    os.environ.pop("AGENT_API_KEY", None)
+    fv = FormalVerifier(tier_stats=req.tier_stats)
+    return fv.verify(req.spec)
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1561,6 +1584,39 @@ def selftest():
           f"quality={round(_res_c['final_quality'], 4)} 与原子版一致 · "
           f"library 查询 {_lib['count']} 个")
     _CL.clear()                                   # 清理不污染后续
+
+    # S24: Phase 2 第三层④ 形式化验证（内建符号验证器 + /verify）
+    _vspec = {"name": "verify_demo", "components": {
+        "src": {"type": "power", "label": "task"},
+        "A": {"type": "resistor", "label": "research", "model": "large",
+              "yield": 1.0, "produced_outputs": ["a"]},
+        "B": {"type": "resistor", "label": "analyze", "model": "tool",
+              "yield": 1.0, "required_inputs": ["a"],
+              "produced_outputs": ["b"]},
+        "V": {"type": "verify", "label": "verify", "threshold": 0.5},
+        "C": {"type": "resistor", "label": "summarize", "model": "small",
+              "yield": 1.0, "required_inputs": ["b"]}},
+        "wires": [["src", "A"], ["A", "B"], ["B", "V"], ["V", "C"]],
+        "quality_gate": 0.5}
+    _v = verify_topology(VerifyRequest(spec=_vspec))
+    assert _v["all_pass"] is True, \
+        f"S24: 合法 spec 应全通过，实际 {_v['summary']}"
+    assert _v["proven"] is True
+    _vnames = [c["name"] for c in _v["checks"]]
+    assert _vnames == ["acyclicity", "reachability", "input_completeness",
+                       "deadlock_freedom", "resource_bounds", "quality_lower_bound"]
+    # 有环 → fail + 反例
+    _vcyc = verify_topology(VerifyRequest(spec={
+        "name": "cyc", "components": {
+            "src": {"type": "power", "label": "t"},
+            "A": {"type": "resistor", "label": "a", "model": "small"},
+            "B": {"type": "resistor", "label": "b", "model": "small"}},
+        "wires": [["src", "A"], ["A", "B"], ["B", "A"]]}))
+    _cyc = [c for c in _vcyc["checks"] if c["name"] == "acyclicity"][0]
+    assert _cyc["status"] == "fail" and _cyc["counterexample"], "S24: 环应 fail + 反例"
+    print(f"✓ S24 Phase2 三层④ 形式化验证(FormalVerifier): 6维全通过(proven) · "
+          f"合法spec {_v['summary']} · 有环反例 {'→'.join(_cyc['counterexample'][:3])}... · "
+          f"零依赖纯静态分析（执行前门禁）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
