@@ -826,6 +826,59 @@ def rl_optimize(req: RLOptimizeRequest):
     return res
 
 
+class FederatedClientSpec(BaseModel):
+    """一个联邦参与方的本地数据（只传结构与统计，服务端永不接触原文）。"""
+    client_id: str
+    records: Optional[list] = Field(
+        None, description="本地拓扑记忆条目 [{spec, result}]；只被抽成 motif+档位统计")
+    metrics: Optional[dict] = Field(
+        None, description="本地执行指标 {cap:{tier:{count,success,total_latency,total_cost}}}")
+    epsilon: float = Field(4.0, description="该方的差分隐私预算 ε（越小越私密、噪声越大）")
+    seed: int = Field(0, description="噪声随机种子（可复现）")
+    max_releases: int = Field(1, description="声明的发布次数上限（防重复查询求平均反推）")
+    min_support: int = Field(1, description="motif 最小支持度，低于此值直接丢（k-匿名）")
+
+
+class FederatedRequest(BaseModel):
+    """Phase 2 第三层② 联邦学习：多实例共享拓扑经验，不共享原始数据。"""
+    clients: list[FederatedClientSpec] = Field(..., description="参与方列表（≥min_clients）")
+    min_clients: int = Field(2, description="最少参与方，不足则拒绝聚合（防单点反推）")
+    blend: float = Field(0.5, description="回灌时全局经验权重 0~1")
+    query_capability: Optional[str] = Field(
+        None, description="可选：聚合后顺带问「某能力用哪个档位最优」")
+
+
+@app.post("/federated/round")
+def federated_round(req: FederatedRequest):
+    """Phase 2 第三层② 联邦学习：脱敏摘要 + 差分隐私 + FedAvg 聚合 + 回灌。
+
+    与 /topology/publish（⑬ 共享生态）的区别：⑬ 分发**完整电路图**（含 goal 原文），
+    这里只出**统计摘要**（motif 频次 / 能力档位成功率 / 质量直方图）并加拉普拉斯噪声，
+    适合跨组织。服务端全程看不到原始任务描述与 spec 全文。
+
+    隐私保证：ε 按顺序组合定理在各查询间平分并由 PrivacyLedger 硬性记账；
+    超出声明发布次数会被拒绝（防「反复查询求平均消噪」攻击），被拒摘要不参与聚合。
+    离线安全（纯本地计算，无 key、无网络）。
+    """
+    from compiler.federated import build_client, FederatedServer, run_federated_round
+    os.environ.pop("AGENT_API_KEY", None)
+    if not req.clients:
+        raise HTTPException(400, "clients 不能为空")
+    clients = [
+        build_client(c.client_id, records=c.records, metrics_data=c.metrics,
+                     epsilon=c.epsilon, seed=c.seed, min_support=c.min_support,
+                     max_releases=c.max_releases)
+        for c in req.clients
+    ]
+    server = FederatedServer(min_clients=req.min_clients)
+    res = run_federated_round(clients, server, blend=req.blend)
+    if req.query_capability:
+        res["best_tier"] = server.best_tier_for(
+            res["global_model"], req.query_capability)
+        res["queried_capability"] = req.query_capability
+    return res
+
+
 class CodegenRequest(BaseModel):
     goal: str
     language: str = "js"  # cpp / rust / js
@@ -1385,6 +1438,45 @@ def selftest():
           f"成本 {_rl['baseline']['cost']}→{_rl['best']['cost']} · "
           f"质量 {_rl['baseline']['quality']}→{_rl['best']['quality']} · "
           f"{_rl['episodes_run']}轮 · 算子收益可解释")
+
+    # S22: Phase 2 第三层② 联邦学习（脱敏摘要 + 差分隐私 + FedAvg + /federated/round）
+    _SECRET = "腾讯2026Q3财报净利润明细"        # 模拟不可出境的原始任务描述
+    def _fedrec(tier, ok):
+        return {
+            "goal_desc": _SECRET,                       # 故意塞进去，验证不会外泄
+            "spec": {"name": _SECRET, "components": {
+                "src": {"type": "power", "label": "task"},
+                "R1": {"type": "resistor", "label": "analyze", "model": tier}},
+                "wires": [["src", "R1"]]},
+            "result": {"success": ok, "final_quality": 0.9 if ok else 0.3,
+                       "total_latency_ms": 900, "total_cost": 0.012},
+        }
+    _fedreq = FederatedRequest(
+        clients=[
+            FederatedClientSpec(client_id="team-a", epsilon=10.0, seed=1,
+                                records=[_fedrec("tool", True)] * 30),
+            FederatedClientSpec(client_id="team-b", epsilon=10.0, seed=2,
+                                records=[_fedrec("small", False)] * 30),
+        ],
+        min_clients=2, blend=0.5, query_capability="analyze")
+    _fed = federated_round(_fedreq)
+    assert _fed["global_model"]["n_clients"] == 2, "S22: 应聚合 2 方"
+    assert _SECRET not in json.dumps(_fed, ensure_ascii=False), \
+        "S22: 全局模型/回执中绝不能出现原始任务描述"
+    assert _fed["global_model"]["privacy"]["raw_data_shared"] is False, "S22: 应声明零原始数据"
+    assert _fed["best_tier"] and _fed["best_tier"]["tier"] == "tool", \
+        f"S22: 应学到 analyze→tool，实际 {_fed.get('best_tier')}"
+    assert set(_fed["applied"]) == {"team-a", "team-b"}, "S22: 两方都应回灌"
+    assert all(r["epsilon_spent"] <= r["epsilon_total"] + 1e-6
+               for r in _fed["privacy_reports"].values()), "S22: 隐私预算不得超支"
+    _fed_solo = federated_round(FederatedRequest(
+        clients=[FederatedClientSpec(client_id="lonely", records=[_fedrec("tool", True)] * 5)],
+        min_clients=2))
+    assert "error" in _fed_solo["global_model"], "S22: 单方应拒绝聚合（防单点反推）"
+    print(f"✓ S22 Phase2 三层② 联邦学习(FederatedServer): 2方聚合 · "
+          f"全局学到 analyze→{_fed['best_tier']['tier']}"
+          f"(成功率 {round(_fed['best_tier']['success_rate'], 4)}) · "
+          f"原始任务描述零外泄 · ε 记账未超支 · 单方拒聚合")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
