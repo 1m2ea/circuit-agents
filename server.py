@@ -450,6 +450,34 @@ def mutate_topology(req: MutateRequest):
     return {"spec": spec, "reports": reports}
 
 
+# ──────────────────────────────────────────────────────────
+# ⑫ 跨平台部署：deploy（导出 Dockerfile / runner 预览）
+# ──────────────────────────────────────────────────────────
+
+class DeployRequest(BaseModel):
+    """⑫ 跨平台部署：提交拓扑，生成可部署产物预览。"""
+    spec: dict = Field(..., description="电路拓扑 Spec")
+    mode: str = Field("server", description="runner 模式：server | cli")
+    name: str = Field("circuit-app", description="导出包名称")
+    port: int = Field(8000, description="服务端口")
+
+
+@app.post("/deploy")
+def deploy(req: DeployRequest):
+    """⑫ 导出可部署产物：Dockerfile / requirements / runner（内嵌 Spec）。
+
+    返回文本预览（不落盘）；完整落盘见 compiler/deploy.DeploymentExporter.export_bundle。
+    """
+    from compiler.deploy import DeploymentExporter
+    return {
+        "dockerfile": DeploymentExporter.generate_dockerfile(
+            port=req.port, entry=f"{req.name}_runner:app"),
+        "requirements": DeploymentExporter.generate_requirements(),
+        "runner": DeploymentExporter.generate_runner(
+            req.spec, mode=req.mode, port=req.port, name=req.name),
+    }
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -755,6 +783,19 @@ def selftest():
     assert "D__merge" in mspec["components"], "S9: auto_heal 应插入汇合电容"
     print(f"✓ S9 ⑪ 自适应拓扑(CircuitMutator): remove+insert+auto_heal 链式生效 "
           f"（节点数 {len(mspec['components'])}）")
+
+    # S10: ⑫ 跨平台部署（离线：纯文本生成，无 Docker 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    dspec = {"name": "demo", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small",
+              "produced_outputs": ["x"]}},
+        "wires": [["src", "A"]]}
+    dresp = deploy(DeployRequest(spec=dspec, mode="server", name="demo", port=8000))
+    assert "FROM python" in dresp["dockerfile"] and "uvicorn" in dresp["dockerfile"]
+    assert "CircuitExecutor" in dresp["runner"]
+    assert any(r.startswith("fastapi") for r in dresp["requirements"])
+    print("✓ S10 ⑫ 跨平台部署(DeploymentExporter): /deploy 返回 Dockerfile+runner+requirements 预览")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
