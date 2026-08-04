@@ -405,6 +405,51 @@ def check_permission(req: PermissionRequest):
     }
 
 
+# ──────────────────────────────────────────────────────────
+# ⑪ 自适应拓扑：topology/mutate（运行时增删/重连/自愈）
+# ──────────────────────────────────────────────────────────
+
+class MutateOp(BaseModel):
+    """⑪ 单条拓扑变更操作。"""
+    op: str = Field(..., description="remove | insert | reroute | auto_heal")
+    cid: Optional[str] = None
+    comp: Optional[dict] = None
+    preds: list[str] = Field(default_factory=list)
+    succs: list[str] = Field(default_factory=list)
+    old: Optional[list] = None
+    new: Optional[list] = None
+    failed_cids: list[str] = Field(default_factory=list)
+
+
+class MutateRequest(BaseModel):
+    """⑪ 自适应拓扑：提交初始拓扑 + 一串变更操作，返回变更后的拓扑。"""
+    spec: dict = Field(..., description="初始电路拓扑 Spec")
+    ops: list[MutateOp] = Field(default_factory=list, description="依次应用的变更操作")
+
+
+@app.post("/topology/mutate")
+def mutate_topology(req: MutateRequest):
+    """⑪ 依次应用拓扑变更（不就地改原图）：remove/insert/reroute/auto_heal。
+
+    返回最终 mutated spec 与每步报告（auto_heal 含冗余分支/汇合节点信息）。"""
+    from runtime import CircuitMutator
+    spec = req.spec
+    reports = []
+    for op in req.ops:
+        if op.op == "remove":
+            spec = CircuitMutator.remove_node(spec, op.cid)
+        elif op.op == "insert":
+            spec = CircuitMutator.insert_node(spec, op.cid, op.comp, op.preds, op.succs)
+        elif op.op == "reroute":
+            spec = CircuitMutator.reroute(spec, op.old, op.new)
+        elif op.op == "auto_heal":
+            spec, rep = CircuitMutator.auto_heal_topology(spec, op.failed_cids)
+            reports.append(rep)
+        else:
+            raise HTTPException(400, f"未知 op: {op.op}")
+    return {"spec": spec, "reports": reports}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -683,6 +728,33 @@ def selftest():
     assert pr2["components"]["safe"]["ok"], "safe 无权限声明应正常"
     print(f"✓ S8 ⑩ 安全与权限(PermissionGate): 越权识别+拦截生效 "
           f"（denied={pr1['denied']}）")
+
+    # S9: ⑪ 自适应拓扑（离线：显式 spec，无 LLM 依赖）
+    os.environ.pop("AGENT_API_KEY", None)
+    from runtime import CircuitMutator
+    base_spec = {"name": "chain", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small",
+              "produced_outputs": ["x"]},
+        "B": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["x"]},
+        "C": {"type": "resistor", "label": "C", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["y"]}},
+        "wires": [["src", "A"], ["A", "B"], ["B", "C"]]}
+    mr = mutate_topology(MutateRequest(
+        spec=base_spec,
+        ops=[MutateOp(op="remove", cid="B"),
+             MutateOp(op="insert", cid="D",
+                      comp={"type": "resistor", "label": "D", "model": "small",
+                            "required_inputs": ["x"], "produced_outputs": ["x"]},
+                      preds=["A"], succs=["C"]),
+             MutateOp(op="auto_heal", failed_cids=["D"])]))
+    mspec = mr["spec"]
+    assert "B" not in mspec["components"], "S9: B 应被删除"
+    assert "D__redundant" in mspec["components"], "S9: auto_heal 应插入 D 冗余分支"
+    assert "D__merge" in mspec["components"], "S9: auto_heal 应插入汇合电容"
+    print(f"✓ S9 ⑪ 自适应拓扑(CircuitMutator): remove+insert+auto_heal 链式生效 "
+          f"（节点数 {len(mspec['components'])}）")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

@@ -2563,6 +2563,156 @@ def permission_selftest():
     print("\n⑩ 安全与权限 离线自检全部通过 ✓")
 
 
+class CircuitMutator:
+    """⑪ 自适应拓扑：运行时对电路拓扑做结构性变更（增/删/重连/自愈）。
+
+    设计（第二层边界扩展 · ⑪）：
+      · remove_node(spec, cid)：删节点并把它前驱直连到后继（保数据流），返回新 spec（深拷贝，不改原图）。
+      · insert_node(spec, cid, comp, preds, succs)：插入节点并接好前驱→本节点→后继。
+      · reroute(spec, old, new)：把一条 wire 从 old 改到 new。
+      · auto_heal_topology(spec, failed_cids)：对失败电阻插入『并行冗余分支』
+        （复制为 tool 档 + 电容汇合 mode=any），运行时单分支 yield 失败被冗余分支掩盖 → 拓扑自愈。
+      · 全部返回新 spec（不就地改），便于 A/B 对比与回滚。范围：聚焦运行时拓扑热更新。
+    """
+
+    @staticmethod
+    def _dc(spec):
+        return json.loads(json.dumps(spec))
+
+    @classmethod
+    def remove_node(cls, spec, cid):
+        new = cls._dc(spec)
+        comps = new["components"]
+        if cid not in comps:
+            return new
+        preds = [a for a, b in new["wires"] if b == cid]
+        succs = [b for a, b in new["wires"] if a == cid]
+        for p in preds:                       # 前驱直连后继（保数据流）
+            for s in succs:
+                if [p, s] not in new["wires"]:
+                    new["wires"].append([p, s])
+        del comps[cid]
+        new["wires"] = [w for w in new["wires"] if cid not in w]
+        return new
+
+    @classmethod
+    def insert_node(cls, spec, cid, comp, preds, succs):
+        new = cls._dc(spec)
+        new["components"][cid] = comp
+        for p in preds:
+            new["wires"].append([p, cid])
+        for s in succs:
+            new["wires"].append([cid, s])
+        return new
+
+    @classmethod
+    def reroute(cls, spec, old, new):
+        nspec = cls._dc(spec)
+        nspec["wires"] = [new if w == old else w for w in nspec["wires"]]
+        return nspec
+
+    @classmethod
+    def auto_heal_topology(cls, spec, failed_cids):
+        new = cls._dc(spec)
+        report = []
+        for cid in failed_cids:
+            comp = new["components"].get(cid)
+            if comp is None or comp.get("type") != "resistor":
+                continue
+            rb = f"{cid}__redundant"
+            rcomp = dict(comp)
+            rcomp["model"] = "tool"
+            rcomp["label"] = rb
+            new["components"][rb] = rcomp
+            preds = [a for a, b in new["wires"] if b == cid]
+            succs = [b for a, b in new["wires"] if a == cid]
+            for p in preds:
+                new["wires"].append([p, rb])
+            if succs:
+                m = f"{cid}__merge"
+                new["components"][m] = {"type": "capacitor", "label": m, "mode": "any"}
+                new["wires"] = [w for w in new["wires"]
+                                if not ((w[0] == cid or w[0] == rb) and w[1] in succs)]
+                for s in succs:
+                    new["wires"].append([cid, m])
+                    new["wires"].append([rb, m])
+                    new["wires"].append([m, s])
+                report.append({"failed": cid, "redundant": rb, "merge": m})
+            else:
+                report.append({"failed": cid, "redundant": rb, "merge": None})
+        return new, report
+
+
+def adaptive_topology_selftest():
+    """⑪ 自适应拓扑离线自检：删/插/重连 + 失败节点并行冗余自愈。"""
+    os.environ.pop("AGENT_API_KEY", None)  # 强制离线
+
+    base = {"name": "chain", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small",
+              "produced_outputs": ["x"]},
+        "B": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["x"]},
+        "C": {"type": "resistor", "label": "C", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["y"]},
+    }, "wires": [["src", "A"], ["A", "B"], ["B", "C"]]}
+
+    class OkBackend(SimBackend):
+        def run(self, comp, inputs):
+            s = super().run(comp, inputs)
+            if comp.get("type") == "resistor" and not s.ok:
+                return Signal(value="x", quality=0.9, ok=True, cost=s.cost,
+                              latency_ms=s.latency_ms, meta=s.meta)
+            return s
+
+    # 1) remove_node：删 B → A 直连 C，执行仍成功
+    m1 = CircuitMutator.remove_node(base, "B")
+    assert "B" not in m1["components"]
+    assert ["A", "C"] in m1["wires"], "A 应直连 C"
+    out1, _, _ = Circuit(m1, OkBackend(random.Random(0))).propagate()
+    assert out1["C"].ok, "删 B 后 C 应仍成功（A 直连提供 x）"
+    print("✓ ⑪ remove_node：删 B → A 直连 C，拓扑仍连通且 C 成功")
+
+    # 2) insert_node：A、C 间插入转发节点 D
+    m2 = CircuitMutator.insert_node(
+        base, "D",
+        {"type": "resistor", "label": "D", "model": "small",
+         "required_inputs": ["x"], "produced_outputs": ["x"]},
+        preds=["A"], succs=["C"])
+    assert ["A", "D"] in m2["wires"] and ["D", "C"] in m2["wires"]
+    out2, _, _ = Circuit(m2, OkBackend(random.Random(1))).propagate()
+    assert out2["D"].ok and out2["C"].ok, "插入 D 后应参与且 C 成功"
+    print("✓ ⑪ insert_node：A→D→C 插入转发节点 D，D 参与且 C 成功")
+
+    # 3) reroute：A→B 重连为 A→C（跳过 B）
+    m3 = CircuitMutator.reroute(base, ["A", "B"], ["A", "C"])
+    assert ["A", "C"] in m3["wires"] and ["A", "B"] not in m3["wires"]
+    print("✓ ⑪ reroute：A→B 重连为 A→C")
+
+    # 4) auto_heal：B 失败 → 插并行冗余分支自愈
+    class FailBBackend(SimBackend):
+        def run(self, comp, inputs):
+            if comp.get("label") == "B":
+                return Signal(value=None, quality=0.0, ok=False, cost=0.0,
+                              latency_ms=0.0, meta={"forced_fail": True})
+            s = super().run(comp, inputs)
+            if comp.get("type") == "resistor" and not s.ok:
+                return Signal(value="x", quality=0.9, ok=True, cost=s.cost,
+                              latency_ms=s.latency_ms, meta=s.meta)
+            return s
+
+    ob, _, _ = Circuit(base, FailBBackend(random.Random(2))).propagate()
+    assert not ob["C"].ok, "原图 B 失败时 C 应收不到 x 而失败"
+    healed, rep = CircuitMutator.auto_heal_topology(base, ["B"])
+    assert "B__redundant" in healed["components"] and "B__merge" in healed["components"], \
+        "应插入冗余分支与汇合电容"
+    hb, _, _ = Circuit(healed, FailBBackend(random.Random(3))).propagate()
+    assert hb["C"].ok, "自愈后冗余分支应掩盖 B 失败，C 成功"
+    print(f"✓ ⑪ auto_heal：B 失败 → 插入冗余分支+汇合电容({rep}) → C 自愈成功（拓扑自适应）")
+
+    print("\n⑪ 自适应拓扑 离线自检全部通过 ✓")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -2577,6 +2727,7 @@ if __name__ == "__main__":
     long_task_selftest()
     multi_robot_selftest()
     permission_selftest()
+    adaptive_topology_selftest()
 
 
 def load(path):
