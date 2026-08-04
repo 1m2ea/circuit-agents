@@ -700,6 +700,24 @@ def cluster_run(req: ClusterRequest):
                      auto_select_models=req.auto_select_models)
 
 
+class CodegenRequest(BaseModel):
+    goal: str
+    language: str = "js"  # cpp / rust / js
+
+
+@app.post("/codegen")
+def codegen_run(req: CodegenRequest):
+    """Phase 2 ④ 跨语言编译器：把目标编译为 C++/Rust/JS 可执行源码（内联最小运行时）。
+
+    离线安全（强制规则解析，无需 LLM/网络）。生成代码可独立用 node / g++ / rustc 运行。
+    """
+    from compiler.codegen import TopologyCompiler
+    os.environ.pop("AGENT_API_KEY", None)
+    lang = (req.language or "js").lower()
+    code = TopologyCompiler().emit(req.goal, lang)
+    return {"language": lang, "code": code, "runnable": True}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1156,6 +1174,17 @@ def selftest():
         "/cluster 应返回分片结果"
     print(f"✓ S17 Phase2 ③ 分布式执行(ClusterCoordinator): worker={_cr['worker_count']} · "
           f"聚合质量={_cr['final_quality']} · per_worker={len(_cr['per_worker'])}")
+
+    # S18: Phase 2 ④ 跨语言编译器（拓扑 → C++/Rust/JS 可执行源码 + /codegen 端点）
+    from compiler.codegen import TopologyCompiler
+    _cg = TopologyCompiler().emit_all("分析两份报告并总结")
+    assert set(_cg) == {"cpp", "rust", "js"}, "应生成三语言"
+    for lang, code in _cg.items():
+        assert "LAYERS" in code and "DONE" in code, f"{lang} 应含拓扑序+主入口"
+    _cge = codegen_run(CodegenRequest(goal="查GDP并预测", language="js"))
+    assert _cge["language"] == "js" and "DONE" in _cge["code"], "/codegen 应返回 JS 源码"
+    print(f"✓ S18 Phase2 ④ 跨语言编译器(TopologyCompiler): 三语言(cpp/rust/js) 生成✓ · "
+          f"/codegen 返回 JS 源码")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
