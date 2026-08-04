@@ -39,6 +39,7 @@ class GoalRequest(BaseModel):
     memory_enabled: bool = Field(True, description="是否启用记忆复用")
     data_fill_budget: int = Field(2, description="自动补数重试次数上限")
     evolve_enabled: bool = Field(True, description="是否启用 3.5 多任务进化")
+    quality_threshold: Optional[float] = Field(None, description="质量门阈值，注入 adc/verify 节点，默认 0.8")
 
 class RunStatus(BaseModel):
     run_id: str
@@ -95,6 +96,13 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
             memory_enabled=params.get("memory_enabled", True),
             auto_select_models=params.get("auto_select_models", False),
         )
+
+        # 质量门阈值注入（前端可调，默认 0.8）：写到 adc/verify 节点的 threshold
+        qt = params.get("quality_threshold")
+        if qt is not None:
+            for comp in spec.get("components", {}).values():
+                if comp.get("type") in ("adc", "verify"):
+                    comp["threshold"] = float(qt)
 
         # 执行
         backend = SimBackend(random.Random(int(time.time() * 1000) % (2**31)))

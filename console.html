@@ -54,6 +54,15 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
   outline: none; transition: border-color 150ms var(--ease);
 }
 #goalInput:focus { border-color: var(--blue); }
+.opt-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.opt-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.opt-input {
+  width: 64px; font-family: var(--mono); font-size: 13px; padding: 5px 8px;
+  border-radius: var(--radius); background: var(--bg); color: var(--ink);
+  border: 1px solid var(--border); outline: none; transition: border-color 150ms var(--ease);
+}
+.opt-input:focus { border-color: var(--blue); }
+.opt-hint { font-size: 11px; color: var(--muted); opacity: 0.7; }
 .btn-row { display: flex; gap: 8px; margin-top: 10px; }
 .btn {
   padding: 8px 18px; border-radius: var(--radius); border: 1px solid var(--border);
@@ -177,6 +186,12 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
       <h2>✦ 新任务</h2>
       <textarea id="goalInput" placeholder="输入自然语言任务描述...
 例: 查中国2025年GDP总量和人均GDP，然后对比分析"></textarea>
+      <div class="opt-row">
+        <label class="opt-label" for="qThreshold">质量门阈值</label>
+        <input id="qThreshold" class="opt-input" type="number" min="0" max="1" step="0.05" value="0.8"
+               title="ADC/verify 节点的达标阈值，默认 0.8。越低越易通过。" />
+        <span class="opt-hint">0~1，越低越易通过</span>
+      </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="btnRun" onclick="submitGoal()">
           <span id="btnRunLabel">运行</span>
@@ -233,6 +248,10 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
           <span class="r-label">总延迟</span>
           <span class="r-value r-cost" id="rLatency">--</span>
         </div>
+        <div class="r-item">
+          <span class="r-label">质量门</span>
+          <span class="r-value" id="rGate">--</span>
+        </div>
         <div class="r-item" id="rStatus" style="flex-basis:100%;font-size:12px;line-height:1.5;"></div>
       </div>
     </div>
@@ -266,7 +285,13 @@ async function submitGoal() {
     const res = await fetch(API + '/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ goal, route: true, evolve_enabled: false, memory_enabled: false })
+      body: JSON.stringify({
+        goal, route: true, evolve_enabled: false, memory_enabled: false,
+        quality_threshold: (() => {
+          const v = parseFloat(document.getElementById('qThreshold').value);
+          return isNaN(v) ? null : v;
+        })()
+      })
     });
     const data = await res.json();
     currentRunId = data.run_id;
@@ -437,6 +462,16 @@ function onResult(result) {
   document.getElementById('rCost').textContent = '$' + (r.total_cost || 0).toFixed(4);
   document.getElementById('rLatency').textContent = (r.total_latency_ms || 0).toFixed(0) + 'ms';
   document.getElementById('rNodes').textContent = Object.keys(r.components || {}).length;
+
+  // 质量门阈值显示
+  const gateEl = document.getElementById('rGate');
+  if (gate) {
+    gateEl.textContent = (gate.threshold || 0).toFixed(3) + (gate.passed ? ' ✓' : ' ✗');
+    gateEl.style.color = gate.passed ? 'var(--teal)' : 'var(--orange)';
+  } else {
+    gateEl.textContent = '—';
+    gateEl.style.color = '';
+  }
 
   // 状态精准区分：成功 / 质量门未通过 / 部分节点失败 / 错误
   const gate = r.quality_gate;
