@@ -36,24 +36,44 @@ class ModelSelector:
     # 档位顺序（用于比较"哪个档更高"）
     _TIER_ORDER = {"small": 0, "large": 1, "tool": 2}
 
-    def __init__(self, memory=None):
+    # 档位→供应商默认路由（跨供应商路由的基础，可被 providers 参数覆盖）
+    # small 走本地免费模型，large 走 OpenAI，tool 走 Anthropic（最高端能力）
+    _PROVIDERS_DEFAULT = {"small": "local", "large": "openai", "tool": "anthropic"}
+
+    def __init__(self, memory=None, providers=None):
         """
         Parameters
         ----------
         memory : TopologyMemory or None
             如果提供，查历史记录做自适应推荐；None 则只靠复杂度+约束。
+        providers : dict or None
+            tier→provider 路由映射（如 {"small":"local","large":"openai","tool":"anthropic"}）。
+            None 用默认路由。供 CircuitExecutor/backend 解析实际模型端点。
         """
         self.memory = memory
         # 从 runtime 复用档位画像（与 Binder 同源，保证一致）
         self._tiers = runtime.SimBackend._TIERS
+        # 供应商路由（跨供应商路由的基础）
+        self.providers = dict(self._PROVIDERS_DEFAULT)
+        if providers:
+            self.providers.update(providers)
 
     # ── 公开入口 ──────────────────────────────────────────────
 
-    def select(self, spec: dict) -> dict:
-        """返回 {node_id: {tier, model, skills, reason}} 的推荐字典。
+    def select(self, spec: dict, optimize_for: "Optional[str]" = None) -> dict:
+        """返回 {node_id: {tier, model, provider, skills, reason}} 的推荐字典。
 
         spec 格式 = compile_goal 的产物（含 capabilities/constraints/components/description）。
         components 是 {cid: {type, label, model, capability, ...}, ...} 的字典。
+
+        Parameters
+        ----------
+        optimize_for : "cost" | "latency" | "quality" | None
+            在硬约束（min_quality/max_cost/max_latency）满足的前提下，选最优档：
+              - "cost"    选最便宜
+              - "latency" 选最低延迟
+              - "quality" 选最高精度
+              - None      沿用复杂度驱动的 base_tier（原行为，约束只做升/降修正）
         """
         caps = spec.get("capabilities", [])
         constraints = spec.get("constraints", {}) or spec.get("goal", {}).get("constraints", {})
@@ -74,7 +94,7 @@ class ModelSelector:
         for cid, comp in resistors:
             cap = comp.get("capability") or comp.get("label", "")
             rec = self._select_for_node(cap, complexity, constraints,
-                                        history.get(cap))
+                                        history.get(cap), optimize_for)
             result[cid] = rec
 
         return result
@@ -86,6 +106,8 @@ class ModelSelector:
             rec = recs.get(cid)
             if rec and comp.get("type") == "resistor":
                 comp["model"] = rec["tier"]
+                if rec.get("provider"):
+                    comp["provider"] = rec["provider"]
                 if rec.get("skills"):
                     comp["skills"] = rec["skills"]
                 comp["_model_reason"] = rec.get("reason", "")
@@ -191,7 +213,8 @@ class ModelSelector:
     # ── 逐节点选型 ────────────────────────────────────────────
 
     def _select_for_node(self, cap: str, complexity: float,
-                         constraints: dict, history: dict) -> dict:
+                         constraints: dict, history: dict,
+                         optimize_for: "Optional[str]" = None) -> dict:
         """为一个节点推荐 (tier, model, skills, reason)。"""
         reasons = []
 
@@ -259,12 +282,42 @@ class ModelSelector:
                     tier = hist_tier
                     reasons.append(f"历史最佳={hist_tier}(成功率{success_rate:.0%})")
 
+        # 5.5) 多目标再平衡（仅当显式 optimize_for）
+        if optimize_for in ("cost", "latency", "quality"):
+            ncap = max(1, len(constraints.get("capabilities", [])))
+            feasible = []
+            for t in ["small", "large", "tool"]:
+                d = self._tiers.get(t, {})
+                ok = True
+                if q_min > 0 and d.get("accuracy", 0) < q_min:
+                    ok = False
+                if max_cost and max_cost > 0 and d.get("cost", 0) > max_cost / ncap:
+                    ok = False
+                if max_lat and max_lat > 0 and d.get("latency", 1e9) > max_lat / ncap:
+                    ok = False
+                if ok:
+                    feasible.append(t)
+            if feasible:
+                if optimize_for == "cost":
+                    tier = min(feasible, key=lambda t: self._tiers[t].get("cost", 1e9))
+                    reasons.append(f"optimize=cost→{tier}")
+                elif optimize_for == "latency":
+                    tier = min(feasible, key=lambda t: self._tiers[t].get("latency", 1e9))
+                    reasons.append(f"optimize=latency→{tier}")
+                elif optimize_for == "quality":
+                    tier = max(feasible, key=lambda t: self._tiers[t].get("accuracy", 0))
+                    reasons.append(f"optimize=quality→{tier}")
+
         # 6) 技能推荐
         skills = self._skills_for(cap, tier)
+
+        # 7) 跨供应商路由建议
+        provider = self.providers.get(tier, self._PROVIDERS_DEFAULT.get(tier, "local"))
 
         return {
             "tier": tier,
             "model": tier,  # 实际 model 名由 backend._resolve_model(tier) 解析
+            "provider": provider,  # 跨供应商路由建议（small→local/large→openai/tool→anthropic）
             "skills": skills,
             "reason": " | ".join(reasons) if reasons else "默认静态映射",
         }
@@ -474,6 +527,55 @@ def selftest():
     assert recs["reason"]["tier"] == "large", \
         f"历史最佳=large → 应升档，实际: {recs['reason']['tier']}"
     print("✓ TopologyMemory 历史驱动升档")
+
+    # ---- 11) 跨供应商路由（provider 字段）----
+    spec11 = {
+        "capabilities": ["summarize"],
+        "constraints": {},
+        "description": "简单",
+        "components": {
+            "s": {"type": "resistor", "label": "summarize",
+                  "capability": "summarize", "model": "small"},
+        },
+    }
+    recs11 = ms.select(spec11)
+    assert recs11["s"]["provider"] == "local", \
+        f"small 应路由 local，实际 {recs11['s']['provider']}"
+    # 高复杂度（复用 spec，8 能力）→ tool/large → openai/anthropic
+    recs11b = ms.select(spec)
+    assert recs11b["n0"]["provider"] in ("openai", "anthropic"), \
+        f"高复杂度应路由 openai/anthropic，实际 {recs11b['n0']['provider']}"
+    # 自定义 providers 覆盖
+    ms_custom = ModelSelector(memory=None,
+                              providers={"small": "my-local", "large": "my-openai",
+                                         "tool": "my-anthropic"})
+    recs11c = ms_custom.select(spec11)
+    assert recs11c["s"]["provider"] == "my-local", \
+        f"自定义 provider 未生效，实际 {recs11c['s']['provider']}"
+    print(f"✓ 跨供应商路由: small→{recs11['s']['provider']}, "
+          f"高复杂度→{recs11b['n0']['provider']}, 自定义覆盖✓")
+
+    # ---- 12) optimize_for 多目标再平衡 ----
+    spec12 = {
+        "capabilities": ["reason", "calculate"],
+        "constraints": {"max_cost": 1.0},  # 宽松，每节点预算 0.5
+        "description": "再平衡测试",
+        "components": {
+            "reason": {"type": "resistor", "label": "reason",
+                       "capability": "reason", "model": "small"},
+            "calculate": {"type": "resistor", "label": "calculate",
+                          "capability": "calculate", "model": "small"},
+        },
+    }
+    recs_cost = ms.select(spec12, optimize_for="cost")
+    recs_qual = ms.select(spec12, optimize_for="quality")
+    # cost 最优=small(0.001)，quality 最优=tool(0.99)，均 ≤0.5 预算
+    assert recs_cost["reason"]["tier"] == "small", \
+        f"optimize=cost 应 small，实际 {recs_cost['reason']['tier']}"
+    assert recs_qual["reason"]["tier"] == "tool", \
+        f"optimize=quality 应 tool，实际 {recs_qual['reason']['tier']}"
+    print(f"✓ optimize_for: cost→{recs_cost['reason']['tier']}, "
+          f"quality→{recs_qual['reason']['tier']}")
 
     # 清理临时文件
     try:
