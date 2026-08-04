@@ -192,6 +192,12 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
                title="ADC/verify 节点的达标阈值，默认 0.8。越低越易通过。" />
         <span class="opt-hint">0~1，越低越易通过</span>
       </div>
+      <div class="opt-row">
+        <label class="opt-label" for="attInput">附件路径</label>
+        <input id="attInput" class="opt-input" type="text" style="flex:1;min-width:0;"
+               placeholder="图片/语音路径，逗号分隔（如 a.png,b.wav）" />
+        <span class="opt-hint">按扩展名分图/音</span>
+      </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="btnRun" onclick="submitGoal()">
           <span id="btnRunLabel">运行</span>
@@ -290,7 +296,21 @@ async function submitGoal() {
         quality_threshold: (() => {
           const v = parseFloat(document.getElementById('qThreshold').value);
           return isNaN(v) ? null : v;
-        })()
+        })(),
+        ...((() => {
+          const raw = document.getElementById('attInput').value.trim();
+          if (!raw) return {};
+          const IMG = /\.(png|jpe?g|gif|bmp|webp|svg)$/i;
+          const AUD = /\.(wav|mp3|m4a|ogg|flac|aac)$/i;
+          const imgs = [], auds = [];
+          raw.split(',').map(s => s.trim()).filter(Boolean).forEach(p => {
+            if (AUD.test(p)) auds.push(p); else imgs.push(p);
+          });
+          const out = {};
+          if (imgs.length) out.images = imgs;
+          if (auds.length) out.audio = auds;
+          return out;
+        })())
       })
     });
     const data = await res.json();

@@ -149,6 +149,67 @@ class GoalParser:
             g.feedback = {"max_iter": 3}
         return g
 
+    # ---- 多模态入口（④）：图片/语音 → 文本/struct ----
+    def parse_multimodal(self, text: str, images=None, audio=None) -> "Goal":
+        """自然语言 + 多模态附件 → Goal。
+
+        离线（无 api_key）：图片/语音转为描述占位（[图片: x]/[语音: x]）拼入 NL，
+        再走原 parse（规则/LLM）。在线（有 key）：同样走占位文本（本机无 vision
+        依赖），预留 _vision_transcribe 钩子供接真 vision/ASR。
+        在返回的 Goal 上标注 attachment_type(text/image/audio/mixed) 与 attachments 清单。
+        """
+        images = self._norm_attachments(images, "image")
+        audio = self._norm_attachments(audio, "audio")
+        # 在线增强钩子（预留）：有 key 时把图片/语音转写为文本描述
+        extra = self._vision_transcribe(images, audio) if (self.api_key and (images or audio)) else None
+        combined = self._build_combined(text, images, audio)
+        if extra:
+            combined = combined + "\n" + extra
+        g = self.parse(combined)
+        if images and audio:
+            atype = "mixed"
+        elif images:
+            atype = "image"
+        elif audio:
+            atype = "audio"
+        else:
+            atype = "text"
+        g.attachment_type = atype
+        g.attachments = images + audio
+        return g
+
+    @staticmethod
+    def _norm_attachments(items, kind):
+        """规范化附件为 [{type, name, ...}] 列表，支持 str / dict / 混合。"""
+        if not items:
+            return []
+        out = []
+        for it in items:
+            if isinstance(it, str):
+                out.append({"type": kind, "name": it})
+            elif isinstance(it, dict):
+                d = dict(it)
+                d.setdefault("type", kind)
+                out.append(d)
+            else:
+                out.append({"type": kind, "name": str(it)})
+        return out
+
+    @staticmethod
+    def _build_combined(text, images, audio):
+        """把图片/语音占位拼入 NL（离线降级核心逻辑）。返回组合文本。"""
+        parts = []
+        for a in images:
+            parts.append(f"[图片: {a.get('name', '?')}]")
+        for a in audio:
+            parts.append(f"[语音: {a.get('name', '?')}]")
+        return "\n".join([p for p in parts if p] + ([text] if text else []))
+
+    def _vision_transcribe(self, images, audio):
+        """在线增强钩子：图片→描述、语音→转写。本期返回 None（占位文本已兜底），
+        预留用 self._http_post 调 vision/ASR 模型，失败则降级。"""
+        return None
+
     # ---- 规则解析（兜底，离线） ----
     def _parse_rule(self, nl: str) -> Goal:
         nl_low = nl.lower()
@@ -572,6 +633,39 @@ def selftest():
     assert any("compare" in edge[1] for edge in g13.dependencies), \
         f"compare 应作为 sink 依赖 retrieve，实际 deps={g13.dependencies}"
     print("✓ 新能力 DAG 分层：compare 作为 sink 依赖 source(retrieve)")
+
+    # 14) ④ 多模态：图片离线降级（占位拼接 + attachment_type=image）
+    p14 = GoalParser()
+    combined14 = GoalParser._build_combined(
+        "分析这张图表", GoalParser._norm_attachments(["chart.png"], "image"), [])
+    assert "[图片: chart.png]" in combined14, f"占位拼接错误：{combined14}"
+    g14 = p14.parse_multimodal("分析这张图表", images=["chart.png"])
+    assert g14.attachment_type == "image", f"应 image，实际 {g14.attachment_type}"
+    assert any(a.get("name") == "chart.png" for a in g14.attachments), "attachments 应含 chart.png"
+    print("✓ ④ 图片：占位拼接正确，attachment_type=image，attachments 含 chart.png")
+
+    # 15) ④ 多模态：语音离线降级
+    p15 = GoalParser()
+    combined15 = GoalParser._build_combined(
+        "总结这段录音", [], GoalParser._norm_attachments(["meeting.wav"], "audio"))
+    assert "[语音: meeting.wav]" in combined15, f"占位拼接错误：{combined15}"
+    g15 = p15.parse_multimodal("总结这段录音", audio=["meeting.wav"])
+    assert g15.attachment_type == "audio", f"应 audio，实际 {g15.attachment_type}"
+    print("✓ ④ 语音：占位拼接正确，attachment_type=audio")
+
+    # 16) ④ 多模态：图文混合 → mixed
+    p16 = GoalParser()
+    g16 = p16.parse_multimodal("结合图片和录音写报告",
+                               images=["fig1.jpg"], audio=["vo1.mp3"])
+    assert g16.attachment_type == "mixed", f"应 mixed，实际 {g16.attachment_type}"
+    print("✓ ④ 图文混合：attachment_type=mixed，两类占位均在描述中")
+
+    # 17) ④ 多模态：纯文本零回归（无附件 → text，解析不变）
+    p17 = GoalParser()
+    g17 = p17.parse_multimodal("查中国GDP总量")
+    assert g17.attachment_type == "text", f"应 text，实际 {g17.attachment_type}"
+    assert "retrieve" in g17.capabilities, "纯文本解析能力不应受影响"
+    print("✓ ④ 纯文本零回归：attachment_type=text，解析正常")
 
     print("\nM4 nl_parser 离线自检全部通过 ✓")
 

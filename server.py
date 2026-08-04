@@ -40,6 +40,8 @@ class GoalRequest(BaseModel):
     data_fill_budget: int = Field(2, description="自动补数重试次数上限")
     evolve_enabled: bool = Field(True, description="是否启用 3.5 多任务进化")
     quality_threshold: Optional[float] = Field(None, description="质量门阈值，注入 adc/verify 节点，默认 0.8")
+    images: Optional[list] = Field(None, description="④ 多模态：图片附件路径/名称列表")
+    audio: Optional[list] = Field(None, description="④ 多模态：语音附件路径/名称列表")
 
 class RunStatus(BaseModel):
     run_id: str
@@ -86,9 +88,14 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
         from runtime import Circuit, CircuitExecutor, SimBackend
         import random
 
-        # 编译：NL → Goal → compile
+        # 编译：NL → Goal → compile（④ 多模态：有附件走 parse_multimodal）
         parser = GoalParser()
-        goal = parser.parse(goal_text)
+        images = params.get("images")
+        audio = params.get("audio")
+        if images or audio:
+            goal = parser.parse_multimodal(goal_text, images=images, audio=audio)
+        else:
+            goal = parser.parse(goal_text)
         spec = compile_goal(
             goal,
             auto_bind=True,
@@ -125,6 +132,9 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
             auto_select_models=params.get("auto_select_models", False),
         )
         result = executor.run()
+        # ④ 多模态：把真实输入模态透传到结果（前端可显示）
+        result["modality"] = getattr(goal, "attachment_type", "text")
+        result["attachments"] = getattr(goal, "attachments", [])
 
         with _lock:
             _runs[run_id]["status"] = "done"

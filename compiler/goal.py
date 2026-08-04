@@ -128,6 +128,11 @@ class Goal:
     # 据 subtasks 自动生成；runtime.propagate 在每个电阻跑前核对 required_inputs 是否被
     # 上游 produced_outputs 覆盖（线性关系自测），缺则 gate:fail。None/空 = 不触发自测。
     component_io: Optional[dict] = None
+    # 可选真实输入模态（④ 多模态入口）：text/image/audio/mixed。
+    # 与语义字段 modalities（文本里提到的模态词）区分：这是"实际附了什么文件"。
+    attachment_type: str = "text"
+    # 可选附件清单（④ 多模态入口）：[{type, name, ...}]，type∈image/audio。
+    attachments: list = field(default_factory=list)
 
     # ---- 校验 + 构造 ----
     @staticmethod
@@ -151,6 +156,13 @@ class Goal:
         modalities = d.get("modalities", []) or []
         if not isinstance(modalities, list) or not all(isinstance(m, str) for m in modalities):
             raise ValueError("goal.modalities 必须是字符串列表")
+        # --- attachment_type / attachments（④ 多模态入口）---
+        attachment_type = d.get("attachment_type", "text")
+        if attachment_type not in ("text", "image", "audio", "mixed"):
+            raise ValueError("goal.attachment_type 必须是 text/image/audio/mixed 之一")
+        attachments = d.get("attachments", []) or []
+        if not isinstance(attachments, list):
+            raise ValueError("goal.attachments 必须是对象列表")
         reliability = d.get("reliability", "normal")
         if reliability not in VALID_RELIABILITY:
             raise ValueError(f"reliability 必须是 {VALID_RELIABILITY} 之一")
@@ -259,6 +271,8 @@ class Goal:
             self_heal=sh,
             subtasks=sub,
             component_io=comp_io,
+            attachment_type=attachment_type,
+            attachments=list(attachments),
         )
 
     def to_dict(self) -> dict:
@@ -277,4 +291,6 @@ class Goal:
             "self_heal": self.self_heal,
             "subtasks": self.subtasks,
             "component_io": self.component_io,
+            "attachment_type": self.attachment_type,
+            "attachments": self.attachments,
         }
