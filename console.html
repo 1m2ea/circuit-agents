@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>circuit-agents · Live Console</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --ink: #e6edf3;
+  --muted: #8b949e;
+  --green: #2e7d32; --red: #c62828; --orange: #ef6c00;
+  --purple: #9c27b0; --blue: #58a6ff; --teal: #39d353;
+  --radius: 8px; --ease: cubic-bezier(0.23, 1, 0.32, 1);
+  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--font); background: var(--bg); color: var(--ink);
+  display: flex; flex-direction: column;
+}
+
+/* ── Header ── */
+header {
+  padding: 10px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  background: var(--panel);
+}
+header h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
+header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); }
+header .stat { font-size: 12px; color: var(--muted); margin-left: auto; }
+
+/* ── Layout ── */
+main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidden; }
+
+/* ── Left Panel ── */
+.left {
+  background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.left-section { padding: 16px; border-bottom: 1px solid var(--border); }
+.left-section h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--muted); margin-bottom: 10px; font-weight: 600;
+}
+#goalInput {
+  width: 100%; height: 120px; resize: vertical; font-family: var(--mono);
+  font-size: 13px; padding: 10px; border-radius: var(--radius);
+  background: var(--bg); color: var(--ink); border: 1px solid var(--border);
+  outline: none; transition: border-color 150ms var(--ease);
+}
+#goalInput:focus { border-color: var(--blue); }
+.btn-row { display: flex; gap: 8px; margin-top: 10px; }
+.btn {
+  padding: 8px 18px; border-radius: var(--radius); border: 1px solid var(--border);
+  font-size: 13px; font-weight: 500; cursor: pointer; font-family: var(--font);
+  transition: transform 120ms var(--ease), background 150ms var(--ease);
+  display: flex; align-items: center; gap: 6px;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: #238636; color: #fff; border-color: #238636; }
+.btn-primary:hover { background: #2ea043; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+.btn-ghost { background: transparent; color: var(--ink); }
+.btn-ghost:hover { background: rgba(255,255,255,0.05); }
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+
+/* ── History ── */
+.history-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+.history-item {
+  padding: 10px 16px; cursor: pointer; border-left: 3px solid transparent;
+  transition: background 120ms var(--ease), border-color 150ms var(--ease);
+  font-size: 13px; line-height: 1.4;
+}
+.history-item:hover { background: rgba(255,255,255,0.03); }
+.history-item.selected { border-left-color: var(--blue); background: rgba(88,166,255,0.06); }
+.history-item .hi-goal {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px;
+}
+.history-item .hi-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.hi-status { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+.hi-status.done { background: #122d17; color: var(--teal); }
+.hi-status.running { background: #1a2332; color: var(--blue); }
+.hi-status.error { background: #2d1216; color: var(--red); }
+
+/* ── Right Panel ── */
+.right { display: flex; flex-direction: column; overflow: hidden; }
+
+/* Topology */
+.topo-area {
+  flex: 0 0 45%; border-bottom: 1px solid var(--border);
+  position: relative; overflow: hidden;
+  background: radial-gradient(ellipse at 50% 50%, #161b22 0%, var(--bg) 100%);
+}
+.topo-area svg { width: 100%; height: 100%; display: block; }
+
+/* Bottom: Timeline + Result */
+.bottom { flex: 1; display: grid; grid-template-rows: 1fr auto; overflow: hidden; }
+.timeline {
+  overflow-y: auto; padding: 12px 16px; font-size: 12px; font-family: var(--mono);
+  line-height: 1.7; counter-reset: tline;
+}
+.tml-ev {
+  padding: 4px 8px; border-left: 2px solid var(--border); margin-bottom: 4px;
+  opacity: 0; animation: tmlIn 200ms var(--ease) forwards;
+  animation-delay: calc(var(--i) * 40ms);
+  border-radius: 0 4px 4px 0;
+}
+@keyframes tmlIn { to { opacity: 1; } }
+.tml-ev.node_done { border-left-color: var(--green); background: rgba(46,125,50,0.05); }
+.tml-ev.gate_fail { border-left-color: var(--red); background: rgba(198,40,40,0.05); }
+.tml-ev.retry { border-left-color: var(--orange); background: rgba(239,108,0,0.05); }
+.tml-ev.evolve { border-left-color: var(--purple); background: rgba(156,39,176,0.05); }
+.tml-ev .tml-node { color: var(--blue); font-weight: 600; }
+.tml-ev .tml-time { color: var(--muted); }
+.tml-ev .tml-ok { color: var(--teal); }
+.tml-ev .tml-fail { color: var(--red); }
+.result-bar {
+  padding: 14px 20px; border-top: 1px solid var(--border);
+  display: flex; gap: 24px; align-items: center; flex-wrap: wrap;
+  background: var(--panel); flex-shrink: 0;
+}
+.result-bar .r-item { font-size: 13px; }
+.result-bar .r-label { font-size: 11px; color: var(--muted); display: block; }
+.result-bar .r-value { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+.r-quality { color: var(--teal); }
+.r-cost { color: var(--blue); }
+.r-nodes { color: var(--muted); }
+
+/* ── Empty state ── */
+.empty-state {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: var(--muted); gap: 8px;
+}
+.empty-state .icon { font-size: 48px; opacity: 0.3; }
+
+/* ── Spinner ── */
+.spinner {
+  display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+  border-top-color: var(--blue); border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── SVG topology ── */
+.topo-node { cursor: pointer; transition: transform 150ms var(--ease); }
+.topo-node:hover { transform: scale(1.05); }
+.topo-node rect { transition: stroke 200ms var(--ease), fill 200ms var(--ease); }
+.topo-wire { stroke: var(--border); stroke-width: 2; transition: stroke 200ms var(--ease); }
+.topo-wire.active { stroke: var(--blue); stroke-width: 3; }
+.topo-label { fill: var(--ink); font-size: 11px; font-family: var(--font); text-anchor: middle; }
+.topo-type { fill: var(--muted); font-size: 9px; font-family: var(--font); text-anchor: middle; }
+.topo-badge { font-size: 14px; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="statusDot"></div>
+  <h1>circuit-agents · Live Console</h1>
+  <span class="stat" id="connStat">已连接</span>
+</header>
+
+<main>
+  <!-- ── Left Panel ── -->
+  <div class="left">
+    <div class="left-section">
+      <h2>✦ 新任务</h2>
+      <textarea id="goalInput" placeholder="输入自然语言任务描述...
+例: 查中国2025年GDP总量和人均GDP，然后对比分析"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btnRun" onclick="submitGoal()">
+          <span id="btnRunLabel">运行</span>
+        </button>
+        <button class="btn btn-ghost" onclick="clearAll()">清空</button>
+      </div>
+    </div>
+
+    <div class="left-section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+      <h2 style="display:flex;justify-content:space-between;">
+        ⏱ 历史
+        <button class="btn btn-sm btn-ghost" onclick="refreshHistory()">刷新</button>
+      </h2>
+      <div class="history-list" id="historyList">
+        <div class="empty-state" style="padding:30px 0;">
+          <div class="icon">⚡</div>
+          <div style="font-size:13px;">提交一个任务开始</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Right Panel ── -->
+  <div class="right">
+    <div class="topo-area" id="topoArea">
+      <svg id="topoSvg" viewBox="0 0 800 400" preserveAspectRatio="xMidYMid meet">
+        <text x="400" y="200" text-anchor="middle" fill="var(--muted)" font-size="14" opacity="0.5">
+          等待任务提交...
+        </text>
+      </svg>
+    </div>
+
+    <div class="bottom">
+      <div class="timeline" id="timeline">
+        <div class="empty-state">
+          <div class="icon" style="font-size:36px;">📡</div>
+          <div style="font-size:13px;">实时执行事件将在此展示</div>
+        </div>
+      </div>
+      <div class="result-bar" id="resultBar" style="opacity:0;">
+        <div class="r-item">
+          <span class="r-label">最终品质</span>
+          <span class="r-value r-quality" id="rQuality">--</span>
+        </div>
+        <div class="r-item">
+          <span class="r-label">总成本</span>
+          <span class="r-value r-cost" id="rCost">--</span>
+        </div>
+        <div class="r-item">
+          <span class="r-label">节点数</span>
+          <span class="r-value r-nodes" id="rNodes">--</span>
+        </div>
+        <div class="r-item">
+          <span class="r-label">总延迟</span>
+          <span class="r-value r-cost" id="rLatency">--</span>
+        </div>
+        <div class="r-item" id="rStatus" style="font-size:12px;"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ────────────────────────────────────────────────────
+// State
+// ────────────────────────────────────────────────────
+const API = '';
+let currentRunId = null;
+let currentSpec = null;
+let eventSource = null;
+let t0 = null;
+
+// ────────────────────────────────────────────────────
+// API calls
+// ────────────────────────────────────────────────────
+
+async function submitGoal() {
+  const goal = document.getElementById('goalInput').value.trim();
+  if (!goal) return;
+
+  const btn = document.getElementById('btnRun');
+  const label = document.getElementById('btnRunLabel');
+  btn.disabled = true;
+  label.textContent = '提交中...';
+
+  try {
+    const res = await fetch(API + '/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ goal, route: true, evolve_enabled: false, memory_enabled: false })
+    });
+    const data = await res.json();
+    currentRunId = data.run_id;
+    // 清空旧数据
+    resetDisplay();
+    // 开始 SSE
+    connectStream(currentRunId);
+    // 刷新历史
+    refreshHistory();
+    // 更新按钮
+    label.innerHTML = '<span class="spinner"></span> 执行中';
+  } catch (e) {
+    console.error(e);
+    label.textContent = '错误，重试';
+    btn.disabled = false;
+  }
+}
+
+function connectStream(runId) {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(API + '/run/' + runId + '/stream');
+  t0 = Date.now();
+
+  eventSource.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'node_done') {
+      onNodeDone(data.event);
+    } else if (data.type === 'result') {
+      onResult(data.result);
+    } else if (data.type === 'error') {
+      onError(data.error);
+    }
+  };
+
+  eventSource.onerror = () => {
+    // SSE done or error — poll for result
+    setTimeout(() => {
+      if (currentRunId) pollResult(currentRunId);
+    }, 1000);
+  };
+
+  // 加载 spec 信息
+  loadSpec(runId);
+}
+
+async function loadSpec(runId) {
+  try {
+    const res = await fetch(API + '/run/' + runId);
+    const data = await res.json();
+    // Poll until spec is available
+    if (data.spec && Object.keys(data.spec).length > 0) {
+      currentSpec = data.spec;
+      renderTopology(currentSpec);
+    }
+  } catch (e) { /* ignore */ }
+  // Keep polling for spec until we get it
+  if (!currentSpec) {
+    setTimeout(() => loadSpec(runId), 500);
+  }
+}
+
+async function pollResult(runId) {
+  try {
+    const res = await fetch(API + '/run/' + runId);
+    const data = await res.json();
+    if (data.status === 'done' && data.result) {
+      if (!currentSpec && data.spec) {
+        currentSpec = data.spec;
+        renderTopology(currentSpec);
+      }
+      onResult(data.result);
+      if (eventSource) eventSource.close();
+    } else if (data.status === 'error') {
+      onError(data.error);
+      if (eventSource) eventSource.close();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function refreshHistory() {
+  try {
+    const res = await fetch(API + '/api/history?limit=30');
+    const items = await res.json();
+    renderHistory(items);
+  } catch (e) {
+    // No /api/history yet, try execution_store
+    try {
+      const res = await fetch(API + '/api/store/list?limit=30');
+      const items = await res.json();
+      renderHistory(items);
+    } catch (e2) { /* silence */ }
+  }
+}
+
+async function loadRun(runId) {
+  currentRunId = runId;
+  resetDisplay();
+  if (eventSource) eventSource.close();
+
+  try {
+    const res = await fetch(API + '/run/' + runId);
+    const data = await res.json();
+    currentSpec = data.spec || {};
+    if (currentSpec.components) renderTopology(currentSpec);
+
+    if (data.status === 'done' && data.result) {
+      // Replay the events visually
+      const events = data.events || [];
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.type === 'node_done' || ev.type === 'node_done') {
+          onNodeDone(ev.event || ev, true);
+        }
+      }
+      onResult(data.result);
+    } else if (data.status === 'running') {
+      connectStream(runId);
+    }
+  } catch (e) { console.error(e); }
+}
+
+// ────────────────────────────────────────────────────
+// Display handlers
+// ────────────────────────────────────────────────────
+
+function resetDisplay() {
+  document.getElementById('timeline').innerHTML = '';
+  document.getElementById('resultBar').style.opacity = '0';
+  document.getElementById('topoSvg').innerHTML =
+    '<text x="400" y="200" text-anchor="middle" fill="var(--muted)" font-size="14" opacity="0.5">执行中...</text>';
+  document.getElementById('btnRun').disabled = true;
+  document.getElementById('btnRunLabel').innerHTML = '<span class="spinner"></span> 执行中';
+  setConnStatus('running');
+}
+
+function onNodeDone(info, isReplay) {
+  const node = info.node || '?';
+  const ok = info.ok !== false;
+  const quality = typeof info.quality === 'number' ? info.quality.toFixed(3) : '--';
+  const retried = info.retried;
+
+  // Timeline
+  const tl = document.getElementById('timeline');
+  if (tl.querySelector('.empty-state')) tl.innerHTML = '';
+
+  const div = document.createElement('div');
+  const ms = t0 ? (Date.now() - t0).toFixed(0) : (isReplay ? 'replay' : '?');
+  div.className = 'tml-ev node_done' + (retried ? ' retry' : '');
+  div.style.setProperty('--i', tl.children.length);
+  div.innerHTML =
+    `<span class="tml-time">${ms}ms</span> ` +
+    `<span class="tml-node">${node}</span> ` +
+    (ok ? `<span class="tml-ok">✓</span>` : `<span class="tml-fail">✗</span>`) +
+    ` Q=${quality}` +
+    (retried ? ' <span style="color:var(--orange)">[补数]</span>' : '');
+
+  tl.appendChild(div);
+  tl.scrollTop = tl.scrollHeight;
+
+  // Update topology
+  if (currentSpec) updateNodeColor(node, ok, retried);
+}
+
+function onResult(result) {
+  const r = result.result || result;
+  document.getElementById('rQuality').textContent = (r.final_quality || 0).toFixed(3);
+  document.getElementById('rCost').textContent = '$' + (r.total_cost || 0).toFixed(4);
+  document.getElementById('rLatency').textContent = (r.total_latency_ms || 0).toFixed(0) + 'ms';
+  document.getElementById('rNodes').textContent = Object.keys(r.components || {}).length;
+  document.getElementById('rStatus').innerHTML = r.success
+    ? '<span style="color:var(--teal)">✓ 执行成功</span>'
+    : '<span style="color:var(--red)">✗ 部分失败</span>';
+  document.getElementById('resultBar').style.opacity = '1';
+
+  document.getElementById('btnRun').disabled = false;
+  document.getElementById('btnRunLabel').textContent = '运行';
+  setConnStatus('done');
+  refreshHistory();
+}
+
+function onError(err) {
+  const tl = document.getElementById('timeline');
+  if (tl.querySelector('.empty-state')) tl.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'tml-ev gate_fail';
+  div.innerHTML = `<span style="color:var(--red)">✗ 错误: ${err}</span>`;
+  tl.appendChild(div);
+
+  document.getElementById('btnRun').disabled = false;
+  document.getElementById('btnRunLabel').textContent = '重试';
+  setConnStatus('error');
+}
+
+function setConnStatus(s) {
+  const dot = document.getElementById('statusDot');
+  const cs = document.getElementById('connStat');
+  if (s === 'running') { dot.style.background = 'var(--blue)'; cs.textContent = '执行中'; }
+  else if (s === 'done') { dot.style.background = 'var(--teal)'; cs.textContent = '就绪'; }
+  else if (s === 'error') { dot.style.background = 'var(--red)'; cs.textContent = '错误'; }
+  else { dot.style.background = 'var(--teal)'; cs.textContent = '已连接'; }
+}
+
+// ────────────────────────────────────────────────────
+// History rendering
+// ────────────────────────────────────────────────────
+
+function renderHistory(items) {
+  const list = document.getElementById('historyList');
+  if (!items || items.length === 0) {
+    list.innerHTML = '<div class="empty-state" style="padding:30px 0;"><div class="icon">📭</div><div style="font-size:13px;">暂无记录</div></div>';
+    return;
+  }
+  list.innerHTML = items.map(item => {
+    const sel = item.run_id === currentRunId ? ' selected' : '';
+    const sc = item.status === 'done' ? 'done' : item.status === 'running' ? 'running' : 'error';
+    const sq = item.result && item.result.final_quality
+      ? `Q=${item.result.final_quality.toFixed(2)}` : '';
+    return `<div class="history-item${sel}" onclick="loadRun('${item.run_id}')">
+      <div class="hi-goal">${esc(item.goal || item.run_id)}</div>
+      <div class="hi-meta">
+        <span class="hi-status ${sc}">${item.status}</span>
+        ${sq ? ' ' + sq : ''}
+        ${item.created_at ? ' · ' + item.created_at.slice(0,16) : ''}
+      </div>
+    </div>`;
+  }).join('');
+  list.scrollTop = 0;
+}
+
+function clearAll() {
+  document.getElementById('goalInput').value = '';
+  currentRunId = null;
+  currentSpec = null;
+  resetDisplay();
+  document.getElementById('topoSvg').innerHTML =
+    '<text x="400" y="200" text-anchor="middle" fill="var(--muted)" font-size="14" opacity="0.5">等待任务提交...</text>';
+  document.getElementById('timeline').innerHTML =
+    '<div class="empty-state"><div class="icon" style="font-size:36px;">📡</div><div style="font-size:13px;">实时执行事件将在此展示</div></div>';
+  document.getElementById('resultBar').style.opacity = '0';
+  document.getElementById('btnRun').disabled = false;
+  document.getElementById('btnRunLabel').textContent = '运行';
+  setConnStatus('ok');
+}
+
+// ────────────────────────────────────────────────────
+// SVG Topology Renderer
+// ────────────────────────────────────────────────────
+
+function renderTopology(spec) {
+  if (!spec || !spec.components) return;
+  const comps = spec.components;
+  const wires = spec.wires || [];
+  const svg = document.getElementById('topoSvg');
+
+  // Calculate layout
+  const nodes = Object.keys(comps);
+  const layerMap = computeLayers(comps, wires);
+  const maxLayer = Math.max(1, ...Object.values(layerMap));
+  const nodesPerLayer = {};
+  for (const [n, l] of Object.entries(layerMap)) {
+    nodesPerLayer[l] = (nodesPerLayer[l] || 0) + 1;
+  }
+
+  const W = 800, H = 350, padX = 80, padY = 42;
+  const lw = (W - padX * 2) / maxLayer;
+
+  // Build node positions
+  const pos = {};
+  const layerCount = {};
+  for (const nid of nodes) {
+    const l = layerMap[nid] || 0;
+    layerCount[l] = (layerCount[l] || 0) + 1;
+    const count = nodesPerLayer[l] || 1;
+    const x = padX + l * lw + lw * 0.5;
+    const y = padY + (layerCount[l] / (count + 1)) * (H - padY * 2);
+    pos[nid] = { x, y };
+  }
+
+  // Build SVG
+  let html = '';
+
+  // Wires
+  for (const [a, b] of wires) {
+    if (!pos[a] || !pos[b]) continue;
+    const pa = pos[a], pb = pos[b];
+    const midX = (pa.x + pb.x) / 2 + 20;
+    html += `<path d="M${pa.x},${pa.y} C${midX},${pa.y} ${midX},${pb.y} ${pb.x},${pb.y}" class="topo-wire" id="wire-${a}-${b}"/>`;
+  }
+
+  // Nodes
+  for (const nid of nodes) {
+    const comp = comps[nid];
+    const p = pos[nid];
+    const t = comp.type || '?';
+    const label = comp.label || nid;
+    const color = nodeTypeColor(t);
+    const r = nodeRadius(t);
+
+    html += `<g class="topo-node" id="tnode-${nid}" transform="translate(${p.x},${p.y})">
+      <rect x="${-r}" y="${-r*0.7}" width="${r*2}" height="${r*1.4}" rx="${r*0.3}"
+            fill="#1c2230" stroke="${color}" stroke-width="2"/>
+      <text class="topo-label" y="1" dy=".35em">${esc(label)}</text>
+      <text class="topo-type" y="${r*0.7+12}">${t}</text>
+    </g>`;
+  }
+
+  svg.innerHTML = html;
+
+  // Store positions and spec for later updates
+  svg._pos = pos;
+  svg._comps = comps;
+  svg._wires = wires;
+  svg._layers = layerMap;
+}
+
+function updateNodeColor(nid, ok, retried) {
+  const svg = document.getElementById('topoSvg');
+  const rect = svg.querySelector(`#tnode-${nid} rect`);
+  if (!rect) return;
+
+  let fill, stroke;
+  if (!ok) {
+    fill = '#2d1216'; stroke = 'var(--red)';
+  } else if (retried) {
+    fill = '#1f2d1a'; stroke = 'var(--orange)';
+    rect.setAttribute('stroke-dasharray', '5 3');
+  } else {
+    fill = '#122d17'; stroke = 'var(--green)';
+  }
+  rect.setAttribute('fill', fill);
+  rect.setAttribute('stroke', stroke);
+
+  // Add check/cross mark
+  const g = rect.parentElement;
+  let mark = g.querySelector('.topo-badge');
+  if (!mark) {
+    mark = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    mark.setAttribute('class', 'topo-badge');
+    mark.setAttribute('x', rect.getAttribute('width') ? parseFloat(rect.getAttribute('width'))/2 - 8 : '10');
+    mark.setAttribute('y', '-4');
+    g.appendChild(mark);
+  }
+  mark.textContent = ok ? '✓' : '✗';
+  mark.setAttribute('fill', ok ? 'var(--green)' : 'var(--red)');
+
+  // Animate wire from this node to successors
+  if (svg._wires) {
+    const wires = svg._wires;
+    for (const [a, b] of wires) {
+      if (a === nid || b === nid) {
+        const w = svg.querySelector(`#wire-${a}-${b}`);
+        if (w) w.classList.add('active');
+      }
+    }
+  }
+}
+
+function computeLayers(comps, wires) {
+  const layers = {};
+  const inDegree = {};
+  const succ = {};
+  for (const n of Object.keys(comps)) { inDegree[n] = 0; succ[n] = []; }
+  for (const [a, b] of wires) { succ[a] = succ[a] || []; succ[a].push(b); inDegree[b] = (inDegree[b] || 0) + 1; }
+
+  const queue = [];
+  for (const [n, d] of Object.entries(inDegree)) {
+    if (d === 0) { queue.push(n); layers[n] = 0; }
+  }
+  while (queue.length) {
+    const u = queue.shift();
+    for (const v of (succ[u] || [])) {
+      inDegree[v]--;
+      if (inDegree[v] === 0) {
+        layers[v] = layers[u] + 1;
+        queue.push(v);
+      }
+    }
+  }
+  return layers;
+}
+
+function nodeTypeColor(t) {
+  if (t === 'power' || t === 'source') return '#6a737d';
+  if (t === 'capacitor') return '#6a737d';
+  if (t === 'resistor') return '#58a6ff';
+  if (t === 'format_adapter') return '#d29922';
+  if (t === 'diode' || t === 'adc') return '#f78166';
+  return '#6a737d';
+}
+
+function nodeRadius(t) {
+  if (t === 'power' || t === 'source') return 22;
+  if (t === 'capacitor') return 18;
+  if (t === 'resistor') return 28;
+  return 24;
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ────────────────────────────────────────────────────
+// Init
+// ────────────────────────────────────────────────────
+refreshHistory();
+setInterval(refreshHistory, 10000); // auto-refresh history every 10s
+</script>
+</body>
+</html>

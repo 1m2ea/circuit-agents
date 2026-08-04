@@ -15,13 +15,16 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 import time
 import threading
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -55,9 +58,20 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# CORS（开发用，生产需收紧）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # 内存存储（生产环境应换 SQLite/Redis）
 _runs: dict[str, dict] = {}
 _lock = threading.Lock()
+
+# 静态文件根目录
+_HERE = Path(__file__).parent
 
 
 def _run_goal(goal_text: str, params: dict, run_id: str):
@@ -129,6 +143,14 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
 # 端点
 # ──────────────────────────────────────────────────────────
 
+@app.get("/")
+def index():
+    """Live Console 前端界面。"""
+    console_path = _HERE / "console.html"
+    if console_path.exists():
+        return HTMLResponse(console_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>circuit-agents API</h1><p>console.html not found</p>")
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
@@ -165,6 +187,35 @@ def get_run(run_id: str):
     if r is None:
         raise HTTPException(404, "run not found")
     return {k: v for k, v in r.items() if not k.startswith("_")}
+
+
+@app.get("/api/history")
+def api_history(limit: int = Query(30, ge=1, le=100)):
+    """返回最近 N 条执行记录（内存 + SQLite 合并）。"""
+    items = []
+    # 先从内存取
+    with _lock:
+        for rid, r in _runs.items():
+            items.append({
+                "run_id": rid,
+                "goal": r.get("goal", ""),
+                "status": r.get("status", "unknown"),
+                "created_at": r.get("created_at", ""),
+                "finished_at": r.get("finished_at"),
+                "result": r.get("result"),
+            })
+    # 再从 SQLite 取（去重）
+    try:
+        from execution_store import ExecutionStore
+        store = ExecutionStore("executions.db")
+        for rec in store.list_recent(limit):
+            if rec["run_id"] not in {i["run_id"] for i in items}:
+                items.append(rec)
+    except Exception:
+        pass
+    # 按 created_at 倒序
+    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return items[:limit]
 
 
 @app.get("/run/{run_id}/stream")
