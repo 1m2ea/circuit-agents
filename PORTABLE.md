@@ -94,7 +94,54 @@ python launch.py
 
 ---
 
-## 6. 注意事项
+## 6. 本机 transformers 桥接（无 Ollama 也能用本地模型）✅ 已真机验证
+
+如果你的本地模型是 **纯 transformers / modelscope 部署**（不是 Ollama，无 OpenAI 服务），
+用本仓库的 `local_llm_bridge.py` 在模型和 circuit-agents 之间架一层 **OpenAI 兼容 HTTP 桥**，
+即可让 `OllamaBackend(openai 模式)` 驱动它。**已在本机用 Qwen2.5-1.5B（CPU）实测端到端跑通。**
+
+> 适用场景：本机已用 `torch`+`transformers`+`modelscope` 装好一个模型（如 `Qwen/Qwen2.5-1.5B-Instruct`），
+> 但不想/不能装 Ollama。U 盘方案仍是主路径；这是「没有 Ollama 也能测真模型」的备选。
+
+### 6.1 原理
+```
+circuit-agents (OllamaBackend, api_mode="openai")
+      │  POST /v1/chat/completions   (忽略 model 字段)
+      ▼
+local_llm_bridge.py  (stdlib http.server，跑在装了 torch 的 venv)
+      │  加载本地模型，用 chat 模板生成
+      ▼
+你的 transformers 模型（CPU / GPU 均可，零 API 费用、零联网）
+```
+桥**忽略请求里的 `model` 字段**，永远用启动时加载的模型生成——所以 circuit-agents 把
+`small/large/tool/code` 都映射成同一个占位名也能跑。
+
+### 6.2 两步跑通
+```bash
+# ① 在装有 torch/transformers/modelscope 的 venv 里起桥（默认 127.0.0.1:8000）
+python local_llm_bridge.py --offline
+#   --model-path 默认指向 C:/Users/lgw12/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct
+#   （modelscope 缓存布局，桥会自动下钻 snapshots/<hash>/ 找到 tokenizer.json）
+#   --offline 禁止任何联网；--host/--port 可改监听地址
+
+# ② 在 circuit-agents 自己的 venv 里（另一个终端）：
+python examples/local_model_demo.py        # 最小拓扑 src→resistor(真模型)→adc，打印模型产出
+# 或对任意 spec：
+python run.py examples/xxx.json --backend local
+```
+
+### 6.3 环境注意（本机踩过的坑）
+- 需要 **fast 分词**（`tokenizers` 库，已随 transformers 装好）+ 模型目录里的 `tokenizer.json`。
+  **不需要** `sentencepiece` / `tiktoken`——本机装过 cp313 版的这俩轮子反而让 slow 分词路径
+  segfault，卸载后走 fast 分词即正常。
+- 模型目录若是 modelscope 缓存（顶层只有 `snapshots/`），`local_llm_bridge.py` 已自动下钻到
+  `snapshots/<hash>/`；直接传快照目录也行。
+- `OllamaBackend` 的 `timeout` 默认 120s；CPU 上 1.5B 模型单轮约 14–24s，重任务可调大
+  （`run.py --backend local` 已设 180s，`examples/local_model_demo.py` 可 `--timeout`）。
+
+---
+
+## 7. 注意事项
 
 - 目标电脑内存 **≥16GB**（14b 模型推理约占 10G+，7b 约 5G；同机只跑一个模型更稳）。
 - 启动器默认监听 `127.0.0.1`，仅本机访问；如需局域网共享，改 `--host 0.0.0.0`（注意安全风险）。

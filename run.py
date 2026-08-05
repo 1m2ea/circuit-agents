@@ -7,12 +7,14 @@ Examples
 """
 import argparse
 import json
+import os
 import random
 import statistics
 import sys
 
 from runtime import Circuit, SimBackend, load
 from compiler.backend_llm import get_default_backend, resolve_api_key
+from compiler.ollama_backend import OllamaBackend
 
 
 def _build_backend(mode, rng):
@@ -20,10 +22,20 @@ def _build_backend(mode, rng):
 
     auto（默认）= 解析到 key 走真模型，否则 SimBackend；
     real = 强制真模型（无 key 报错退出）；
+    local = 走本地 transformers/Ollama 桥（OllamaBackend openai 模式，
+            默认 127.0.0.1:8000，由 local_llm_bridge.py 提供）；
     mock/sim = 强制 SimBackend 离线对照。
     """
     if mode in ("mock", "sim"):
         return SimBackend(rng)
+    if mode == "local":
+        return OllamaBackend(
+            host=os.environ.get("LOCAL_LLM_HOST", "http://127.0.0.1:8000"),
+            api_mode="openai",
+            model_map={"small": "local", "large": "local",
+                       "tool": "local", "code": "local"},
+            timeout=180.0,
+        )
     if mode == "real":
         key = resolve_api_key()
         if not key:
@@ -43,10 +55,12 @@ def main():
                     help="number of stochastic runs to average over")
     ap.add_argument("--seed", type=int, default=None,
                     help="base seed (each run gets seed+i)")
-    ap.add_argument("--backend", choices=["auto", "real", "mock", "sim"],
+    ap.add_argument("--backend", choices=["auto", "real", "local", "mock", "sim"],
                     default="auto",
                     help="auto=有 key 走真模型否则 SimBackend(默认)；"
-                         "real=强制真模型(无 key 报错)；mock/sim=强制 SimBackend 离线对照")
+                         "real=强制真模型(无 key 报错)；"
+                         "local=本地 transformers/Ollama 桥(127.0.0.1:8000)；"
+                         "mock/sim=强制 SimBackend 离线对照")
     args = ap.parse_args()
 
     spec = load(args.spec)
