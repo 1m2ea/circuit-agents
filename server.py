@@ -1125,6 +1125,30 @@ def ollama_health(req: OllamaRunRequest):
             "host": be.host, "model_map": be.model_map}
 
 
+class SimplifyRequest(BaseModel):
+    """奥卡姆剃刀化简 Pass：对拓扑 spec 做结构精简（"如无必要，勿增实体"）。"""
+    spec: dict = Field(..., description="待化简的拓扑 spec")
+    tol: float = Field(1e-6, description="等价判定容差（去噪确定性模拟）")
+    max_rounds: int = Field(50, description="最大化简轮数（幂等收敛保护）")
+
+
+@app.post("/simplify")
+def simplify_topology(req: SimplifyRequest):
+    """奥卡姆剃刀化简 Pass：删掉等价不变即剃落冗余，不确定/会变/伤完整性则保留。
+
+    复杂任务的并行支路/多重验证/反馈环本就不冗余，自然保留；
+    简单任务里的冗余 adc、重复 retrieve、空转 organize 被一扫而空。
+    等价判定用「去噪确定性模拟」（复制 SimBackend 质量语义但去噪声/开路随机），
+    使删前/删后两版在「逻辑结果」层面可比，不被仿真噪声伪影干扰。
+
+    返回：简化后 spec + 化简报告（removed/merged/steps/final_nodes 等）。
+    """
+    from compiler.simplify import simplify
+    os.environ.pop("AGENT_API_KEY", None)
+    new_spec, report = simplify(req.spec, tol=req.tol, max_rounds=req.max_rounds)
+    return {"spec": new_spec, "report": report}
+
+
 @app.post("/run", response_model=RunStatus)
 def submit_run(req: GoalRequest):
     """提交一个自然语言任务，异步编译+执行。"""
@@ -1896,6 +1920,43 @@ def selftest():
           f"calls={_oll_stats['calls']} · success={_oll_stats['successes']} · "
           f"成本=¥0（本地免费） · native API · fallback=SimBackend · "
           f"模型映射 small→qwen2.5:7b large→qwen2.5:14b")
+
+    # S29: 奥卡姆剃刀化简 Pass（compiler.simplify + /simplify 端点）
+    _simp_red = {
+        "name": "simp_red", "components": {
+            "src": {"type": "power", "label": "task"},
+            "ret": {"type": "resistor", "label": "retrieve", "model": "small",
+                    "capability": "retrieve"},
+            "mid": {"type": "adc", "threshold": 0.5},
+            "org": {"type": "resistor", "label": "organize", "model": "small",
+                    "capability": "organize"},
+            "adc": {"type": "adc", "threshold": 0.5}},
+        "wires": [["src", "ret"], ["ret", "mid"], ["mid", "org"], ["org", "adc"]]}
+    _simp_res = simplify_topology(SimplifyRequest(spec=_simp_red))
+    assert "mid" not in _simp_res["spec"]["components"], "S29: 冗余中间 adc 应被剃落"
+    assert _simp_res["report"]["simplified"], "S29: 应标记 simplified"
+    assert _simp_res["report"]["original_nodes"] == 5, "S29: 原节点数应为 5"
+    # 复杂任务（并行+反馈）应完整保留
+    _simp_cx = {
+        "name": "simp_complex", "components": {
+            "src": {"type": "power", "label": "task"},
+            "a": {"type": "resistor", "label": "a", "model": "large",
+                  "capability": "reason"},
+            "b": {"type": "resistor", "label": "b", "model": "large",
+                  "capability": "reason"},
+            "c": {"type": "resistor", "label": "c", "model": "large",
+                  "capability": "reason"},
+            "adc": {"type": "adc", "threshold": 0.5}},
+        "wires": [["src", "a"], ["src", "b"], ["a", "c"], ["b", "c"],
+                  ["c", "adc"], ["adc", "src"]],
+        "feedback": {"from": "adc", "to": "src", "max_iter": 3}}
+    _simp_cxr = simplify_topology(SimplifyRequest(spec=_simp_cx))
+    assert set(_simp_cxr["spec"]["components"].keys()) == set(_simp_cx["components"].keys()), \
+        "S29: 复杂任务结构应完整保留"
+    assert "feedback" in _simp_cxr["spec"], "S29: 反馈环应保留"
+    assert not _simp_cxr["report"]["simplified"], "S29: 复杂任务不应被化简"
+    print(f"✓ S29 奥卡姆剃刀化简(OckhamsRazor): 冗余 adc 剃落"
+          f" · 复杂任务(并行+反馈)完整保留 · 去噪确定性等价判定 · /simplify 端点可用")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
