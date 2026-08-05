@@ -29,6 +29,8 @@ DEFAULT_OLLAMA_MODELS = {
     "small": "qwen2.5:7b",
     "large": "qwen2.5:14b",
     "tool":  "qwen2.5:7b",
+    # 代码生成/审查专用档（便携工作站推荐 deepseek-coder-v2；U盘无此模型时回退 small）
+    "code":  "deepseek-coder-v2",
 }
 
 # Ollama 默认端口
@@ -343,11 +345,14 @@ def ollama_backend_selftest():
     assert oll_native._resolve_model("small") == "qwen2.5:7b"
     assert oll_native._resolve_model("large") == "qwen2.5:14b"
     assert oll_native._resolve_model("tool") == "qwen2.5:7b"
+    assert oll_native._resolve_model("code") == "deepseek-coder-v2"
     # 自定义映射
-    custom = OllamaBackend(model_map={"small": "llama3.2:3b", "large": "llama3.1:8b"})
+    custom = OllamaBackend(model_map={"small": "llama3.2:3b", "large": "llama3.1:8b",
+                                      "code": "deepseek-coder:33b"})
     assert custom._resolve_model("small") == "llama3.2:3b"
     assert custom._resolve_model("large") == "llama3.1:8b"
-    print("✓ 模型映射: 默认 qwen2.5 系列 + 自定义 llama3.x 系列")
+    assert custom._resolve_model("code") == "deepseek-coder:33b"
+    print("✓ 模型映射: 默认 qwen2.5 系列 + code→deepseek-coder-v2 + 自定义可覆盖")
 
     # 9) health_check（注入式）
     def fake_health(url, headers, body):
