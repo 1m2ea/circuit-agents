@@ -8,7 +8,7 @@ circuit-agents · compiler._verify_real
  · key 明文绝不在脚本里硬编码，也绝不 print（只打印长度）。
  · AGENT_API_BASE 缺省默认 https://api.deepseek.com/v1。
  · 运行方式（key 通过文件注入，明文不进命令/对话）：
-     DEEPSEEK_API_KEY="$(cat /c/Users/lgw12/key_tmp.txt)" \
+     DEEPSEEK_API_KEY="$(cat ~/Desktop/key_tmp.txt)" \
        python circuit-agents/compiler/_verify_real.py
    （沙箱不继承本机全局环境变量，故必须文件注入；cat 读文件，明文只存在于进程内存。）
 """
@@ -55,7 +55,7 @@ def main():
 
     if not api_key:
         print("✗ 未检测到 API key。请通过环境变量注入（DEEPSEEK_API_KEY），例如：")
-        print('    DEEPSEEK_API_KEY="$(cat /c/Users/lgw12/key_tmp.txt)" '
+        print('    DEEPSEEK_API_KEY="$(cat ~/Desktop/key_tmp.txt)" '
               "python circuit-agents/compiler/_verify_real.py [--large-cap reason]")
         sys.exit(2)
 

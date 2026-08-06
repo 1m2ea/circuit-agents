@@ -249,7 +249,7 @@ class TopologyCompiler:
 # ============================================================================
 
 def _node_exe():
-    cand = "C:/Users/lgw12/.workbuddy/binaries/node/versions/22.22.2/node.exe"
+    cand = os.path.expanduser("~/.workbuddy/binaries/node/versions/22.22.2/node.exe")
     if os.path.exists(cand):
         return cand
     return shutil.which("node")

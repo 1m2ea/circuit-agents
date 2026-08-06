@@ -5,7 +5,7 @@
 让 circuit-agents 的 ``OllamaBackend(api_mode="openai")`` 能通过 HTTP 驱动
 **纯 transformers 部署**的本地模型（无 Ollama、无 vLLM、无 API key）。
 本脚本跑在装有 torch/transformers/modelscope 的 venv 里（本机即
-``C:/Users/lgw12/.workbuddy/binaries/python/envs/llm``）；circuit-agents 自己
+``~/.workbuddy/binaries/python/envs/llm``）；circuit-agents 自己
 跑在另一个 venv，二者通过 127.0.0.1 上的 HTTP 解耦。
 
 端点（OpenAI 兼容）：
@@ -15,7 +15,7 @@
 
 用法：
     python local_llm_bridge.py \
-        --model-path "C:/Users/lgw12/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct" \
+        --model-path "~/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct" \
         --host 127.0.0.1 --port 8000 --offline
 
 说明：
@@ -32,7 +32,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DEFAULT_MODEL_PATH = r"C:\Users\lgw12\llm\models\models\Qwen--Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL_PATH = os.path.expanduser("~/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct")
 MODEL_ID = "qwen2.5-1.5b"  # 对外暴露的模型名（与请求里的 model 字段无关）
 
 # 运行时被 load_model 填充

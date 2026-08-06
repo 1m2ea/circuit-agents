@@ -120,7 +120,7 @@ local_llm_bridge.py  (stdlib http.server，跑在装了 torch 的 venv)
 ```bash
 # ① 在装有 torch/transformers/modelscope 的 venv 里起桥（默认 127.0.0.1:8000）
 python local_llm_bridge.py --offline
-#   --model-path 默认指向 C:/Users/lgw12/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct
+#   --model-path 默认指向 ~/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct
 #   （modelscope 缓存布局，桥会自动下钻 snapshots/<hash>/ 找到 tokenizer.json）
 #   --offline 禁止任何联网；--host/--port 可改监听地址
 

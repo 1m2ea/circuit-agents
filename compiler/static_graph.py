@@ -426,7 +426,7 @@ class StaticGraphCompiler:
 
 def _get_python():
     """返回托管 Python 路径。"""
-    cand = "C:/Users/lgw12/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+    cand = os.path.expanduser("~/.workbuddy/binaries/python/versions/3.13.12/python.exe")
     if os.path.exists(cand):
         return cand
     import shutil
