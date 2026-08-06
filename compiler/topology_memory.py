@@ -161,6 +161,18 @@ class TopologyMemory:
             "avg_quality": round(sum(qualities) / len(qualities), 3),
         }
 
+    def recent(self, n: int = 5) -> list:
+        """返回最近 n 条执行记录（dict 列表，含 spec/result），供心跳/复盘。
+
+        加锁 + 锁内重载，避免读到并发 record 半写的 _store。任何异常静默返回 []。
+        """
+        try:
+            with _MEM_LOCK:
+                self._store = self._load()
+                return list(self._store.get("entries", []))[-n:]
+        except Exception:
+            return []
+
 
 # ---------------------------------------------------------------------------
 # 离线自检（无需外部依赖）

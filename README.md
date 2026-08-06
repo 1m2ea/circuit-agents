@@ -120,12 +120,25 @@ python run.py examples/feedback.json --backend local
 | 跨语言/验证/调参 | `POST /codegen` · `POST /verify` · `POST /tune` |
 | 静态图/因果/异构 | `POST /static-graph/compile` · `POST /causal/analyze` · `POST /ollama/run` · `POST /ollama/health` |
 | 奥卡姆剃刀 | `POST /simplify` |
+| **π 永动心跳 f(π)** | `GET /pi/heartbeat` · `POST /pi/heartbeat/start` · `/stop` · `/tick` |
+
+## π 永动心跳 f(π)
+
+把 π 的十进制数字序列（3.1415926535…永不重复）当作系统的「永动驱动力」：每一位数字决定这一拍去逼近什么，动作结果写回系统状态、自动成为下一拍的输入——**方向恒变（π）、起点恒变（状态），双重恒变，系统永远在进化**。
+
+| π 位 | 动作 | 复用模块 |
+|---|---|---|
+| 0–3 | 探索新任务类型 | ⑭ SelfEvolution（蒸馏高频 motif 为可复用模板） |
+| 4–6 | 对最近拓扑跑奥卡姆剃刀 | `simplify()` 化简器 |
+| 7–9 | 分析低质量历史并升级模型重试 | QualityReport 分级 + 模型档升级 |
+
+π 数字源是无界十进制 spigot 算法（无需存储整串、永不重复）。心跳挂成 server 的后台守护线程，**开机即启动**（`interval` 默认 60s），永不停止；也可经端点手动 `tick` 演示。见 `compiler/pi_heartbeat.py`。
 
 ## 自测
 
 ```bash
 python -c "import runtime; runtime.selftest()"   # 内核自检
-python server.py --selftest                       # 全量 S1–S29 离线自检（零回归）
+python server.py --selftest                       # 全量 S1–S30 离线自检（零回归）
 ```
 
 ## 文档索引

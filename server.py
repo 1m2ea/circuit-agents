@@ -28,6 +28,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
+# π 永动心跳（f(π) 驱动系统进化方向；离线安全、零新核心逻辑）
+try:
+    from compiler.pi_heartbeat import PiHeartbeat, pi_heartbeat_selftest
+except Exception:  # pragma: no cover
+    PiHeartbeat = None
+    pi_heartbeat_selftest = None
+
+# π 永动心跳实例（永动循环默认关闭，由 /pi/heartbeat/start 或启动参数开启）
+PI_HEARTBEAT = PiHeartbeat(interval=60.0) if PiHeartbeat else None
+
 # ──────────────────────────────────────────────────────────
 # 模型
 # ──────────────────────────────────────────────────────────
@@ -1270,6 +1280,40 @@ def asyncio_sleep(seconds: float):
 # 离线自检（不启动服务器）
 # ──────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────
+# π 永动心跳 f(π)
+# ──────────────────────────────────────────────────────────
+
+if PI_HEARTBEAT is not None:
+    @app.get("/pi/heartbeat")
+    def pi_heartbeat_state():
+        """返回当前系统状态 + 最近一拍动作 + π 推进位置。"""
+        return {
+            "n": PI_HEARTBEAT.state["n"],
+            "running": PI_HEARTBEAT.is_running(),
+            "interval": PI_HEARTBEAT.interval,
+            "spigot_next_digits": PI_HEARTBEAT.spigot.first_digits(6),
+            "state": PI_HEARTBEAT._public_state(),
+            "last": PI_HEARTBEAT.state.get("last"),
+        }
+
+    @app.post("/pi/heartbeat/start")
+    def pi_heartbeat_start(interval: float = Query(60.0, ge=1.0, le=3600)):
+        ok = PI_HEARTBEAT.start(interval=interval)
+        return {"started": ok, "running": PI_HEARTBEAT.is_running(),
+                "interval": PI_HEARTBEAT.interval}
+
+    @app.post("/pi/heartbeat/stop")
+    def pi_heartbeat_stop():
+        PI_HEARTBEAT.stop()
+        return {"running": PI_HEARTBEAT.is_running()}
+
+    @app.post("/pi/heartbeat/tick")
+    def pi_heartbeat_tick(n: int = Query(1, ge=1, le=50)):
+        """手动推进 n 拍（演示/调试用）。"""
+        return {"ticks": PI_HEARTBEAT.run_once(n=n)}
+
+
 def selftest():
     """验证 API 模型序列化 + 内存存储 + 后台线程 + SSE 流。"""
     import random
@@ -1958,6 +2002,10 @@ def selftest():
     print(f"✓ S29 奥卡姆剃刀化简(OckhamsRazor): 冗余 adc 剃落"
           f" · 复杂任务(并行+反馈)完整保留 · 去噪确定性等价判定 · /simplify 端点可用")
 
+    # S30: π 永动心跳（spigot 正确性 + f(π) 三动作覆盖 + 状态恒变 + 反馈闭环）
+    if pi_heartbeat_selftest is not None:
+        pi_heartbeat_selftest()
+
     print("\nserver.py 离线自检全部通过 ✓")
 
 
@@ -1972,6 +2020,9 @@ if __name__ == "__main__":
     if args.selftest:
         selftest()
     else:
+        if PI_HEARTBEAT is not None:
+            PI_HEARTBEAT.start(interval=60.0)  # 永动心跳：开机即启动
         print(f"circuit-agents API Server → http://{args.host}:{args.port}")
         print("端点: POST /run | GET /run/{id} | GET /run/{id}/stream | GET /health")
+        print("π 永动心跳: GET /pi/heartbeat | POST /pi/heartbeat/start|stop|tick")
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
