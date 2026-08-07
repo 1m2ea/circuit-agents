@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
+import sys
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -373,6 +376,17 @@ class Circuit:
         # 真实非空数据不受影响（零回归）。
         self.join_completeness = spec.get("join_completeness", True)
         # forward wires only (exclude the declared feedback edge)
+        self._build_graph()
+
+    def _build_graph(self):
+        """由 self.spec 重算 forward/succ/pred/components。
+
+        在线拓扑编辑（人在回路）后调用本方法，使活图与 spec 保持一致：
+        已执行节点的输出缓存在 executor.out 中，编辑只触及尚未执行的层，
+        下游节点重算时自然读到最新数据 —— 无需重跑已完成的节点。
+        """
+        spec = self.spec
+        self.components = spec["components"]
         self.forward = [w for w in spec["wires"]
                         if not (self.feedback
                                 and w == [self.feedback["from"], self.feedback["to"]])]
@@ -700,6 +714,11 @@ class CircuitExecutor:
         # ③ 多后端并行：透传 backend_map 到 Circuit
         self._backend_map = backend_map or {}
         self.circuit.backend_map = self._backend_map
+        # 在线拓扑编辑（人在回路）：暂停/恢复 + 运行时安全编辑状态
+        self._state = "idle"            # idle → running → paused → done
+        self._pause_requested = False
+        self._resume_event = threading.Event()
+        self._topology_dirty = False
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -834,6 +853,9 @@ class CircuitExecutor:
 
     def run(self):
         self._t0 = time.perf_counter()
+        self._state = "running"
+        self._pause_requested = False
+        self._topology_dirty = False
         out = {}
         layers = self.circuit.layers()
         # ③ 智能模型选型：执行前按复杂度/历史/约束微调电阻 model/skills
@@ -859,7 +881,9 @@ class CircuitExecutor:
                    nodes=len(self.circuit.components),
                    layers=len(layers))
 
-        for li, layer in enumerate(layers):
+        li = 0
+        while li < len(layers):
+            layer = layers[li]
             self._li = li
             self._emit("layer_start", layer_idx=li, nodes=list(layer))
             for cid in layer:
@@ -941,6 +965,22 @@ class CircuitExecutor:
                         pass
                 out[cid] = sig
             self._emit("layer_done", layer_idx=li)
+            li += 1
+            # ── 在线拓扑编辑检查点：完成当前并行层后，若请求暂停则安全暂停 ──
+            # 暂停发生在层与层之间，保证已完成的并行层原子性；恢复后若拓扑被编辑，
+            # 重算剩余层（已执行节点被跳过），新/修改节点的产出自然汇入下游数据流。
+            if self._pause_requested:
+                self._state = "paused"
+                self._emit("paused", after_layer=li - 1)
+                self._resume_event.wait()
+                self._resume_event.clear()
+                self._pause_requested = False
+                self._state = "running"
+                self._emit("resumed", after_layer=li - 1)
+                if self._topology_dirty:
+                    layers = self.circuit.layers()
+                    li = self._resume_index(layers, out)
+                    self._topology_dirty = False
 
         self._results = out
         terminals = [c for c in self.circuit.components if not self.circuit.succ[c]]
@@ -1039,6 +1079,7 @@ class CircuitExecutor:
                 mem.record(goal_desc, self.circuit.spec, result)
             except Exception:
                 pass
+        self._state = "done"
         return result
 
     # ---- ② 流式执行：逐节点 yield 结果（供 SSE/API 消费）----
@@ -1185,6 +1226,280 @@ class CircuitExecutor:
             "wires": [["src", "analyze"]],
         }
 
+    # ---- 在线拓扑编辑（人在回路）----
+    def pause(self):
+        """请求暂停：完成当前并行层后安全暂停。返回是否真的会暂停
+        （任务已 idle/done 则返回 False —— 无可暂停内容）。"""
+        if self._state in ("idle", "done"):
+            return False
+        self._pause_requested = True
+        self._state = "pausing"
+        return True
+
+    def resume(self):
+        """恢复执行（仅在 paused 态有效）。返回是否真的恢复。"""
+        if self._state != "paused":
+            return False
+        self._resume_event.set()
+        return True
+
+    def get_state(self):
+        """返回执行器当前状态快照，供 CLI/HTTP/UI 轮询。"""
+        return {
+            "state": self._state,
+            "paused": self._state == "paused",
+            "pause_requested": self._pause_requested,
+            "topology_dirty": self._topology_dirty,
+            "layers_done": getattr(self, "_li", 0),
+            "components": list(self.circuit.components.keys()),
+            "wires": [list(w) for w in self.circuit.spec.get("wires", [])],
+        }
+
+    def _resume_index(self, layers, out):
+        """重算后找到第一个「尚有未执行节点」的层，作为恢复起点。
+        已执行节点（在 out 中）所在的层被跳过，保证不被重跑。"""
+        for i, layer in enumerate(layers):
+            if any(c not in out for c in layer):
+                return i
+        return len(layers)
+
+    def edit(self, op, **kwargs):
+        """应用一次运行时安全编辑。op ∈ {insert, replace, append_parallel, set_gate}。
+
+        编辑就地作用于活图（self.circuit.spec），并置 _topology_dirty；
+        恢复执行时由 run() 的检查点重算剩余层，使改动生效。
+        约定：编辑应在 paused 态进行（保证只触及尚未执行的层），
+        但即便在 running 态调用也安全 —— 改动只会在下一个检查点生效。
+        """
+        editor = RuntimeTopologyEditor(self.circuit)
+        if op == "insert":
+            editor.insert_on_wire(kwargs["u"], kwargs["v"],
+                                  kwargs["new_cid"], kwargs["comp"])
+        elif op == "replace":
+            editor.replace_node(kwargs["cid"], kwargs["comp"])
+        elif op == "append_parallel":
+            editor.append_parallel(kwargs["cid"], kwargs["new_cid"], kwargs["comp"])
+        elif op == "set_gate":
+            editor.set_gate(kwargs["cid"], kwargs["threshold"])
+        else:
+            raise ValueError(f"未知编辑操作: {op}")
+        self._topology_dirty = True
+        self._emit("topology_edit", op=op,
+                   **{k: v for k, v in kwargs.items() if k != "comp"})
+        return {"op": op, "applied": True,
+                "components": list(self.circuit.components.keys())}
+
+
+class RuntimeTopologyEditor:
+    """在线拓扑编辑器：对运行中的 Circuit 做安全的结构性编辑。
+
+    四类安全操作（与用户设计的「运行时外科手术」一一对应）：
+      · insert_on_wire(u, v, new, comp)   在连线 u→v 上插入新处理步骤
+      · replace_node(cid, new_comp)       用不同技能/模型的节点替换现有节点（保留连线）
+      · append_parallel(cid, new, comp)   在某节点后追加与其并行的新处理支路
+      · set_gate(cid, threshold)          动态调整某 adc/verify 质量门的通过标准
+
+    一致性保证：编辑后调用 circuit._build_graph() 重建 succ/pred/forward，
+    活图与 spec 始终一致；已执行节点的输出留在 executor.out，下游自然读到最新数据。
+    """
+
+    SAFE_OPS = ("insert", "replace", "append_parallel", "set_gate")
+
+    def __init__(self, circuit):
+        self.circuit = circuit
+
+    def insert_on_wire(self, u, v, new_cid, comp):
+        spec = self.circuit.spec
+        if [u, v] not in [list(w) for w in spec["wires"]]:
+            # 容错：spec 中 wire 可能是 list，统一比对新/旧两种形态
+            if [u, v] not in spec["wires"]:
+                raise ValueError(f"连线 {u}->{v} 不存在，无法插入")
+        spec["components"][new_cid] = comp
+        spec["wires"].append([u, new_cid])
+        spec["wires"].append([new_cid, v])
+        spec["wires"].remove([u, v])
+        self.circuit._build_graph()
+        return new_cid
+
+    def replace_node(self, cid, new_comp):
+        spec = self.circuit.spec
+        if cid not in spec["components"]:
+            raise ValueError(f"节点 {cid} 不存在，无法替换")
+        merged = dict(spec["components"][cid])
+        merged.update(new_comp)          # 保留连线，仅替换组件定义
+        spec["components"][cid] = merged
+        self.circuit._build_graph()
+        return cid
+
+    def append_parallel(self, cid, new_cid, comp):
+        """在 cid 后追加并行支路：新节点以 cid 为前驱、以 cid 的下游为后继，
+        与原下游并行汇入（共享同一批后继输入）。"""
+        spec = self.circuit.spec
+        if cid not in spec["components"]:
+            raise ValueError(f"节点 {cid} 不存在，无法追加并行支路")
+        succs = [b for a, b in spec["wires"] if a == cid]
+        spec["components"][new_cid] = comp
+        spec["wires"].append([cid, new_cid])
+        for s in succs:
+            spec["wires"].append([new_cid, s])
+        self.circuit._build_graph()
+        return new_cid
+
+    def set_gate(self, cid, threshold):
+        spec = self.circuit.spec
+        comp = spec["components"].get(cid)
+        if comp is None or comp.get("type") not in ("adc", "verify"):
+            raise ValueError(f"{cid} 不是质量门节点（adc/verify），无法调阈值")
+        comp["threshold"] = float(threshold)
+        self.circuit._build_graph()
+        return cid
+
+
+class TopologyConsole:
+    """后台监听线程：从输入源读取指令，驱动运行中的 CircuitExecutor 做在线编辑。
+
+    两种输入源（可同时工作）：
+      · 程序化 feed(line)  —— 测试 / HTTP 注入（不阻塞）。
+      · sys.stdin 行读取   —— 终端交互（读不到时自动退出，不阻塞主执行）。
+
+    指令（大小写不敏感，参数形如 key=value 或位置参数）：
+      PAUSE                                 请求暂停（完成当前层后）
+      RESUME                                继续执行
+      STATUS                                打印状态快照
+      REPLACE <cid> WITH <type> [model=] [skill=] [prompt=] [label=]
+      INSERT <newcid> ON <u>-><v> [type=] [model=] [label=] [prompt=]
+      APPEND <newcid> PARALLEL <cid> [type=] [model=] [label=] [prompt=]
+      GATE <cid> THRESHOLD <float>          调整质量门阈值
+    """
+
+    def __init__(self, executor, instr=None):
+        self.exe = executor
+        self.instr = instr if instr is not None else sys.stdin
+        self._queue = queue.Queue()
+        self._thread = None
+        self._stop = threading.Event()
+
+    def feed(self, line):
+        """程序化注入一条指令（测试 / HTTP 用）。"""
+        self._queue.put(line)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            line = self._read_line()
+            if line is None:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.02)
+                continue
+            self.handle(line)
+
+    def _read_line(self):
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self.instr is sys.stdin:
+            try:
+                ln = self.instr.readline()
+                return ln.rstrip("\n") if ln else None
+            except Exception:
+                return None
+        return None
+
+    # ---- 指令解析 ----
+    @staticmethod
+    def _parse_kv(tokens):
+        """把 ['model=large', 'skill=web_search'] 解析为 dict；位置参数原样保留。"""
+        kv, pos = {}, []
+        for t in tokens:
+            if "=" in t and not t.startswith("="):
+                k, v = t.split("=", 1)
+                kv[k] = v
+            else:
+                pos.append(t)
+        return kv, pos
+
+    @staticmethod
+    def _build_comp(kv, pos, default_type="resistor"):
+        comp = {"type": kv.get("type", pos[0] if pos else default_type)}
+        if "model" in kv:
+            comp["model"] = kv["model"]
+        if "label" in kv:
+            comp["label"] = kv["label"]
+        if "skill" in kv:
+            comp["skill"] = kv["skill"]
+        if "prompt" in kv:
+            comp["prompt"] = kv["prompt"]
+        return comp
+
+    def handle(self, line):
+        line = (line or "").strip()
+        if not line:
+            return
+        parts = line.split()
+        cmd = parts[0].upper()
+        try:
+            if cmd == "PAUSE":
+                ok = self.exe.pause()
+                print(f"  [console] {'已请求暂停（完成当前层后生效）' if ok else '任务已结束，无需暂停'}")
+            elif cmd == "RESUME":
+                ok = self.exe.resume()
+                print(f"  [console] {'已恢复执行' if ok else '当前不在暂停态'}")
+            elif cmd == "STATUS":
+                print("  [console]", self.exe.get_state())
+            elif cmd == "REPLACE":
+                # REPLACE <cid> WITH <type> [kv...]
+                cid = parts[1]
+                if len(parts) < 3 or parts[2].upper() != "WITH":
+                    raise ValueError("REPLACE 语法: REPLACE <cid> WITH <type> [model=] [skill=] [prompt=]")
+                kv, _ = self._parse_kv(parts[3:])
+                comp = self._build_comp(kv, [])
+                self.exe.edit("replace", cid=cid, comp=comp)
+                print(f"  [console] 已替换节点 {cid} → {comp}")
+            elif cmd == "INSERT":
+                # INSERT <newcid> ON <u>-><v> [kv...]
+                new_cid = parts[1]
+                if len(parts) < 4 or parts[2].upper() != "ON":
+                    raise ValueError("INSERT 语法: INSERT <newcid> ON <u>-><v> [type=] [model=] [prompt=]")
+                edge = parts[3]
+                if "->" not in edge:
+                    raise ValueError("边需写成 u->v 形式")
+                u, v = edge.split("->", 1)
+                kv, _ = self._parse_kv(parts[4:])
+                comp = self._build_comp(kv, [])
+                self.exe.edit("insert", u=u, v=v, new_cid=new_cid, comp=comp)
+                print(f"  [console] 已在 {u}->{v} 上插入节点 {new_cid}")
+            elif cmd == "APPEND":
+                # APPEND <newcid> PARALLEL <cid> [kv...]
+                new_cid = parts[1]
+                if len(parts) < 4 or parts[2].upper() != "PARALLEL":
+                    raise ValueError("APPEND 语法: APPEND <newcid> PARALLEL <cid> [type=] [model=] [prompt=]")
+                cid = parts[3]
+                kv, _ = self._parse_kv(parts[4:])
+                comp = self._build_comp(kv, [])
+                self.exe.edit("append_parallel", cid=cid, new_cid=new_cid, comp=comp)
+                print(f"  [console] 已在 {cid} 后追加并行支路 {new_cid}")
+            elif cmd == "GATE":
+                # GATE <cid> THRESHOLD <float>
+                cid = parts[1]
+                if len(parts) < 4 or parts[2].upper() != "THRESHOLD":
+                    raise ValueError("GATE 语法: GATE <cid> THRESHOLD <0.0-1.0>")
+                thr = float(parts[3])
+                self.exe.edit("set_gate", cid=cid, threshold=thr)
+                print(f"  [console] 已调整质量门 {cid} 阈值为 {thr}")
+            else:
+                print(f"  [console] 未知指令: {cmd}（可用: PAUSE/RESUME/STATUS/REPLACE/INSERT/APPEND/GATE）")
+        except Exception as e:
+            print(f"  [console] 指令错误: {e}")
+
 
 def circuit_executor_selftest():
     """CircuitExecutor 离线自检（无 key/无网）：自动补数据闭环 + 动态技能派发。"""
@@ -1284,6 +1599,79 @@ def circuit_executor_selftest():
         "完整性检查应触发 B fail_linear → 执行器补 x → B ok"
     assert "x" in res3["state"]["_fetched"], "执行器应自动补到 x"
     print("✓ A 协同：电容完整性(空壳x)→ B fail_linear → 执行器自动补数 → B ok（端到端）")
+
+
+def runtime_topology_editor_selftest():
+    """在线拓扑编辑（人在回路）离线自检：真实线程暂停 → 编辑活图 → 恢复 → 动态汇合。
+
+    用 SlowBackend（每节点 sleep 30ms）制造可观测的暂停窗口；
+    流程：启动执行线程 → 立即 pause() → 等到 paused → 经 CLI 控制台 feed 四类编辑
+    → resume() → 等到 done → 断言编辑已生效且新节点产出汇入下游。
+    """
+    class SlowBackend(SimBackend):
+        def __init__(self):
+            super().__init__(random.Random(42))
+        def run(self, comp, inputs):
+            time.sleep(0.03)
+            return super().run(comp, inputs)
+
+    spec = {
+        "name": "editor_demo",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "research"},
+            "r1": {"type": "resistor", "label": "analyze", "model": "small"},
+            "adc": {"type": "adc", "label": "adc", "threshold": 0.8},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    ex = CircuitExecutor(Circuit(spec, SlowBackend()), verbose=False)
+    console = TopologyConsole(ex, instr=None).start()
+
+    import threading as _th
+    _done = _th.Event()
+    _result = {}
+
+    def _runner():
+        _result["res"] = ex.run()
+        _done.set()
+
+    _th.Thread(target=_runner, daemon=True).start()
+
+    # 1) 立即请求暂停，等到执行器真的暂停（完成第 0 层 src 后）
+    assert ex.pause(), "pause() 应返回 True（任务在运行）"
+    for _ in range(200):
+        if ex.get_state()["state"] == "paused":
+            break
+        time.sleep(0.01)
+    assert ex.get_state()["state"] == "paused", "执行器应在层间安全暂停"
+    print("✓ 可中断性：执行器在完成当前并行层后安全暂停（人在回路窗口已打开）")
+
+    # 2) 经 CLI 控制台 feed 四类运行时安全编辑
+    console.feed("INSERT src2 ON src->r1 type=resistor model=small")
+    console.feed("REPLACE r1 WITH resistor model=large label=analyze_v2")
+    console.feed("APPEND par1 PARALLEL r1 type=resistor model=small")
+    console.feed("GATE adc THRESHOLD 0.5")
+    time.sleep(0.1)  # 让控制台线程消费指令
+    st = ex.get_state()
+    assert "src2" in st["components"], "插入节点 src2 应出现在活图"
+    assert "par1" in st["components"], "并行支路 par1 应出现在活图"
+    assert ex.circuit.components["r1"]["model"] == "large", "r1 应被替换为 large 档"
+    assert ex.circuit.components["adc"]["threshold"] == 0.5, "adc 质量门阈值应改为 0.5"
+    print("✓ 运行时安全编辑：插入/替换/追加并行/调质量门 —— 四类手术均作用于活图")
+    console.stop()
+
+    # 3) 恢复执行
+    assert ex.resume(), "resume() 应在 paused 态返回 True"
+    _done.wait(timeout=10)
+    res = _result["res"]
+    out = res["components"]
+    assert "src2" in out, "插入节点 src2 应被执行并产出"
+    assert "par1" in out, "并行支路 par1 应被执行并产出"
+    assert res["success"], "编辑后拓扑应执行成功"
+    assert ex.circuit.components["adc"]["threshold"] == 0.5, "恢复的阈值应保留"
+    print(f"✓ 动态汇合：恢复后新/修改节点产出汇入下游，最终质量={res['final_quality']}，"
+          f"活图节点={sorted(ex.circuit.components.keys())}")
+    print("\n在线拓扑编辑（人在回路）离线自检全部通过 ✓")
 
 
 def circuit_executor_evolve_selftest():

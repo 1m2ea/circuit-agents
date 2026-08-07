@@ -150,6 +150,7 @@ app.add_middleware(
 # 内存存储（生产环境应换 SQLite/Redis）
 _runs: dict[str, dict] = {}
 _longtasks: dict[str, dict] = {}   # ⑦ 长周期任务实例表：id -> {task, status, goal, result, checkpoint, error}
+_topo_sessions: dict[str, dict] = {}  # 在线拓扑编辑会话：sid -> {executor, thread, done, result, error}
 _lock = threading.Lock()
 
 # 静态文件根目录
@@ -1298,6 +1299,110 @@ async def stream_run(run_id: str, request: Request):
     )
 
 
+# ──────────────────────────────────────────────────────────
+# 在线拓扑编辑（人在回路）：会话式暂停/编辑/恢复/查询
+# ──────────────────────────────────────────────────────────
+
+class TopologySessionRequest(BaseModel):
+    spec: dict
+    seed: int = Field(0, description="SimBackend 随机种子（确定性用）")
+    node_delay_ms: int = Field(0, description="每节点人为延迟(ms)，用于演示/仪表盘制造可暂停窗口")
+
+
+class TopologyEditRequest(BaseModel):
+    op: str                           # insert | replace | append_parallel | set_gate
+    u: Optional[str] = None
+    v: Optional[str] = None
+    cid: Optional[str] = None
+    new_cid: Optional[str] = None
+    comp: Optional[dict] = None
+    threshold: Optional[float] = None
+
+
+def _topo_session(sid: str):
+    with _lock:
+        s = _topo_sessions.get(sid)
+    if s is None:
+        raise HTTPException(404, "topology session not found")
+    return s
+
+
+@app.post("/topology/session")
+def topology_session(req: TopologySessionRequest):
+    """新建一个在线编辑会话：编译 spec → 起 CircuitExecutor 后台线程，返回会话 id。
+
+    客户端流程：pause →（edit×N）→ resume；期间可随时 GET /topology/state/{sid} 轮询。
+    """
+    import random as _rnd
+    import time as _tmod
+    from runtime import Circuit, CircuitExecutor, SimBackend
+    sid = uuid.uuid4().hex[:12]
+    _be = SimBackend(_rnd.Random(req.seed))
+    if req.node_delay_ms > 0:
+        # 演示/仪表盘用：人为给每节点加延迟，制造可观测的暂停窗口
+        _base_run = _be.run
+        def _delayed_run(comp, inputs):
+            _tmod.sleep(req.node_delay_ms / 1000.0)
+            return _base_run(comp, inputs)
+        _be.run = _delayed_run
+    ex = CircuitExecutor(Circuit(req.spec, _be), verbose=False)
+    done = threading.Event()
+    rec = {"executor": ex, "done": done, "result": None, "error": None,
+           "thread": None}
+
+    def _runner():
+        try:
+            rec["result"] = ex.run()
+        except Exception as e:  # 异常不拖崩宿主，记入会话
+            rec["error"] = str(e)
+        finally:
+            done.set()
+
+    rec["thread"] = threading.Thread(target=_runner, daemon=True)
+    rec["thread"].start()
+    with _lock:
+        _topo_sessions[sid] = rec
+    return {"session_id": sid, "state": ex.get_state()}
+
+
+@app.post("/topology/pause/{sid}")
+def topology_pause(sid: str):
+    rec = _topo_session(sid)
+    paused = rec["executor"].pause()
+    return {"session_id": sid, "paused": paused, "state": rec["executor"].get_state()}
+
+
+@app.post("/topology/edit/{sid}")
+def topology_edit(sid: str, req: TopologyEditRequest):
+    rec = _topo_session(sid)
+    try:
+        out = rec["executor"].edit(
+            req.op, u=req.u, v=req.v, cid=req.cid,
+            new_cid=req.new_cid, comp=req.comp, threshold=req.threshold)
+    except Exception as e:
+        raise HTTPException(400, f"编辑失败: {e}")
+    return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
+
+
+@app.post("/topology/resume/{sid}")
+def topology_resume(sid: str):
+    rec = _topo_session(sid)
+    resumed = rec["executor"].resume()
+    return {"session_id": sid, "resumed": resumed, "state": rec["executor"].get_state()}
+
+
+@app.get("/topology/state/{sid}")
+def topology_state(sid: str):
+    rec = _topo_session(sid)
+    st = rec["executor"].get_state()
+    st["done"] = rec["done"].is_set()
+    if rec["done"].is_set() and rec["error"] is None and rec["result"] is not None:
+        st["result"] = rec["result"]
+    if rec["error"] is not None:
+        st["error"] = rec["error"]
+    return st
+
+
 # asyncio.sleep 包装（避免底层依赖细节）
 def asyncio_sleep(seconds: float):
     import asyncio
@@ -2140,6 +2245,55 @@ def selftest():
         print(f"✓ S31 导师-学生训练电路(MentorTrain): 诊断「{_mres['diagnosis']}」"
               f" · 质量 {_mres['before_quality']}→{_mres['after_quality']} 门通过"
               f" · 固化 1 条 · 原spec未改 · 反例拒固化 · /mentor/train 端点可用")
+
+    # S32: 在线拓扑编辑（人在回路）端点接线 —— 直接调用端点函数验证请求模型/会话/编辑分发/404路径
+    _spec = {
+        "name": "s32_topo",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "a", "model": "small"},
+            "adc": {"type": "adc", "label": "adc", "threshold": 0.5},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    _sess = topology_session(TopologySessionRequest(spec=_spec))
+    _sid = _sess["session_id"]
+    assert _sid and _sess["state"]["state"] in ("running", "done"), "S32: 应建会话并启动"
+    # 等任务自然跑完（SimBackend 很快；无 required_inputs 不会触发网络补数）
+    import time as _t
+    for _ in range(500):
+        if topology_state(_sid)["done"]:
+            break
+        _t.sleep(0.01)
+    _st = topology_state(_sid)
+    assert _st["done"], "S32: 会话应执行完成"
+    assert _st["result"]["success"], "S32: 初始拓扑应执行成功"
+    # 编辑分发（对已完成会话编辑只作用于活图，验证端点把参数正确转给 executor.edit）
+    _ed = topology_edit(_sid, TopologyEditRequest(
+        op="replace", cid="r1", comp={"model": "large", "label": "a2"}))
+    assert _ed["edit"]["op"] == "replace" and "r1" in _ed["state"]["components"], \
+        "S32: /topology/edit 应正确分发 replace"
+    assert _topo_sessions[_sid]["executor"].circuit.components["r1"]["model"] == "large", \
+        "S32: replace 应作用到活图 r1"
+    # 编辑非法 op → 400
+    _raised = False
+    try:
+        topology_edit(_sid, TopologyEditRequest(op="frobnicate"))
+    except Exception:
+        _raised = True
+    assert _raised, "S32: 非法 op 应被拒绝(400)"
+    # 未知会话 → 404（pause/resume/state/edit 共用 _topo_session）
+    _nf = False
+    try:
+        topology_state("nope")
+    except Exception:
+        _nf = True
+    assert _nf, "S32: 未知会话应 404"
+    # pause/resume 对已结束会话为 no-op（返回 False，不抛）
+    assert topology_pause(_sid)["paused"] is False, "S32: 已结束会话 pause 应为 no-op"
+    assert topology_resume(_sid)["resumed"] is False, "S32: 已结束会话 resume 应为 no-op"
+    print("✓ S32 在线拓扑编辑(人在回路): /topology/session|pause|edit|resume|state 端点接线"
+          " · 会话创建/状态轮询/编辑分发/非法op拒/未知会话404 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
