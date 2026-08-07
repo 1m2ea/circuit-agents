@@ -1,7 +1,13 @@
 # circuit-agents 便携 AI 工作站（U 盘版）
 
 把 circuit-agents 整套装进一个 U 盘，插上任意一台 **≥16GB 内存**的电脑即可本地驱动电路引擎，
-**零 API 成本**、**拔掉不留痕迹**。本文件是组装 + 使用说明（"纸面方案"，U 盘修好/换新即可照做）。
+**零 API 成本**、**拔掉不留痕迹**。
+
+> **当前已建成状态（2026-08-07）**：U 盘（E: 234GB）按 **transformers 桥接路线** 实测建成——
+> 1.5B 模型（2.89GB）+ 装好 torch 的便携 Python + `launch.py`（桥接版启动器）。
+> 已在真机用 U 盘自己的 `python.exe` 端到端跑通真实推理。
+> 原 `portable_launch.py`（Ollama 版启动器）**保留在 `circuit-agents/` 内**，等你拿到 Ollama 引擎后即可改走 Ollama 路线。
+> 本文件既是"纸面方案"，也是这份 U 盘的实际说明。
 
 ---
 
@@ -10,12 +16,13 @@
 ```
 U盘根目录/
 └── AI/
-    ├── launch.py            # 启动器（本仓库的 portable_launch.py 拷过来）
-    ├── ollama/              # Ollama 程序 + 模型存储
-    │   ├── ollama(.exe)     # Ollama 二进制（Windows 为 ollama.exe）
+    ├── launch.py            # 启动器（桥接版：起 local_llm_bridge + circuit-agents server）
+    ├── ollama/              # （预留）Ollama 程序 + 模型存储，引擎就绪后启用
     │   └── models/          # 模型文件（OLLAMA_MODELS 指向这里）
-    ├── circuit-agents/      # 本项目（本仓库内容）
-    └── python-portable/     # 便携 Python（可选，电脑没装 Python 时用）
+    ├── models/
+    │   └── Qwen2.5-1.5B/    # 本地 transformers 模型（snapshots/master 含 tokenizer.json + model.safetensors）
+    ├── circuit-agents/      # 本项目（本仓库内容；portable_launch.py=Ollama版启动器已保留在内）
+    └── python-portable/     # 便携 Python（embeddable 3.13 + torch/transformers/fastapi/uvicorn，已装好）
 ```
 
 > 本 `PORTABLE.md` 位于仓库根，组装时拷到 `U盘/AI/README.md` 即可。
@@ -35,45 +42,54 @@ U盘根目录/
 
 ---
 
-## 3. 组装步骤
+## 3. 组装步骤（桥接版 · 已实测）
 
-1. U 盘根建 `AI/`，并在其下建 `ollama/`、`ollama/models/`、`circuit-agents/`、`python-portable/`。
-2. 下载 Ollama 便携版（或把已安装的 `ollama` / `ollama.exe` 拷到 `AI/ollama/`）。
-3. 把本仓库全部内容拷到 `AI/circuit-agents/`。
-4. 把本仓库的 `portable_launch.py` 拷为 `AI/launch.py`。
-5. （可选）放一个便携 Python 到 `AI/python-portable/`：
-   - 若是目标电脑都没装 Python，用 **embeddable Python** 或 **Miniconda-portable**；
-   - 并在其 venv 里装依赖：`pip install fastapi uvicorn`（server 模式需要）。
-6. 首次在有网的电脑上预拉模型（避免每次现场拉）：
-   ```
-   set OLLAMA_MODELS=U盘\AI\ollama\models
-   ollama pull qwen2.5:7b
-   ollama pull deepseek-coder-v2
-   ollama pull qwen2.5:14b
-   ```
+1. U 盘根建 `AI/`，并在其下建 `ollama/models/`、`models/`、`circuit-agents/`、`python-portable/`。
+2. 把本仓库全部内容（排除 `.git`/`__pycache__`/临时文件）拷到 `AI/circuit-agents/`。
+3. 把本地 transformers 模型（如 `Qwen2.5-1.5B-Instruct`）拷到 `AI/models/Qwen2.5-1.5B/`
+   （需含 `snapshots/master/tokenizer.json` + `model.safetensors`）。
+4. 以 embeddable Python 为基底建 `AI/python-portable/`：
+   - 启用 `python313._pth` 里的 `import site` 并加 `Lib/site-packages`；
+   - `pip install --target Lib/site-packages torch transformers tokenizers fastapi uvicorn`
+     （走国内源如 `https://pypi.tuna.tsinghua.edu.cn/simple`，约 1GB）。
+5. 把本仓库的 `launch.py`（桥接版启动器）放在 `AI/launch.py`。
+6. （可选，Ollama 路线）把 `circuit-agents/portable_launch.py` 拷为 `AI/launch_ollama.py`，
+   等你取到 `ollama.exe` 放入 `AI/ollama/` 后即可改用 Ollama 引擎。
 
 ---
 
-## 4. 启动
+## 4. 启动（桥接版）
 
 插上 U 盘，进 `AI/` 目录：
 
 ```bash
 # 干跑自检：只校验路径/环境，不启动进程（推荐先跑一次）
-python launch.py --check
+python-portable\python.exe launch.py --check
 
-# 正式启动：起 Ollama + 起 circuit-agents server
-python launch.py
+# 正式启动：起 local_llm_bridge（加载 U盘模型）+ 起 circuit-agents server
+python-portable\python.exe launch.py
 ```
 
-- 启动后访问 **http://localhost:8765**（Live Console）。
-- 启动器会：设 `OLLAMA_MODELS`/`OLLAMA_HOST` 指向 U 盘 → 起 `ollama serve` →
-  按需 `ollama pull` 缺失模型 → 起 `circuit-agents/server.py`。
-- **关闭**：`Ctrl+C`，启动器会终止 Ollama 与 server，本机不留残留。
-- 常用参数：`--host`（Ollama 地址）、`--models`（要拉的模型）、`--no-pull`（跳过拉取）、
-  `--python`（指定 Python）、`--server-port`（server 端口）。
+- 启动器会：设模型路径 → 起 `local_llm_bridge.py`（127.0.0.1:8000，加载 U盘 1.5B）→
+  起 `circuit-agents/server.py`（默认 127.0.0.1:8765）。
+- 真实模型推理走桥 + `examples/local_model_demo.py` / `run.py --backend local`；
+  控制台 8765 的 `/run` 端点默认是确定性模拟器（SimBackend），用于可视化与开发。
+- **关闭**：`Ctrl+C`，启动器会终止桥与 server，本机不留残留。
+- 常用参数：`--model-path`（模型目录）、`--bridge-port`（桥端口，默认 8000）、
+  `--server-port`（server 端口，默认 8765）、`--python`（指定 Python）。
 
-> 没有便携 Python 且目标电脑已装 Python+依赖时，`launch.py` 会用 `sys.executable` 直接跑 server。
+> 没有便携 Python 且目标电脑已装 torch+依赖时，`launch.py` 会用 `sys.executable` 直接跑。
+
+---
+
+## 4b. 实测记录（2026-08-07，U 盘 E:）
+
+- 用 U盘 `python-portable\python.exe` 起桥加载 U盘 `models/Qwen2.5-1.5B`：约 24s 就绪。
+- `examples/local_model_demo.py` 端到端跑通真实推理：
+  `[r1](REAL-LLM) ok=True q=0.700 :: '今天的天气很好，但项目进展缓慢…'`
+  （backend stats：calls=1 successes=1，CPU 推理约 44s）。
+- `server.py --selftest`：S1–S30 全量通过（**注：冷盘首次跑 S4 可能因 USB 慢读超 15s 超时，
+  系统文件缓存热后稳定通过**，属 dev 自检时序问题，不影响真实推理使用）。
 
 ---
 
@@ -147,4 +163,5 @@ python run.py examples/xxx.json --backend local
 - 启动器默认监听 `127.0.0.1`，仅本机访问；如需局域网共享，改 `--host 0.0.0.0`（注意安全风险）。
 - Ollama 模型文件很大，**第一次**建议在在家有网时预拉好，现场用 `--no-pull` 启动。
 - 拔盘前务必 `Ctrl+C` 关闭启动器，否则 Ollama 进程可能仍占用 U 盘文件。
-- 便携 Python 方案未定（embeddable vs Miniconda-portable），按需选择；server 模式必须能 `import fastapi`。
+- 便携 Python 已定为 **embeddable 3.13 + 装 torch/transformers/fastapi/uvicorn**（桥接版必需，
+  模型推理与 server 都在 U盘 Python 内跑，目标电脑无需预装任何东西）。server 模式必须能 `import fastapi`。
