@@ -35,8 +35,36 @@ except Exception:  # pragma: no cover
     PiHeartbeat = None
     pi_heartbeat_selftest = None
 
+# 导师-学生训练电路（Phase 3：强模型优化弱模型的外部电路结构，非知识蒸馏）
+try:
+    from mentor import (mentor_train_cycle, make_ollama_student,
+                        default_content_quality, MENTOR_MODEL, MENTOR_BASE)
+except Exception:  # pragma: no cover
+    mentor_train_cycle = None
+    make_ollama_student = None
+    default_content_quality = None
+    MENTOR_MODEL = MENTOR_BASE = None
+
+# 训练成果模板库（质量门通过的优化方案在此累积，供 π 心跳 / 后续编译复用）
+MENTOR_REGISTRY = []
+
+
+def _mentor_store():
+    """惰性拿 server 的 ExecutionStore（失败案例来源）。"""
+    try:
+        from execution_store import ExecutionStore
+        return ExecutionStore("executions.db")
+    except Exception:
+        return None
+
+
 # π 永动心跳实例（永动循环默认关闭，由 /pi/heartbeat/start 或启动参数开启）
-PI_HEARTBEAT = PiHeartbeat(interval=60.0) if PiHeartbeat else None
+# digit == 9 时拉起导师-学生训练：失败案例 → 导师优化 → 本地学生重跑 → 质量门 → 固化
+PI_HEARTBEAT = PiHeartbeat(
+    interval=60.0,
+    mentor_store=_mentor_store(),
+    mentor_registry=MENTOR_REGISTRY,
+) if PiHeartbeat else None
 
 # ──────────────────────────────────────────────────────────
 # 模型
@@ -1314,6 +1342,56 @@ if PI_HEARTBEAT is not None:
         return {"ticks": PI_HEARTBEAT.run_once(n=n)}
 
 
+# ──────────────────────────────────────────────────────────
+# S31 导师-学生训练电路：强模型优化弱模型的外部电路结构（非知识蒸馏）
+# ──────────────────────────────────────────────────────────
+
+class MentorTrainRequest(BaseModel):
+    quality_threshold: float = Field(0.8, ge=0.0, le=1.0,
+                                     description="质量门阈值（adc 语义）")
+    limit: int = Field(40, ge=1, le=500, description="回溯多少条历史找失败案例")
+    use_local_student: bool = Field(True, description="用本机 Ollama 7B 做学生重跑")
+    solidify: bool = Field(True, description="质量门通过时是否固化为可复用模板")
+
+
+if mentor_train_cycle is not None:
+    @app.post("/mentor/train")
+    def mentor_train(req: MentorTrainRequest):
+        """跑一步导师-学生训练闭环。
+
+        失败案例 → 导师(deepseek-reasoner)分析 → 应用优化 → 学生(本地7B)重跑
+        → 质量门 → 通过则固化模板。零数据零算力：只改外部电路结构，不动权重。
+        """
+        store = _mentor_store()
+        if store is None:
+            raise HTTPException(500, "execution_store 不可用")
+        student = None
+        if req.use_local_student and make_ollama_student is not None:
+            student = make_ollama_student()
+        try:
+            res = mentor_train_cycle(
+                store, student_backend=student,
+                quality_threshold=req.quality_threshold, limit=req.limit,
+                registry=MENTOR_REGISTRY, solidify=req.solidify,
+                quality_fn=default_content_quality,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"训练闭环失败: {type(e).__name__}: {e}")
+        res["mentor_model"] = MENTOR_MODEL
+        res["student"] = "ollama:local" if student is not None else "none(仅出方案)"
+        res["registry_size"] = len(MENTOR_REGISTRY)
+        return res
+
+    @app.get("/mentor/registry")
+    def mentor_registry_list():
+        """列出已固化的训练成果模板。"""
+        return {"count": len(MENTOR_REGISTRY),
+                "mentor_model": MENTOR_MODEL, "mentor_base": MENTOR_BASE,
+                "templates": [{"diagnosis": e.get("diagnosis"),
+                               "quality": e.get("quality")}
+                              for e in MENTOR_REGISTRY]}
+
+
 def selftest():
     """验证 API 模型序列化 + 内存存储 + 后台线程 + SSE 流。"""
     import random
@@ -2002,9 +2080,66 @@ def selftest():
     print(f"✓ S29 奥卡姆剃刀化简(OckhamsRazor): 冗余 adc 剃落"
           f" · 复杂任务(并行+反馈)完整保留 · 去噪确定性等价判定 · /simplify 端点可用")
 
-    # S30: π 永动心跳（spigot 正确性 + f(π) 三动作覆盖 + 状态恒变 + 反馈闭环）
+    # S30: π 永动心跳（spigot 正确性 + f(π) 四动作覆盖 + 状态恒变 + 反馈闭环）
     if pi_heartbeat_selftest is not None:
         pi_heartbeat_selftest()
+
+    # S31: 导师-学生训练电路（离线：注入式导师 + 注入式学生，不走网络/不调本地模型）
+    if mentor_train_cycle is not None:
+        import json as _mjson
+        import tempfile as _mtmp
+        from execution_store import ExecutionStore as _MStore
+        _mdb = os.path.join(_mtmp.mkdtemp(), "s31.db")
+        _mstore = _MStore(_mdb)
+        _mspec = {"name": "s31", "components": {
+            "pwr": {"type": "power", "label": "pwr"},
+            "ext": {"type": "resistor", "label": "extract", "model": "small",
+                    "capability": "extract", "produced_outputs": ["m"]},
+            "adc": {"type": "adc", "threshold": 0.8}},
+            "wires": [["pwr", "ext"], ["ext", "adc"]]}
+        _mstore.save("s31-fail", "抽取季度指标", "failed", _mspec, [],
+                     {"final_quality": 0.25, "failed_nodes": ["ext"]}, ["s31"])
+
+        def _s31_mentor(messages):
+            _plan = {"diagnosis": "ext 用 small 档，抽取能力不足",
+                     "node_fixes": [{"cid": "ext", "model": "large",
+                                     "prompt": "逐项抽取指标并输出结构化结果"}],
+                     "topology_ops": [], "rationale": "升档 + 明确指令提升抽取率"}
+            return {"choices": [{"message": {
+                "content": _mjson.dumps(_plan, ensure_ascii=False)}}]}
+
+        def _s31_student(_spec):
+            return {"final_quality": 0.7, "success": True, "failed_nodes": [],
+                    "outputs": {"pwr": "pwr", "adc": "0.9",
+                                "ext": "抽取结果：营收 1.2 亿，净利 1800 万，同比 +23%。"}}
+
+        _m_reg = []
+        _mres = mentor_train_cycle(_mstore, http_post=_s31_mentor,
+                                   student_rerun_fn=_s31_student,
+                                   registry=_m_reg,
+                                   quality_fn=default_content_quality)
+        assert _mres["ok"], "S31: 闭环应成功"
+        assert _mres["optimized_spec"]["components"]["ext"]["model"] == "large", \
+            "S31: 导师方案应把 ext 升到 large"
+        assert _mres["original_spec"]["components"]["ext"]["model"] == "small", \
+            "S31: 原 spec 不应被就地修改（深拷贝可回滚）"
+        # 只统计 resistor：pwr/adc 的元件语义值不应稀释内容质量
+        assert _mres["after_quality"] > 0.9, \
+            f"S31: 内容质量应只算 resistor，实际 {_mres['after_quality']}"
+        assert _mres["quality_gate_passed"], f"S31: {_mres['quality_gate_reason']}"
+        assert len(_m_reg) == 1, "S31: 通过后应固化 1 条模板"
+        # 反例：质量未提升则拒绝固化
+        _m_reg2 = []
+        _mres2 = mentor_train_cycle(
+            _mstore, http_post=_s31_mentor,
+            student_rerun_fn=lambda s: {"final_quality": 0.1, "success": False,
+                                        "failed_nodes": ["ext"], "outputs": {}},
+            registry=_m_reg2, quality_fn=default_content_quality)
+        assert not _mres2["quality_gate_passed"], "S31: 未提升应被质量门拒绝"
+        assert len(_m_reg2) == 0, "S31: 未过门不应固化"
+        print(f"✓ S31 导师-学生训练电路(MentorTrain): 诊断「{_mres['diagnosis']}」"
+              f" · 质量 {_mres['before_quality']}→{_mres['after_quality']} 门通过"
+              f" · 固化 1 条 · 原spec未改 · 反例拒固化 · /mentor/train 端点可用")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

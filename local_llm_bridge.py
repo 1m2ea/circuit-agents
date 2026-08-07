@@ -14,9 +14,16 @@
     GET  /health
 
 用法：
+    # 普通 transformers 模型（如 1.5B）
     python local_llm_bridge.py \
         --model-path "~/llm/models/models/Qwen--Qwen2.5-1.5B-Instruct" \
         --host 127.0.0.1 --port 8000 --offline
+
+    # GGUF 量化模型（如 7B-Q4，需另装纯 Python 的 gguf 库）
+    #   目录里放 *.gguf + 同目录的 tokenizer.json / config.json 即可自动识别
+    python local_llm_bridge.py \
+        --model-path "E:/AI/models/Qwen2.5-7B-GGUF" \
+        --host 127.0.0.1 --port 8001 --offline
 
 说明：
     - 桥忽略请求里的 ``model`` 字段，永远用启动时加载的模型生成（这样
@@ -57,18 +64,48 @@ def _resolve_model_dir(model_path):
     return model_path
 
 
+def _find_gguf(model_dir):
+    """若目录下含 .gguf 权重文件，返回文件名（优选最大的合并单文件）。否则 None。"""
+    try:
+        ggufs = [f for f in os.listdir(model_dir)
+                 if f.lower().endswith(".gguf")]
+    except OSError:
+        return None
+    if not ggufs:
+        return None
+    ggufs.sort(key=lambda f: os.path.getsize(os.path.join(model_dir, f)),
+               reverse=True)
+    return ggufs[0]
+
+
 def load_model(model_path, offline):
-    """加载本地 transformers 模型。重依赖延迟导入，便于 --help 不加载 torch。"""
+    """加载本地 transformers 模型。重依赖延迟导入，便于 --help 不加载 torch。
+
+    支持两种权重布局：
+      - 普通 transformers 目录（含 config.json / tokenizer.json / *.safetensors）
+      - GGUF 目录（含 *.gguf + 同目录的 tokenizer.json / config.json）
+        —— 需额外安装纯 Python 的 ``gguf`` 库（transformers 读 GGUF 依赖它）。
+    """
+    global MODEL_ID
     if offline:
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
     model_path = _resolve_model_dir(model_path)
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    print(f"[bridge] loading {model_path} ...", flush=True)
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype="auto", trust_remote_code=True
-    )
+    gguf_name = _find_gguf(model_path)
+    if gguf_name:
+        print(f"[bridge] GGUF 权重检测: {gguf_name} -> 走 gguf_file 加载", flush=True)
+        MODEL_ID = "qwen2.5-7b-gguf"
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, gguf_file=gguf_name, torch_dtype="auto",
+            trust_remote_code=True
+        )
+    else:
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype="auto", trust_remote_code=True
+        )
     model.eval()
     try:
         import torch

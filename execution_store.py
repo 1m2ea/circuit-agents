@@ -125,6 +125,26 @@ class ExecutionStore:
                 for r in rows
             ]
 
+    def list_by_status(self, status: str, limit: int = 20) -> list[dict]:
+        """按状态过滤列出执行记录（摘要，供『导师-学生训练电路』取失败案例）。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT run_id, goal, status, created_at, finished_at, tags
+                   FROM executions WHERE status = ? ORDER BY created_at DESC LIMIT ?""",
+                (status, limit),
+            ).fetchall()
+            return [
+                {
+                    "run_id": r["run_id"],
+                    "goal": r["goal"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
+                    "finished_at": r["finished_at"],
+                    "tags": json.loads(r["tags"]),
+                }
+                for r in rows
+            ]
+
     def delete(self, run_id: str) -> bool:
         """删除一条记录。返回是否实际删除了行。"""
         with self._connect() as conn:

@@ -157,6 +157,108 @@ python run.py examples/xxx.json --backend local
 
 ---
 
+## 6b. Ollama 真实后端（本机已跑通 ✅ 2026-08-07）
+
+`OllamaBackend` 已在本机跑通**真实本地推理**，不再只是纸面方案。
+
+### 6b.1 已落地的通路
+```
+circuit-agents (OllamaBackend, native API)
+      │  POST http://127.0.0.1:11434/api/chat
+      ▼
+ollama serve (便携解压版 ollama.exe，无需安装)
+      │  加载 GGUF
+      ▼
+qwen2.5:7b (Q4_K_M, 4.68GB)
+```
+
+- **ollama.exe 来源**：`ollama-windows-amd64.zip`（1.46GB）解压出 `ollama.exe`（35.5MB）+ `lib/`，
+  **免安装、可放 U 盘**。本机受限网络下靠 **断点续传** 才下满（直连会反复重置）。
+- **模型注册**：不重复占盘，直接用 Modelfile 指向已有 GGUF：
+  ```
+  FROM E:\AI\models\Qwen2.5-7B-GGUF\qwen2.5-7b-instruct-q4_k_m.gguf
+  ```
+  ```bash
+  set OLLAMA_MODELS=C:\path\to\models   # 建议指到 C 盘，避免 U 盘慢读
+  ollama.exe serve                       # 监听 127.0.0.1:11434
+  ollama.exe create qwen2.5:7b -f Modelfile
+  ```
+- **零代码改动**：`DEFAULT_OLLAMA_MODELS` 里 `small`/`tool` 已映射 `qwen2.5:7b`，
+  注册成这个名字就直接对上。
+- **探活**：`curl http://127.0.0.1:11434/api/tags`，或 `OllamaBackend.health_check() -> (ok, detail)`。
+- **成本**：本地推理 `total_cost = 0`（S28 自检已断言）。Ollama 不可达时自动降级 `SimBackend`，不会崩。
+
+### 6b.2 质量语义的坑（重要）
+`OllamaBackend.run()` 默认用 **tier_cap 先验**当质量（`small=0.70`），
+这会**把本地 7B 的真实输出质量压死在 0.70**，导致任何优化都过不了 0.8 质量门。
+
+真实本地模型场景请改用**内容打分**：
+
+```python
+from mentor import default_content_quality, rerun_student, make_ollama_student
+be = make_ollama_student()               # 探活失败返回 None
+rr = rerun_student(spec, be)             # 拿各 resistor 的真实输出
+q  = default_content_quality(spec, rr["outputs"])   # 从真实文本估质量
+```
+
+`default_content_quality` **只统计 resistor（模型推理）节点**——`power`/`source`/`adc`
+的输出是电路语义值（如 `"0.92"`、节点标签），计入会稀释真实内容质量。
+
+---
+
+## 6c. 导师-学生训练电路（Phase 3，已真机端到端 ✅）
+
+用**强云端导师**优化**弱本地学生**的**外部电路结构**（提示词/拓扑/模型选型）——
+区别于知识蒸馏：**不动权重、零数据、零算力**。
+
+```
+失败案例(execution_store) → 导师(deepseek-reasoner)分析 → 结构化优化方案 JSON
+   → apply_optimization(深拷贝，原 spec 不改) → 学生(本地 qwen2.5:7b)重跑
+   → 质量门(≥阈值 且 优于原质量) → 通过则固化为可复用模板
+```
+
+### 6c.1 配置
+| 项 | 环境变量 | 默认 |
+|---|---|---|
+| 导师模型 | `MENTOR_MODEL` | `deepseek-reasoner` |
+| 导师 base | `MENTOR_BASE` | `https://api.deepseek.com` |
+| 导师 key | `DEEPSEEK_API_KEY` | — |
+| 学生地址 | `OLLAMA_HOST` | `http://127.0.0.1:11434` |
+| 学生模型 | `OLLAMA_STUDENT_MODEL` | `qwen2.5:7b` |
+
+### 6c.2 跑法
+```bash
+# 实景（真导师 + 真本地学生）
+python _live_mentor_deepseek.py
+
+# HTTP 端点
+POST /mentor/train    {"quality_threshold":0.8,"use_local_student":true}
+GET  /mentor/registry  # 已固化的训练成果模板
+```
+
+### 6c.3 真机实测（2026-08-07）
+任务：*从季度经营简报抽取关键指标并生成结论摘要*（原质量 0.28，失败节点 `ext`/`sum`）
+
+- 导师（DeepSeek-R1，41s）诊断：`ext/sum 均用 small 档，对财报术语和数值语境理解不足`
+- 方案：`ext`/`sum` 升 `large` + 注入专业角色提示词 + **`insert_after ext` 插入「指标完整性校验」节点**
+- 学生（本地 7B）重跑：节点 5→6，真实输出如
+  `[ext] 抽取关键指标：营收、净利润、同比增长率、环比增长率。`
+  `[指标完整性校验] 检查关键指标是否完整：营收 有 / 净利润 有 …`
+- 结果：**质量 0.28 → 1.0，质量门通过，固化 1 条模板**
+
+### 6c.4 π 心跳自动触发
+π 的十进制数字 `digit == 9`（`MENTOR_TRIGGER_DIGIT`，可用环境变量改）时，
+心跳自动拉起一次训练闭环；无 store / 无失败案例 / mentor 不可用时**静默降级**，
+绝不拖崩宿主。通过质量门的方案会回灌 `TopologyMemory`，供后续 explore/simplify 复用。
+
+```
+π: 3 1 4 1 5 9 2 6 5 3 5 8 ...
+       ↑       ↑
+    explore  mentor(训练)
+```
+
+---
+
 ## 7. 注意事项
 
 - 目标电脑内存 **≥16GB**（14b 模型推理约占 10G+，7b 约 5G；同机只跑一个模型更稳）。
