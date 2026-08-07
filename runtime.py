@@ -1237,11 +1237,18 @@ class CircuitExecutor:
         return True
 
     def resume(self):
-        """恢复执行（仅在 paused 态有效）。返回是否真的恢复。"""
-        if self._state != "paused":
-            return False
-        self._resume_event.set()
-        return True
+        """恢复执行。在 paused / pausing 态都置位恢复事件（幂等，避免竞态卡死）。
+
+        pause() 先把 _state 置为 "pausing" 并立即返回，执行器要到下一个层间检查点
+        才真正进入 "paused"。若 resume() 在此窗口内被调用，必须仍置位 _resume_event，
+        否则检查点会永久阻塞在 wait() 上 → 任务卡死在 paused。
+        """
+        if self._state in ("pausing", "paused"):
+            self._resume_event.set()
+            if self._state == "paused":
+                self._state = "running"
+            return True
+        return False
 
     def get_state(self):
         """返回执行器当前状态快照，供 CLI/HTTP/UI 轮询。"""
@@ -1251,6 +1258,8 @@ class CircuitExecutor:
             "pause_requested": self._pause_requested,
             "topology_dirty": self._topology_dirty,
             "layers_done": getattr(self, "_li", 0),
+            "current_layer": getattr(self, "_li", 0),
+            "done_nodes": list(self._results.keys()),   # 已完成节点（供仪表盘着色）
             "components": list(self.circuit.components.keys()),
             "wires": [list(w) for w in self.circuit.spec.get("wires", [])],
         }
@@ -1671,6 +1680,21 @@ def runtime_topology_editor_selftest():
     assert ex.circuit.components["adc"]["threshold"] == 0.5, "恢复的阈值应保留"
     print(f"✓ 动态汇合：恢复后新/修改节点产出汇入下游，最终质量={res['final_quality']}，"
           f"活图节点={sorted(ex.circuit.components.keys())}")
+
+    # 4) 竞态守护：pause() 后立即 resume()（不等待进入 paused），执行器不得卡死
+    ex2 = CircuitExecutor(Circuit(spec, SlowBackend()), verbose=False)
+    _d2 = _th.Event(); _r2 = {}
+    def _r2_run():
+        _r2["res"] = ex2.run(); _d2.set()
+    _th.Thread(target=_r2_run, daemon=True).start()
+    assert ex2.pause(), "pause() 应返回 True"
+    assert ex2.resume(), "pause 后立即 resume() 不得因竞态窗口返回 False/卡死"
+    _d2.wait(timeout=10)
+    assert ex2.get_state()["state"] == "done", \
+        "pause→立即resume 不应卡在 paused（竞态修复验证）"
+    assert _r2["res"]["success"], "竞态恢复后拓扑应执行成功"
+    print("✓ 竞态守护：pause()→立即resume() 不卡死（pausing 窗口幂等置位恢复事件）")
+
     print("\n在线拓扑编辑（人在回路）离线自检全部通过 ✓")
 
 

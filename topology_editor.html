@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电路拓扑 · 人在回路编辑器</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161c24; --panel2:#1d2530; --line:#2a3441;
+    --txt:#e6edf3; --muted:#8b97a6; --accent:#4c9aff; --accent2:#7c5cff;
+    --green:#2ec27e; --amber:#f5a623; --red:#ff5d5d; --gray:#46525f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft Yahei",sans-serif;
+       background:var(--bg);color:var(--txt);display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  header{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);
+         border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.5px}
+  header .sub{color:var(--muted);font-size:12px}
+  input,select,button{font:inherit;color:var(--txt);background:var(--panel2);
+         border:1px solid var(--line);border-radius:7px;padding:6px 9px;outline:none}
+  input[type=text]{min-width:170px}
+  button{cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+  button.warn{background:#3a2a12;border-color:var(--amber);color:var(--amber)}
+  .badge{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;border:1px solid var(--line)}
+  .b-idle{background:#222c38;color:var(--muted)}
+  .b-running{background:#0f2e1c;color:var(--green);border-color:var(--green)}
+  .b-paused{background:#3a2a12;color:var(--amber);border-color:var(--amber)}
+  .b-done{background:#10243a;color:var(--accent);border-color:var(--accent)}
+  main{flex:1;display:flex;min-height:0}
+  #canvas-wrap{flex:1;position:relative;overflow:auto;background:
+       radial-gradient(circle at 1px 1px, #1b232e 1px, transparent 0) 0 0/22px 22px}
+  svg{display:block}
+  .side{width:320px;background:var(--panel);border-left:1px solid var(--line);
+        display:flex;flex-direction:column;min-height:0}
+  .side .sec{padding:12px 14px;border-bottom:1px solid var(--line)}
+  .side .sec h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin:0 0 8px}
+  .palette{display:flex;flex-wrap:wrap;gap:6px}
+  .palette button{font-size:12px;padding:5px 9px}
+  .inspector label{display:block;font-size:12px;color:var(--muted);margin:8px 0 3px}
+  .inspector .row{display:flex;gap:6px}
+  #log{flex:1;overflow:auto;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
+       padding:10px 14px;color:var(--muted);white-space:pre-wrap}
+  #log b{color:var(--txt)}
+  .hint{color:var(--amber);font-size:12px;min-height:16px;margin-left:6px}
+  /* SVG node */
+  .node{cursor:pointer}
+  .node rect{fill:var(--panel2);stroke:var(--line);stroke-width:1.5}
+  .node.sel rect{stroke:var(--accent);stroke-width:2.5}
+  .node.edited rect{stroke:var(--accent2);stroke-dasharray:5 3}
+  .node.done rect{fill:#13301f;stroke:var(--green)}
+  .node.active rect{stroke:var(--amber);stroke-width:2.5}
+  .node text{fill:var(--txt);font-size:12px;pointer-events:none}
+  .node .t-type{fill:var(--muted);font-size:10px}
+  .edge{stroke:var(--gray);stroke-width:1.6;fill:none}
+  .edge.hl{stroke:var(--amber);stroke-width:2.4}
+  .legend{position:absolute;left:12px;bottom:12px;background:rgba(22,28,36,.85);
+          border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:11px;color:var(--muted)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ 拓扑编辑器</h1><span class="sub">人在回路 · 执行中动态外科手术</span>
+  <input type="text" id="server" value="http://127.0.0.1:8765" title="circuit-agents server 地址">
+  <select id="preset">
+    <option value="demo">示例：双检索→合并→质量门</option>
+    <option value="research">研究：检索→抽取→校验→摘要</option>
+  </select>
+  <button class="primary" id="btn-start">启动会话</button>
+  <button id="btn-pause" disabled>⏸ 暂停</button>
+  <button id="btn-resume" disabled>▶ 恢复</button>
+  <span id="badge" class="badge b-idle">idle</span>
+  <span class="hint" id="hint"></span>
+</header>
+<main>
+  <div id="canvas-wrap">
+    <svg id="svg" width="1200" height="700"></svg>
+    <div class="legend">
+      <div><i style="background:var(--accent2)"></i>已人工编辑</div>
+      <div><i style="background:var(--green)"></i>已完成</div>
+      <div><i style="background:var(--amber)"></i>执行中</div>
+      <div><i style="background:var(--gray)"></i>未执行</div>
+    </div>
+  </div>
+  <div class="side">
+    <div class="sec">
+      <h2>面板 · 插入新节点</h2>
+      <div class="palette">
+        <button data-insert="resistor">+ 处理节点</button>
+        <button data-insert="extract">+ 抽取</button>
+        <button data-insert="verify">+ 校验</button>
+        <button data-insert="adc">+ 质量门</button>
+      </div>
+      <div class="hint" id="ins-hint">点面板按钮 → 点源节点(u) → 点目标节点(v) 即在连线插入</div>
+    </div>
+    <div class="sec inspector" id="inspector">
+      <h2>节点检查器</h2>
+      <div id="ins-empty" style="color:var(--muted);font-size:13px">点击画布中的任意节点以查看 / 修改属性。</div>
+      <div id="ins-body" style="display:none">
+        <div style="font-weight:600" id="ins-id"></div>
+        <div class="t-type" id="ins-type"></div>
+        <label>标签 label</label>
+        <input type="text" id="ins-label" style="width:100%">
+        <label>模型 model（resistor 可换档）</label>
+        <select id="ins-model">
+          <option value="small">small（小模型）</option>
+          <option value="tool">tool（工具模型）</option>
+          <option value="large">large（强模型）</option>
+        </select>
+        <label id="ins-gate-label" style="display:none">质量门阈值 threshold</label>
+        <input type="range" id="ins-gate" min="0" max="1" step="0.05" value="0.8" style="display:none;width:100%">
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="ins-replace" style="flex:1">替换（换档/改名）</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button id="ins-append" style="flex:1">↔ 在其后追加并行支路</button>
+        </div>
+      </div>
+    </div>
+    <div class="sec" style="flex:1;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
+      <h2>事件流</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+let S = {
+  base:"http://127.0.0.1:8765", sid:null, spec:null,
+  pos:{}, selected:null, edited:new Set(),
+  insertType:null, insertU:null,
+  pollTimer:null, done:false
+};
+
+const PRESETS = {
+  demo:{
+    name:"双检索合并",
+    components:{
+      src:{type:"power",label:"任务"},
+      r1:{type:"resistor",label:"检索A",model:"small",produced_outputs:["a"]},
+      r2:{type:"resistor",label:"检索B",model:"small",produced_outputs:["b"]},
+      sum:{type:"resistor",label:"合并摘要",model:"small",produced_outputs:["s"]},
+      adc:{type:"adc",label:"质量门",threshold:0.8}
+    },
+    wires:[["src","r1"],["src","r2"],["r1","sum"],["r2","sum"],["sum","adc"]]
+  },
+  research:{
+    name:"研究链路",
+    components:{
+      src:{type:"power",label:"课题"},
+      ret:{type:"resistor",label:"检索",model:"small",produced_outputs:["r"]},
+      ext:{type:"resistor",label:"抽取",model:"small",produced_outputs:["e"]},
+      vfy:{type:"verify",label:"校验",threshold:0.8},
+      sum:{type:"resistor",label:"综述",model:"small",produced_outputs:["s"]},
+      adc:{type:"adc",label:"质量门",threshold:0.8}
+    },
+    wires:[["src","ret"],["ret","ext"],["ext","vfy"],["vfy","sum"],["sum","adc"]]
+  }
+};
+
+function log(msg,cls){const d=$("log");const t=document.createElement("div");
+  t.innerHTML=(cls?`<b>${msg}</b>`:msg);d.appendChild(t);d.scrollTop=d.scrollHeight;}
+function hint(msg){$("hint").textContent=msg||"";}
+
+async function api(path,body){
+  const url=S.base+path;
+  const opt={method:body?"POST":"GET",headers:{"Content-Type":"application/json"}};
+  if(body) opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt);
+  if(!r.ok){const t=await r.text();throw new Error(r.status+" "+t);}
+  return r.json();
+}
+
+// ── 布局：拓扑分层（Kahn）──
+function layers(){
+  const comps=S.spec.components, wires=S.spec.wires;
+  const indeg={}, succ={};
+  for(const c in comps){indeg[c]=0;succ[c]=[];}
+  for(const [u,v] of wires){succ[u].push(v);indeg[v]=(indeg[v]||0)+1;}
+  const layer={}; let q=Object.keys(comps).filter(c=>indeg[c]===0);
+  q.forEach(c=>layer[c]=0);
+  let guard=0;
+  while(q.length && guard++<999){
+    const nq=[];
+    for(const u of q) for(const v of succ[u]){
+      layer[v]=Math.max(layer[v]||0,layer[u]+1);
+      if(--indeg[v]===0) nq.push(v);
+    }
+    q=nq;
+  }
+  for(const c in comps) if(layer[c]===undefined) layer[c]=0;
+  return layer;
+}
+
+function render(){
+  const svg=$("svg"); svg.innerHTML="";
+  const L=layers();
+  const byL={};
+  for(const c in L){ (byL[L[c]]=byL[L[c]]||[]).push(c); }
+  const colW=200, rowH=92, ox=70, oy=50;
+  let maxL=0; for(const c in L) maxL=Math.max(maxL,L[c]);
+  // 计算位置（拖拽覆盖优先）
+  const pos={};
+  for(let lvl=0;lvl<=maxL;lvl++){
+    const arr=byL[lvl]||[];
+    arr.forEach((c,i)=>{
+      if(S.pos[c]) pos[c]=S.pos[c];
+      else pos[c]={x:ox+lvl*colW, y:oy+i*rowH};
+    });
+  }
+  S._pos=pos;
+  // defs arrow
+  const defs=document.createElementNS(SVGNS,"defs");
+  defs.innerHTML=`<marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3"
+     orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,3 L0,6 Z" fill="#46525f"/></marker>`;
+  svg.appendChild(defs);
+  // 边
+  for(const [u,v] of S.spec.wires){
+    const a=pos[u], b=pos[v]; if(!a||!b) continue;
+    const x1=a.x+130,y1=a.y+26,x2=b.x,y2=b.y+26;
+    const p=document.createElementNS(SVGNS,"path");
+    const mx=(x1+x2)/2;
+    p.setAttribute("d",`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
+    p.setAttribute("class","edge"); p.setAttribute("marker-end","url(#arw)");
+    svg.appendChild(p);
+  }
+  // 节点
+  for(const c in S.spec.components){
+    const comp=S.spec.components[c]; const p=pos[c]; if(!p) continue;
+    const g=document.createElementNS(SVGNS,"g");
+    g.setAttribute("class","node"+(S.selected===c?" sel":"")+(S.edited.has(c)?" edited":""));
+    g.setAttribute("transform",`translate(${p.x},${p.y})`);
+    g.dataset.id=c;
+    const rect=document.createElementNS(SVGNS,"rect");
+    rect.setAttribute("width",130);rect.setAttribute("height",52);rect.setAttribute("rx",9);
+    g.appendChild(rect);
+    const t1=document.createElementNS(SVGNS,"text");
+    t1.setAttribute("x",10);t1.setAttribute("y",20);t1.textContent=comp.label||c;
+    g.appendChild(t1);
+    const t2=document.createElementNS(SVGNS,"text");
+    t2.setAttribute("class","t-type");t2.setAttribute("x",10);t2.setAttribute("y",38);
+    t2.textContent=(comp.type==="resistor"?("resistor · "+ (comp.model||"small")):comp.type)+(comp.threshold!==undefined?` · θ=${comp.threshold}`:"");
+    g.appendChild(t2);
+    g.addEventListener("click",()=>onNodeClick(c));
+    g.addEventListener("mousedown",ev=>startDrag(ev,c));
+    svg.appendChild(g);
+  }
+}
+
+function markState(st){
+  // 节点着色：done_nodes→green；current_layer 层→active
+  const done=new Set(st.done_nodes||[]);
+  const L=layers(); const cl=st.current_layer||0;
+  const active=new Set();
+  for(const c in L) if(L[c]===cl && !done.has(c) && st.state==="running") active.add(c);
+  document.querySelectorAll(".node").forEach(g=>{
+    const c=g.dataset.id;
+    g.classList.remove("done","active");
+    if(done.has(c)) g.classList.add("done");
+    else if(active.has(c)) g.classList.add("active");
+  });
+}
+
+// ── 拖拽重排（仅视觉）──
+let drag=null;
+function startDrag(ev,c){
+  ev.preventDefault();
+  const g=ev.currentTarget;
+  const m=ev; drag={c,g,sx:m.clientX,sy:m.clientY,ox:S.pos[c]?S.pos[c].x:S._pos[c].x,oy:S.pos[c]?S.pos[c].y:S._pos[c].y};
+  window.addEventListener("mousemove",onDrag);
+  window.addEventListener("mouseup",endDrag);
+}
+function onDrag(ev){
+  if(!drag) return;
+  S.pos[drag.c]={x:drag.ox+(ev.clientX-drag.sx), y:drag.oy+(ev.clientY-drag.sy)};
+  drag.g.setAttribute("transform",`translate(${drag.ox+(ev.clientX-drag.sx)},${drag.oy+(ev.clientY-drag.sy)})`);
+}
+function endDrag(){drag=null;window.removeEventListener("mousemove",onDrag);window.removeEventListener("mouseup",endDrag);}
+
+// ── 节点点击 ──
+function onNodeClick(c){
+  if(S.insertType){ // 插入流程
+    if(!S.insertU){ S.insertU=c; hint("已选源节点 "+c+" → 再点目标节点(v)"); return; }
+    const u=S.insertU, v=c;
+    if(u===v){hint("源和目标不能相同");return;}
+    insertBetween(u,v,S.insertType);
+    S.insertType=null; S.insertU=null;
+    return;
+  }
+  S.selected=c; render(); showInspector(c);
+}
+
+function showInspector(c){
+  const comp=S.spec.components[c];
+  $("ins-empty").style.display="none"; $("ins-body").style.display="block";
+  $("ins-id").textContent=c; $("ins-type").textContent="type: "+comp.type;
+  $("ins-label").value=comp.label||"";
+  $("ins-model").value=comp.model||"small";
+  $("ins-model").disabled=(comp.type!=="resistor");
+  const isGate=(comp.type==="adc"||comp.type==="verify");
+  $("ins-gate").style.display=isGate?"block":"none";
+  $("ins-gate-label").style.display=isGate?"block":"none";
+  if(isGate) $("ins-gate").value=comp.threshold??0.8;
+  S.selected=c;
+}
+
+// ── 编辑操作（自动先暂停以保证只动未执行层）──
+async function ensurePaused(){
+  const st=await api("/topology/state/"+S.sid);
+  if(st.state==="running"){ await api("/topology/pause/"+S.sid); log("已自动暂停（保证编辑只作用于未执行层）"); }
+}
+function newComp(type){
+  if(type==="adc") return {type:"adc",label:"质量门",threshold:0.8};
+  if(type==="verify") return {type:"verify",label:"校验",threshold:0.8};
+  if(type==="extract") return {type:"resistor",label:"抽取",model:"small",produced_outputs:["o"]};
+  return {type:"resistor",label:"处理",model:"small",produced_outputs:["o"]};
+}
+async function insertBetween(u,v,type){
+  const cid="ins_"+(Object.keys(S.spec.components).length+1)+"_"+type;
+  const comp=newComp(type);
+  await ensurePaused();
+  const r=await api("/topology/edit/"+S.sid,{op:"insert",u,v,new_cid:cid,comp});
+  // 本地镜像
+  S.spec.components[cid]=comp;
+  S.spec.wires=S.spec.wires.filter(w=>!(w[0]===u&&w[1]===v));
+  S.spec.wires.push([u,cid],[cid,v]);
+  S.edited.add(cid); S.selected=cid;
+  log(`插入节点 <b>${cid}</b>（${type}）于 ${u}→${v}`);
+  render(); showInspector(cid); updateButtons(r);
+}
+async function replaceNode(){
+  const c=S.selected; if(!c) return;
+  const comp={label:$("ins-label").value,
+    model:$("ins-model").value};
+  if(S.spec.components[c].type==="adc"||S.spec.components[c].type==="verify")
+    comp.threshold=parseFloat($("ins-gate").value);
+  await ensurePaused();
+  const r=await api("/topology/edit/"+S.sid,{op:"replace",cid:c,comp});
+  Object.assign(S.spec.components[c],comp);
+  S.edited.add(c); log(`替换节点 <b>${c}</b> → model=${comp.model||"?"} label=${comp.label}`);
+  render(); showInspector(c); updateButtons(r);
+}
+async function appendParallel(){
+  const c=S.selected; if(!c) return;
+  const type="resistor";
+  const cid="par_"+(Object.keys(S.spec.components).length+1);
+  const comp=newComp(type); comp.label="并行支路";
+  await ensurePaused();
+  const r=await api("/topology/edit/"+S.sid,{op:"append_parallel",cid:c,new_cid:cid,comp});
+  S.spec.components[cid]=comp;
+  S.spec.wires.push([c,cid]);
+  for(const [a,b] of S.spec.wires.slice()) if(a===c&&b!==cid) S.spec.wires.push([cid,b]);
+  S.edited.add(cid); S.selected=cid;
+  log(`追加并行支路 <b>${cid}</b> 于 ${c} 之后`);
+  render(); showInspector(cid); updateButtons(r);
+}
+async function setGate(){
+  const c=S.selected; if(!c) return;
+  const th=parseFloat($("ins-gate").value);
+  await ensurePaused();
+  const r=await api("/topology/edit/"+S.sid,{op:"set_gate",cid:c,threshold:th});
+  S.spec.components[c].threshold=th; S.edited.add(c);
+  log(`调整质量门 <b>${c}</b> → θ=${th}`);
+  render(); updateButtons(r);
+}
+
+function updateButtons(st){
+  const running=(st&&st.state==="running")||(S.lastState==="running");
+  $("btn-pause").disabled=!S.sid||S.done;
+  $("btn-resume").disabled=!S.sid||S.done;
+}
+
+// ── 轮询 ──
+async function poll(){
+  if(!S.sid) return;
+  try{
+    const st=await api("/topology/state/"+S.sid);
+    S.lastState=st.state;
+    const b=$("badge"); b.className="badge b-"+st.state; b.textContent=st.state;
+    markState(st);
+    if(st.state==="paused") hint("已暂停 —— 可安全编辑拓扑，编辑完点『恢复』");
+    if(st.done){
+      clearInterval(S.pollTimer); S.pollTimer=null; S.done=true;
+      $("btn-pause").disabled=true; $("btn-resume").disabled=true;
+      const res=st.result||{};
+      const ok=res.success?"✅ 成功":"❌ 未过门";
+      log(`执行结束：${ok}　质量=${res.final_quality??"?"}　失败节点=${(res.failed_nodes||[]).join(",")||"无"}`);
+      hint("");
+    }
+  }catch(e){ log("轮询错误："+e.message); }
+}
+
+// ── 启动 ──
+async function start(){
+  S.base=$("server").value.trim().replace(/\/$/,"");
+  const p=PRESETS[$("preset").value];
+  S.spec=JSON.parse(JSON.stringify(p));
+  S.pos={}; S.edited.clear(); S.selected=null; S.done=false; S.insertType=null; S.insertU=null;
+  log("启动会话："+p.name+"（每节点 600ms 延迟，便于暂停干预）");
+  try{
+    const r=await api("/topology/session",{spec:S.spec,seed:1,node_delay_ms:600});
+    S.sid=r.session_id;
+    $("btn-pause").disabled=false; $("btn-resume").disabled=false;
+    log("会话已建立：<b>"+S.sid+"</b>");
+    render(); showInspectorNone();
+    if(S.pollTimer) clearInterval(S.pollTimer);
+    S.pollTimer=setInterval(poll,600); poll();
+  }catch(e){ log("启动失败："+e.message); }
+}
+function showInspectorNone(){
+  $("ins-empty").style.display="block"; $("ins-body").style.display="none";
+}
+async function pause(){ if(!S.sid)return; const r=await api("/topology/pause/"+S.sid); log("⏸ 暂停"); updateButtons(r); }
+async function resume(){ if(!S.sid)return; const r=await api("/topology/resume/"+S.sid); log("▶ 恢复执行"); hint(""); updateButtons(r); }
+
+// ── 绑定 ──
+$("btn-start").addEventListener("click",start);
+$("btn-pause").addEventListener("click",pause);
+$("btn-resume").addEventListener("click",resume);
+$("ins-replace").addEventListener("click",replaceNode);
+$("ins-append").addEventListener("click",appendParallel);
+$("ins-gate").addEventListener("change",setGate);
+document.querySelectorAll("[data-insert]").forEach(b=>{
+  b.addEventListener("click",()=>{
+    S.insertType=b.dataset.insert; S.insertU=null;
+    hint("插入「"+b.textContent.replace("+ ","")+"」：先点源节点(u)，再点目标节点(v)");
+  });
+});
+hint("点『启动会话』开始；运行中可随时暂停并手术式修改拓扑。");
+</script>
+</body>
+</html>
