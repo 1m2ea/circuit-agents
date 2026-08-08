@@ -78,6 +78,10 @@
   .mb-reviewer{background:#3a2a12;color:var(--amber);border-color:var(--amber)}
   .mb-student{background:#0f2e1c;color:var(--green);border-color:var(--green)}
   .mb-observer{background:#222c38;color:var(--muted)}
+  #llm-toggle{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);
+              cursor:pointer;user-select:none}
+  #llm-toggle input{cursor:pointer;margin:0}
+  #rb-avail{font-size:11px;color:var(--muted);letter-spacing:.5px}
   #collab-body{font-size:12px;max-height:200px;overflow:auto}
   #collab-body .ca{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--line);align-items:baseline}
   #collab-body .ca .who{font-weight:600;min-width:54px}
@@ -112,6 +116,10 @@
   <span id="rb-members"></span>
   <button id="btn-invite">📋 复制邀请</button>
   <button id="btn-orchestrate">⚙ 多agent编排</button>
+  <label id="llm-toggle" title="开启后 mentor/reviewer 走真实云端模型、student 走本机 Ollama；任一不可用会自动降级 mock">
+    <input type="checkbox" id="chk-llm"> 真实LLM
+  </label>
+  <span class="avail" id="rb-avail"></span>
   <span class="hint" id="rb-hint"></span>
 </div>
 <main>
@@ -665,6 +673,7 @@ function showRoomBar(){
   $("kb-sec").style.display="flex";
   renderMembers();
   loadMemory();
+  loadAvailability();
 }
 
 // ── 共享记忆与知识库（维度②）──
@@ -735,19 +744,43 @@ async function pullMemory(name){
 
 // ── 多 agent 编排（维度③）：mentor 提优化 → reviewer 裁决 → student 执行 ──
 function _canOrchestrate(){ const r=(S.members[S.me]||S.role); return r==="owner"||r==="mentor"||r==="student"; }
+const AGENT_TAG={llm:"🟢真实LLM",mock:"⚪mock",rule:"📏规则",injected:"💉注入",skipped:"—"};
 async function orchestrate(){
   if(!S.room) return;
   if(!_canOrchestrate()){ $("rb-hint").textContent="⛔ 需 owner/mentor/student 权限"; return; }
+  const useLLM=!!($("chk-llm")&&$("chk-llm").checked);
+  $("rb-hint").textContent=useLLM?"⚙ 编排中（真实模型，可能需要数十秒）…":"⚙ 编排中…";
   try{
-    const r=await api("/rooms/"+S.room+"/orchestrate",{user_id:S.me, mock:true});
-    const t=r.trace;
+    const r=await api("/rooms/"+S.room+"/orchestrate",
+                      {user_id:S.me, mock:!useLLM, use_llm:useLLM});
+    const t=r.trace, ag=r.agents||{};
     const v=t.reviewer.verdict;
+    const who=["mentor","reviewer","student"]
+      .filter(k=>ag[k]).map(k=>k+"="+(AGENT_TAG[ag[k]]||ag[k])).join(" · ");
     const st = t.student.skipped ? "（reviewer 驳回）"
               : (" → student 质量=" + t.student.after_quality + (t.student.quality_gate_passed ? " ✓" : " ✗"));
-    $("rb-hint").textContent="⚙ mentor: "+(t.mentor.diagnosis||"")+" → reviewer: "+v+st;
-    log("⚙ 多agent编排：mentor 提议 → reviewer:"+v+st);
+    $("rb-hint").textContent="⚙ ["+who+"] "+(t.mentor.diagnosis||"")+" → reviewer:"+v+st;
+    log("⚙ 多agent编排 ["+who+"]：mentor 提议 → reviewer:"+v+st);
+    (r.degraded||[]).forEach(d=>log("⚠ 角色降级："+d));
     loadMemory();
   }catch(e){ $("rb-hint").textContent="编排失败："+e.message; }
+}
+// 探测真实 LLM 可用性：不可用则把开关置灰并说明原因（避免用户开了却静默降级）
+async function loadAvailability(){
+  const el=$("rb-avail"); if(!el) return;
+  try{
+    const a=await api("/agents/availability?check_student=false");  // 无 body → GET
+    const parts=[];
+    parts.push((a.mentor?"🟢":"⚪")+"导师"); parts.push((a.judge?"🟢":"⚪")+"裁决");
+    el.textContent=parts.join(" ");
+    el.title=Object.entries(a.detail||{}).map(([k,v])=>k+": "+v).join("\n");
+    const chk=$("chk-llm");
+    if(chk && !a.any){
+      chk.disabled=true;
+      $("llm-toggle").title="未检测到可用的真实模型（缺 API key / 本机 Ollama 未起）——开了也会自动降级 mock";
+      $("llm-toggle").style.opacity=.5;
+    }
+  }catch(e){ el.textContent=""; }
 }
 function renderMembers(){
   const el=$("rb-members"); if(!el) return; el.innerHTML="";

@@ -1568,8 +1568,13 @@ class RoomMemoryDistillRequest(BaseModel):
 class RoomOrchestrateRequest(BaseModel):
     user_id: str = Field(..., description="编排发起者（需 control 权限：owner/mentor/student）")
     case: Optional[dict] = Field(None, description="失败案例 {goal,spec,result}；不传用房间 spec")
-    mock: bool = Field(False, description="离线/无 key 时用确定性角色，保证闭环可跑")
+    mock: bool = Field(False, description="强制全 mock 角色（离线/无 key 时保证闭环可跑）")
     quality_threshold: float = Field(0.8, description="质量门阈值")
+    goal: str = Field("", description="任务目标（喂给真实导师的上下文）")
+    use_llm: bool = Field(False, description="总开关：是否让三角色走真实 LLM（默认关，避免误烧钱）")
+    use_real_mentor: Optional[bool] = Field(None, description="单独指定导师是否用真实 LLM；None 跟随 use_llm")
+    use_real_reviewer: Optional[bool] = Field(None, description="单独指定裁决者是否用真实 LLM；None 跟随 use_llm")
+    use_real_student: Optional[bool] = Field(None, description="单独指定学生是否用本机真实模型；None 跟随 use_llm")
 
 
 @app.post("/rooms")
@@ -1740,11 +1745,22 @@ def room_orchestrate(rid: str, req: RoomOrchestrateRequest):
     base_spec = case.get("spec") or room.get("spec") or {}
     before_q = (case.get("result", {}) or {}).get("final_quality", 0.0) if case else 0.0
     from mentor import orchestrate as _orchestrate
-    trace = _orchestrate(base_spec, mock=req.mock, before_quality=before_q,
-                         quality_threshold=req.quality_threshold)
+    # 逐角色解析「真实 LLM / mock」：未单独指定的角色跟随总开关 use_llm
+    _rm = req.use_real_mentor if req.use_real_mentor is not None else req.use_llm
+    _rr = req.use_real_reviewer if req.use_real_reviewer is not None else req.use_llm
+    _rs = req.use_real_student if req.use_real_student is not None else req.use_llm
+    _mock = req.mock or not (_rm or _rr or _rs)
+    trace = _orchestrate(base_spec, mock=_mock, before_quality=before_q, goal=req.goal,
+                         quality_threshold=req.quality_threshold,
+                         use_real_mentor=_rm, use_real_reviewer=_rr, use_real_student=_rs)
     diag = (trace.get("mentor", {}).get("diagnosis") or "")[:60]
+    _ag = trace.get("agents", {})
+    _agtxt = "/".join(f"{k}:{v}" for k, v in _ag.items())
     _record_activity(room, req.user_id, "orchestrate", rid,
-                     detail=f"mentor:{diag} → reviewer:{trace['reviewer']['verdict']}")
+                     detail=f"[{_agtxt}] mentor:{diag} → reviewer:{trace['reviewer']['verdict']}")
+    if trace.get("degraded"):
+        _record_activity(room, "system", "orchestrate_degraded", rid,
+                         detail="; ".join(trace["degraded"])[:200])
     if trace["reviewer"]["verdict"] == "approve":
         with _lock:
             room["memory"]["templates"].append({
@@ -1759,7 +1775,25 @@ def room_orchestrate(rid: str, req: RoomOrchestrateRequest):
             })
         _record_activity(room, "student", "orchestrate_execute", rid,
                          detail=(trace.get("student") or {}).get("quality_gate_reason"))
-    return {"room_id": rid, "trace": trace}
+    return {"room_id": rid, "trace": trace,
+            "agents": trace.get("agents", {}), "degraded": trace.get("degraded", [])}
+
+
+@app.get("/agents/availability")
+def agents_availability(check_student: bool = True):
+    """探测三个真实 LLM 角色可用性（mentor/judge 看 key，student 看本机 Ollama）。
+
+    仪表盘据此决定「真实LLM」开关是否可点、并提示哪个角色会降级。
+    只做可用性探测，不发起任何推理请求；任何异常都降级成"不可用"而不是 500。
+    """
+    try:
+        from mentor import agent_availability
+        av = agent_availability(check_student=check_student)
+    except Exception as e:
+        av = {"mentor": False, "judge": False, "student": False,
+              "detail": {"error": str(e)}}
+    av["any"] = bool(av.get("mentor") or av.get("judge") or av.get("student"))
+    return av
 
 
 # asyncio.sleep 包装（避免底层依赖细节）
@@ -2878,6 +2912,53 @@ def selftest():
     assert ["a", "c"] in room_info(_rid5, user_id="kara").get("spec", {}).get("wires", []), \
         "S39: reroute 应同步到房间共享 spec（协作者可见）"
     print("✓ S39 大规模协作维度④: reroute 改流向(替换/新建 wire) + 房间 activity + 共享拓扑同步 全通过")
+
+    # S40: 真实 LLM 接入多 agent 编排（深化①）—— 逐角色开关 + 无 key 优雅降级 + 能力探测
+    import os as _os40
+    _saved40 = {}
+    for _k in ("DEEPSEEK_API_KEY",):
+        _saved40[_k] = _os40.environ.pop(_k, None)
+    try:
+        _spec40 = {"name": "s40_llm", "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "a": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["x"]},
+            "b": {"type": "resistor", "label": "B", "model": "small",
+                  "required_inputs": ["x"], "produced_outputs": ["y"]},
+        }, "wires": [["src", "a"], ["a", "b"]]}
+        _rid6 = "collab_s40"
+        create_room(CreateRoomRequest(spec=_spec40, owner_id="liam", name="llm", room_id=_rid6))
+        # ① 默认不开 use_llm → 全 mock，不产生任何真实调用
+        _o1 = room_orchestrate(_rid6, RoomOrchestrateRequest(user_id="liam"))
+        assert _o1["agents"]["mentor"] == "mock", "S40: 默认应全 mock（不误烧 token）"
+        assert _o1["agents"]["reviewer"] == "rule", "S40: 默认裁决走规则"
+        assert not _o1["degraded"], "S40: 默认 mock 路径不应有降级记录"
+        # ② 开 use_llm 但无 key → 逐角色降级，闭环仍完成且不抛异常
+        _o2 = room_orchestrate(_rid6, RoomOrchestrateRequest(
+            user_id="liam", use_llm=True, use_real_student=False))
+        assert _o2["agents"]["mentor"] == "mock", "S40: 无 key 应降级 mock"
+        assert _o2["agents"]["reviewer"] == "rule", "S40: 无 key 裁决应降级规则"
+        assert _o2["degraded"], "S40: 降级原因应回传给前端"
+        assert _o2["trace"]["student"]["quality_gate_passed"] is True, "S40: 降级后闭环仍应跑完"
+        # ③ 降级事件写进房间 activity（协作者能看见"它掉回 mock 了"）
+        _act6 = room_activity(_rid6, user_id="liam")["activities"]
+        assert any(a["action"] == "orchestrate_degraded" for a in _act6), \
+            "S40: 降级应记入房间 activity"
+        assert any("mentor:mock" in (a.get("detail") or "") for a in _act6), \
+            "S40: activity 应标注每个角色的真实/mock 身份"
+        # ④ 能力探测端点：无 key → 明确报不可用，且不 500
+        _av = agents_availability(check_student=False)
+        assert _av["mentor"] is False and _av["judge"] is False, "S40: 无 key 应报不可用"
+        assert _av["any"] is False and "detail" in _av, "S40: 探测应返回 detail 供 UI 提示"
+        # ⑤ 单角色覆盖：只让 reviewer 走真实（其余仍 mock），不影响闭环
+        _o3 = room_orchestrate(_rid6, RoomOrchestrateRequest(
+            user_id="liam", use_real_reviewer=True, use_real_student=False))
+        assert _o3["agents"]["mentor"] == "mock", "S40: 未指定的角色不应被带成真实"
+        assert _o3["trace"]["reviewer"]["verdict"] in ("approve", "reject")
+    finally:
+        for _k, _v in _saved40.items():
+            if _v is not None:
+                _os40.environ[_k] = _v
+    print("✓ S40 深化①真实LLM接入: 逐角色开关/默认全mock不烧钱/无key优雅降级/降级可见/能力探测 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

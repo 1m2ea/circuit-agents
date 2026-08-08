@@ -1,0 +1,25 @@
+C:\Users\lgw12\WorkBuddy\666\circuit-agents\server.py:955: UserWarning: Field name "register" in "ComponentDiscoverRequest" shadows an attribute in parent "BaseModel"
+  class ComponentDiscoverRequest(BaseModel):
+INFO:     Started server process [32708]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8765 (Press CTRL+C to quit)
+circuit-agents API Server → http://127.0.0.1:8765
+端点: POST /run | GET /run/{id} | GET /run/{id}/stream | GET /health
+π 永动心跳: GET /pi/heartbeat | POST /pi/heartbeat/start|stop|tick
+INFO:     127.0.0.1:52176 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52177 - "POST /rooms HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52178 - "POST /topology/pause/4c52f9c4c444 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52179 - "POST /topology/edit/4c52f9c4c444?room_id=reroute_demo&user_id=kara HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52180 - "GET /rooms/reroute_demo?user_id=kara HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52181 - "GET /rooms/reroute_demo/activity?user_id=kara HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52182 - "POST /rooms/reroute_demo/join HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52183 - "POST /topology/edit/4c52f9c4c444?room_id=reroute_demo&user_id=lee HTTP/1.1" 403 Forbidden
+INFO:     127.0.0.1:52184 - "POST /topology/pause/4c52f9c4c444 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52185 - "POST /topology/edit/4c52f9c4c444?room_id=reroute_demo&user_id=kara HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52186 - "GET /topology/editor HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52221 - "HEAD /topology/editor HTTP/1.1" 405 Method Not Allowed
+INFO:     127.0.0.1:52222 - "GET /topology/editor HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56652 - "GET /topology/editor HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55755 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55771 - "GET /health HTTP/1.1" 200 OK

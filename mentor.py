@@ -49,6 +49,25 @@ MENTOR_MODEL = os.environ.get("MENTOR_MODEL", "deepseek-reasoner")
 MENTOR_BASE = os.environ.get("MENTOR_BASE", "https://api.deepseek.com").rstrip("/")
 MENTOR_KEY_ENV = os.environ.get("MENTOR_KEY_ENV", "DEEPSEEK_API_KEY")
 
+# ── 裁决者(reviewer)模型配置：默认与导师同源，可单独覆盖成更便宜的模型 ──
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", MENTOR_MODEL)
+JUDGE_BASE = os.environ.get("JUDGE_BASE", MENTOR_BASE).rstrip("/")
+JUDGE_KEY_ENV = os.environ.get("JUDGE_KEY_ENV", MENTOR_KEY_ENV)
+
+JUDGE_SYSTEM_PROMPT = (
+    "你是 circuit-agents 多智能体系统的『裁决者(reviewer)』。系统用『电路图』表示任务："
+    "power(电源) → resistor(模型推理节点, 有 model 档 small/large/tool) → 终端。\n"
+    "导师刚给出一份对原电路的优化方案，系统已把它应用成新的 spec。"
+    "结构合法性(连通DAG/不丢输出)已由确定性规则预先校验通过，你只需做**语义裁决**："
+    "这次改动是否真的值得采纳（是否对症、是否过度复杂化、是否引入无谓成本）。\n"
+    "严格只输出如下 JSON，不要任何额外文字：\n"
+    "{\n"
+    '  "verdict": "approve 或 reject",\n'
+    '  "reason": "一句话理由",\n'
+    '  "risk": "low / medium / high"\n'
+    "}\n"
+)
+
 SYSTEM_PROMPT = (
     "你是 circuit-agents 多智能体系统的『导师』模型。系统用『电路图』表示任务："
     "power(电源) → resistor(模型推理节点, 有 model 档 small/large/tool) + 其他元件 → 终端。\n"
@@ -114,6 +133,9 @@ class MentorAgent:
     def _call(self, messages):
         if self._http_post:
             return self._http_post(messages)
+        if not self.api_key:
+            # 无 key 时直接失败，不发无谓网络请求（离线自检才能秒回而不是等超时）
+            raise RuntimeError(f"缺少导师 API key（环境变量 {MENTOR_KEY_ENV}）")
         url = self.base + "/v1/chat/completions"
         body = {"model": self.model, "messages": messages,
                 "temperature": 0.3, "stream": False}
@@ -566,6 +588,101 @@ def reviewer_adjudicate(base_spec, opt_spec) -> dict:
     return {"verdict": "approve", "reason": "拓扑合法且较原方案有改进"}
 
 
+class JudgeAgent:
+    """裁决者：用真实 LLM 对导师方案做**语义**裁决（是否值得采纳）。
+
+    安全设计（重要）：结构硬约束由确定性规则 `reviewer_adjudicate` 先跑，
+    规则判 reject 时**直接返回**，LLM 无权推翻——即 LLM 只能更严格，不能更宽松。
+    这样即使模型胡说八道，也不可能把非法拓扑放进房间的共享电路。
+    """
+
+    def __init__(self, api_key=None, base=None, model=None, http_post=None, timeout=120):
+        self.api_key = api_key or os.environ.get(JUDGE_KEY_ENV)
+        self.base = (base or JUDGE_BASE).rstrip("/")
+        self.model = model or JUDGE_MODEL
+        self._http_post = http_post  # 注入式 HTTP（离线测试用假响应）
+        self.timeout = timeout
+
+    def _build_messages(self, base_spec, opt_spec, plan=None):
+        b = json.dumps(base_spec or {}, ensure_ascii=False)[:2500]
+        o = json.dumps(opt_spec or {}, ensure_ascii=False)[:2500]
+        p = json.dumps(plan or {}, ensure_ascii=False)[:1500]
+        user = (f"原电路 spec:\n{b}\n\n导师方案:\n{p}\n\n优化后 spec:\n{o}\n\n"
+                "请裁决该优化是否值得采纳，只输出 JSON。")
+        return [{"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+
+    def _call(self, messages):
+        if self._http_post:
+            return self._http_post(messages)
+        if not self.api_key:
+            raise RuntimeError(f"缺少裁决者 API key（环境变量 {JUDGE_KEY_ENV}）")
+        url = self.base + "/v1/chat/completions"
+        body = {"model": self.model, "messages": messages,
+                "temperature": 0.0, "stream": False}
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    @staticmethod
+    def _parse_verdict(raw):
+        if isinstance(raw, dict):
+            content = (raw["choices"][0].get("message", {}).get("content", "") or "") \
+                if "choices" in raw else (raw.get("content", "") or json.dumps(raw, ensure_ascii=False))
+        else:
+            content = raw if isinstance(raw, str) else str(raw)
+        try:
+            d = json.loads(_extract_json(content))
+        except Exception as e:
+            # 解析失败视为弃权 → 由调用方降级回规则裁决，绝不因此崩掉闭环
+            return {"verdict": "abstain", "reason": f"裁决输出无法解析: {e}",
+                    "raw": content[:300]}
+        v = str(d.get("verdict", "")).strip().lower()
+        if v not in ("approve", "reject"):
+            return {"verdict": "abstain", "reason": f"未知裁决值 {v!r}", "raw": content[:300]}
+        return {"verdict": v, "reason": d.get("reason", ""), "risk": d.get("risk")}
+
+    def adjudicate(self, base_spec, opt_spec, plan=None) -> dict:
+        hard = reviewer_adjudicate(base_spec, opt_spec)
+        if hard.get("verdict") == "reject":
+            hard["by"] = "rule"          # 硬约束否决，不问 LLM（省钱且不可推翻）
+            return hard
+        v = self._parse_verdict(self._call(self._build_messages(base_spec, opt_spec, plan)))
+        if v["verdict"] == "abstain":    # LLM 弃权 → 采用规则结论
+            return {**hard, "by": "rule(llm弃权)", "llm_note": v.get("reason")}
+        v["by"] = "llm"
+        return v
+
+
+def agent_availability(*, check_student=True) -> dict:
+    """探测三个真实 LLM 角色是否可用，供端点/UI 决定是否走真实模式（不发起推理请求）。
+
+    返回 {"mentor":bool, "judge":bool, "student":bool, "detail":{...}}。
+    任何异常都吞掉并记为不可用——探测本身绝不能让请求失败。
+    """
+    detail = {}
+    mk = os.environ.get(MENTOR_KEY_ENV)
+    detail["mentor"] = f"{MENTOR_KEY_ENV}={'已设置' if mk else '未设置'} / model={MENTOR_MODEL}"
+    jk = os.environ.get(JUDGE_KEY_ENV)
+    detail["judge"] = f"{JUDGE_KEY_ENV}={'已设置' if jk else '未设置'} / model={JUDGE_MODEL}"
+    student = False
+    if check_student:
+        try:
+            be = make_ollama_student()
+            student = be is not None
+            detail["student"] = ("Ollama 可用 / model="
+                                 + os.environ.get("OLLAMA_STUDENT_MODEL", "qwen2.5:7b")
+                                 ) if student else "Ollama 不可达（未装/未起）"
+        except Exception as e:
+            detail["student"] = f"探测异常: {e}"
+    else:
+        detail["student"] = "未探测"
+    return {"mentor": bool(mk), "judge": bool(jk), "student": student, "detail": detail}
+
+
 def mock_student_rerun(spec) -> dict:
     """确定性 mock 学生：优化后拓扑（含 large 升级或验证节点）质量更高。"""
     comps = (spec or {}).get("components", {}) or {}
@@ -576,52 +693,94 @@ def mock_student_rerun(spec) -> dict:
 
 
 def orchestrate(spec, *, mock=False, mentor_fn=None, reviewer_fn=None, student_fn=None,
-                quality_threshold=0.8, before_quality=0.0,
-                use_real_mentor=True, use_real_student=True):
+                quality_threshold=0.8, before_quality=0.0, goal="",
+                use_real_mentor=True, use_real_reviewer=True, use_real_student=True,
+                mentor_http_post=None, judge_http_post=None):
     """房间内多 agent 编排闭环：mentor(提出优化) → reviewer(裁决) → [approve] student(执行) → 质量门。
 
     返回全链路 trace dict（供端点写 room activity + 知识库）：
       {"mentor":{diagnosis,plan}, "optimized_spec", "reviewer":{verdict,reason},
-       "student":{result, after_quality, quality_gate_passed, quality_gate_reason} | {skipped}}
-    mock=True 时用确定性角色，保证离线可跑、可测；否则尝试真实导师/学生，失败自动降级 mock。
+       "student":{result, after_quality, quality_gate_passed, quality_gate_reason} | {skipped},
+       "agents":{"mentor":"llm|mock|injected", "reviewer":..., "student":...},
+       "degraded":[降级原因...]}
+
+    三个角色互相独立可切真实 LLM：
+      · mentor   → MentorAgent（云端强模型，需 MENTOR_KEY_ENV）
+      · reviewer → JudgeAgent（同源云端模型，硬约束仍由规则先兜底）
+      · student  → 本机 Ollama（OllamaBackend 真实推理）
+    任一角色不可用/报错都**逐角色单独降级**回确定性 mock，闭环永不中断；
+    降级原因记入 trace["degraded"]，UI 可直接展示"哪个角色掉回 mock 了"。
     """
     base = spec
-    # 1) mentor 角色
+    agents, degraded = {}, []
+
+    # 1) mentor 角色 ────────────────────────────────
     if mentor_fn is not None:
-        plan = mentor_fn(base)
+        plan = mentor_fn(base); agents["mentor"] = "injected"
     elif mock or not use_real_mentor:
-        plan = mock_mentor_plan(base)
+        plan = mock_mentor_plan(base); agents["mentor"] = "mock"
     else:
         try:
-            plan = MentorAgent().analyze(
-                {"goal": "", "spec": base, "result": {"final_quality": before_quality}})
-        except Exception:
-            plan = mock_mentor_plan(base)
-    optimized = apply_optimization(base, plan)
+            plan = MentorAgent(http_post=mentor_http_post).analyze(
+                {"goal": goal, "spec": base, "result": {"final_quality": before_quality}})
+            if plan.get("error") or (not plan.get("node_fixes") and not plan.get("topology_ops")):
+                raise RuntimeError(plan.get("error") or "导师未给出任何可应用的优化")
+            agents["mentor"] = "llm"
+        except Exception as e:
+            plan = mock_mentor_plan(base); agents["mentor"] = "mock"
+            degraded.append(f"mentor→mock: {e}")
+
+    try:
+        optimized = apply_optimization(base, plan)
+    except Exception as e:      # 真实导师给出无法应用的方案 → 回退 mock 方案
+        degraded.append(f"mentor方案不可应用→mock: {e}")
+        plan = mock_mentor_plan(base); agents["mentor"] = "mock"
+        optimized = apply_optimization(base, plan)
+
     trace = {"mentor": {"diagnosis": plan.get("diagnosis"), "plan": plan},
              "optimized_spec": optimized}
-    # 2) reviewer 角色
-    rv_fn = reviewer_fn or reviewer_adjudicate
-    verdict = rv_fn(base, optimized)
+
+    # 2) reviewer 角色 ──────────────────────────────
+    if reviewer_fn is not None:
+        verdict = reviewer_fn(base, optimized); agents["reviewer"] = "injected"
+    elif mock or not use_real_reviewer:
+        verdict = reviewer_adjudicate(base, optimized); agents["reviewer"] = "rule"
+    else:
+        try:
+            verdict = JudgeAgent(http_post=judge_http_post).adjudicate(base, optimized, plan)
+            agents["reviewer"] = "llm" if verdict.get("by") == "llm" else "rule"
+            if verdict.get("by", "").startswith("rule("):
+                degraded.append(f"reviewer→rule: {verdict.get('llm_note')}")
+        except Exception as e:
+            verdict = reviewer_adjudicate(base, optimized); agents["reviewer"] = "rule"
+            degraded.append(f"reviewer→rule: {e}")
     trace["reviewer"] = verdict
-    # 3) student 角色（仅 approve 后执行）
-    if verdict["verdict"] == "approve":
+
+    # 3) student 角色（仅 approve 后执行）──────────────
+    if verdict.get("verdict") == "approve":
         if student_fn is not None:
-            rr = student_fn(optimized)
+            rr = student_fn(optimized); agents["student"] = "injected"
         elif mock or not use_real_student:
-            rr = mock_student_rerun(optimized)
+            rr = mock_student_rerun(optimized); agents["student"] = "mock"
         else:
             try:
                 be = make_ollama_student()
-                rr = rerun_student(optimized, be) if be else mock_student_rerun(optimized)
-            except Exception:
-                rr = mock_student_rerun(optimized)
+                if be is None:
+                    raise RuntimeError("Ollama 不可达")
+                rr = rerun_student(optimized, be); agents["student"] = "llm"
+            except Exception as e:
+                rr = mock_student_rerun(optimized); agents["student"] = "mock"
+                degraded.append(f"student→mock: {e}")
         after_q = rr.get("final_quality", 0.0) if isinstance(rr, dict) else rr[0]
         passed, reason = quality_gate(before_quality, after_q, quality_threshold)
         trace["student"] = {"result": rr, "after_quality": after_q,
                             "quality_gate_passed": passed, "quality_gate_reason": reason}
     else:
         trace["student"] = {"skipped": True, "reason": "reviewer 驳回"}
+        agents["student"] = "skipped"
+
+    trace["agents"] = agents
+    trace["degraded"] = degraded
     return trace
 
 
@@ -645,6 +804,99 @@ def orchestrate_selftest():
     v = reviewer_adjudicate(base, broken)
     assert v["verdict"] == "reject", "破坏 DAG 的优化应被 reviewer 驳回"
     print("✓ 多 agent 编排离线自检通过 (mentor提议→reviewer裁决→student执行→质量门 / 驳回路径)")
+    orchestrate_llm_selftest()
+
+
+def _demo_spec():
+    return {"name": "orch", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["x"]},
+        "B": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["y"]},
+        "C": {"type": "resistor", "label": "C", "model": "small",
+              "required_inputs": ["y"], "produced_outputs": ["z"]},
+    }, "wires": [["src", "A"], ["A", "B"], ["B", "C"]]}
+
+
+def _fake_resp(content: str):
+    return {"choices": [{"message": {"content": content}}]}
+
+
+def orchestrate_llm_selftest():
+    """真实 LLM 接入的离线自检（S40 内核侧）：
+       ① 无 key 时三角色逐个降级回 mock，闭环仍走完；
+       ② 注入假 LLM 响应时 mentor/reviewer 走真实路径；
+       ③ LLM 判 reject → student 跳过；
+       ④ LLM 说 approve 也**不能**推翻结构硬约束；
+       ⑤ LLM 输出乱码 → 弃权降级规则裁决，不抛异常。"""
+    base = _demo_spec()
+    saved = {k: os.environ.pop(k, None) for k in (MENTOR_KEY_ENV, JUDGE_KEY_ENV)}
+    try:
+        # ① 无 key + 要求真实 → 全部降级，闭环照样跑完
+        tr = orchestrate(base, mock=False, before_quality=0.2,
+                         use_real_mentor=True, use_real_reviewer=True, use_real_student=True)
+        assert tr["agents"]["mentor"] == "mock", "无 key 时 mentor 应降级 mock"
+        assert tr["agents"]["reviewer"] == "rule", "无 key 时 reviewer 应降级规则"
+        assert tr["agents"]["student"] in ("mock", "llm"), "student 应为 mock 或本机真实"
+        assert tr["degraded"], "降级原因应被记录"
+        assert tr["student"]["quality_gate_passed"] is True, "降级后闭环仍应通过质量门"
+        print("✓ S40-a 无 key 三角色逐个降级 mock，闭环不中断 ·", "; ".join(tr["degraded"])[:90])
+
+        # ② 注入假 LLM：mentor 真实出方案 + judge 真实 approve
+        mentor_plan = json.dumps({"diagnosis": "A 档位偏弱", "rationale": "升档",
+                                  "node_fixes": [{"cid": "A", "model": "large"}],
+                                  "topology_ops": []}, ensure_ascii=False)
+        tr2 = orchestrate(base, before_quality=0.2, use_real_student=False,
+                          mentor_http_post=lambda m: _fake_resp(mentor_plan),
+                          judge_http_post=lambda m: _fake_resp(
+                              '{"verdict":"approve","reason":"对症且成本可控","risk":"low"}'))
+        assert tr2["agents"]["mentor"] == "llm", "注入导师响应时应走 llm 路径"
+        assert tr2["agents"]["reviewer"] == "llm", "注入裁决响应时应走 llm 路径"
+        assert tr2["reviewer"]["verdict"] == "approve"
+        assert tr2["optimized_spec"]["components"]["A"]["model"] == "large", "导师方案应被应用"
+        assert not tr2["degraded"], f"真实路径不应有降级: {tr2['degraded']}"
+        print("✓ S40-b 注入真实 LLM 响应：mentor(llm)出方案 → reviewer(llm)approve → 学生执行")
+
+        # ③ LLM 判 reject → 学生跳过
+        tr3 = orchestrate(base, before_quality=0.2, use_real_student=False,
+                          mentor_http_post=lambda m: _fake_resp(mentor_plan),
+                          judge_http_post=lambda m: _fake_resp(
+                              '{"verdict":"reject","reason":"过度复杂化","risk":"high"}'))
+        assert tr3["reviewer"]["verdict"] == "reject"
+        assert tr3["student"].get("skipped") is True, "被驳回时学生不应执行"
+        print("✓ S40-c LLM 裁决 reject → student 跳过（不浪费一次真实推理）")
+
+        # ④ LLM 无权推翻硬约束：结构非法时规则先否决，根本不问 LLM
+        called = {"n": 0}
+
+        def _judge_always_yes(m):
+            called["n"] += 1
+            return _fake_resp('{"verdict":"approve","reason":"我全都同意","risk":"low"}')
+        broken = json.loads(json.dumps(base))
+        broken["wires"] = [["src", "A"], ["A", "C"], ["C", "B"], ["B", "C"]]  # 制造环
+        vv = JudgeAgent(http_post=_judge_always_yes).adjudicate(base, broken)
+        assert vv["verdict"] == "reject" and vv["by"] == "rule", "非法拓扑必须被规则否决"
+        assert called["n"] == 0, "硬约束否决时不应再调 LLM"
+        print("✓ S40-d 硬约束优先：非法拓扑被规则直接否决，LLM 无权推翻且不被调用")
+
+        # ⑤ LLM 输出乱码 → 弃权 → 降级规则裁决，不抛异常
+        tr5 = orchestrate(base, before_quality=0.2, use_real_student=False,
+                          mentor_http_post=lambda m: _fake_resp(mentor_plan),
+                          judge_http_post=lambda m: _fake_resp("我觉得挺好的吧~~~"))
+        assert tr5["agents"]["reviewer"] == "rule", "解析失败应降级规则"
+        assert tr5["reviewer"]["verdict"] == "approve", "规则兜底仍应给出结论"
+        assert any("reviewer→rule" in d for d in tr5["degraded"]), "降级应被记录"
+        print("✓ S40-e LLM 输出无法解析 → 弃权降级规则裁决，闭环不崩")
+
+        # ⑥ 能力探测不发起推理、异常不外溢
+        av = agent_availability(check_student=False)
+        assert av["mentor"] is False and av["judge"] is False, "已清空 key，应报不可用"
+        assert "detail" in av
+        print("✓ S40-f 能力探测 agent_availability 正常（无 key → 报不可用，不抛异常）")
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
 
 
 if __name__ == "__main__":
