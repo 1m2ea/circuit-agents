@@ -719,6 +719,9 @@ class CircuitExecutor:
         self._pause_requested = False
         self._resume_event = threading.Event()
         self._topology_dirty = False
+        # 连续干预通道（极致·实时交互）：编辑(HTTP 线程)与执行器重算(运行线程)
+        # 都触碰 self.circuit.spec，用同一把 RLock 串行，避免并发撕裂拓扑。
+        self._edit_lock = threading.RLock()
         # 指挥中⼼：① 节点工作报告（透明决策）② 主动提问（驾驭不确定性）
         #           ③ 人工编辑学习库（教它更聪明）
         self._node_traces = {}          # cid -> {inputs, output, model, latency, quality, ...}
@@ -989,8 +992,9 @@ class CircuitExecutor:
                 self._state = "running"
                 self._emit("resumed", after_layer=li - 1)
                 if self._topology_dirty:
-                    layers = self.circuit.layers()
-                    li = self._resume_index(layers, out)
+                    with self._edit_lock:
+                        layers = self.circuit.layers()
+                        li = self._resume_index(layers, out)
                     self._topology_dirty = False
 
         self._results = out
@@ -1296,27 +1300,28 @@ class CircuitExecutor:
         但即便在 running 态调用也安全 —— 改动只会在下一个检查点生效。
         """
         editor = RuntimeTopologyEditor(self.circuit)
-        if op == "insert":
-            editor.insert_on_wire(kwargs["u"], kwargs["v"],
-                                  kwargs["new_cid"], kwargs["comp"])
-        elif op == "replace":
-            editor.replace_node(kwargs["cid"], kwargs["comp"])
-        elif op == "append_parallel":
-            editor.append_parallel(kwargs["cid"], kwargs["new_cid"], kwargs["comp"])
-        elif op == "set_gate":
-            editor.set_gate(kwargs["cid"], kwargs["threshold"])
-        elif op == "reroute":
-            # 改 DAG 流向：old 为空则新增一条 wire，否则把 old 重定向为 new。
-            old = kwargs.get("old")
-            new = kwargs.get("new")
-            if not new:
-                raise ValueError("reroute 需要 new wire")
-            if old:
-                self.circuit.spec = CircuitMutator.reroute(self.circuit.spec, old, new)
-            elif list(new) not in [list(w) for w in self.circuit.spec.get("wires", [])]:
-                self.circuit.spec.setdefault("wires", []).append(list(new))
-        else:
-            raise ValueError(f"未知编辑操作: {op}")
+        with self._edit_lock:
+            if op == "insert":
+                editor.insert_on_wire(kwargs["u"], kwargs["v"],
+                                      kwargs["new_cid"], kwargs["comp"])
+            elif op == "replace":
+                editor.replace_node(kwargs["cid"], kwargs["comp"])
+            elif op == "append_parallel":
+                editor.append_parallel(kwargs["cid"], kwargs["new_cid"], kwargs["comp"])
+            elif op == "set_gate":
+                editor.set_gate(kwargs["cid"], kwargs["threshold"])
+            elif op == "reroute":
+                # 改 DAG 流向：old 为空则新增一条 wire，否则把 old 重定向为 new。
+                old = kwargs.get("old")
+                new = kwargs.get("new")
+                if not new:
+                    raise ValueError("reroute 需要 new wire")
+                if old:
+                    self.circuit.spec = CircuitMutator.reroute(self.circuit.spec, old, new)
+                elif list(new) not in [list(w) for w in self.circuit.spec.get("wires", [])]:
+                    self.circuit.spec.setdefault("wires", []).append(list(new))
+            else:
+                raise ValueError(f"未知编辑操作: {op}")
         self._topology_dirty = True
         # ── 指挥中⼼③ 教它更聪明：每次人工编辑都记进学习库（成功案例） ──
         self._record_learning(op, kwargs)

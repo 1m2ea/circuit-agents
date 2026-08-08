@@ -19,6 +19,7 @@ import os
 import uuid
 import time
 import threading
+import queue
 from pathlib import Path
 from typing import Optional
 
@@ -154,6 +155,45 @@ _topo_sessions: dict[str, dict] = {}  # 在线拓扑编辑会话：sid -> {execu
 _rooms: dict[str, dict] = {}          # 大规模协作：房间 rid -> {room_id, owner, members:{uid:role}, session_id, activity:[...], created_at}
 _lock = threading.Lock()
 
+# ── 实时交互（极致：连续不中断）：事件总线 + SSE 推送 ──────────────
+class _RealtimeHub:
+    """把执行器事件 / 房间 activity 实时推送给订阅者（SSE 消费者）。
+
+    - 订阅者是一个 queue.Queue；executor.on_event 与 _record_activity 调 push()。
+    - 仅在有订阅者时才有开销；无 SSE 连接时 push 是空操作，零拖累 selftest。
+    """
+    def __init__(self):
+        self._subs = {}                 # sid -> [Queue, ...]
+        self._lock = threading.Lock()
+
+    def subscribe(self, sid: str) -> "queue.Queue":
+        q = queue.Queue()
+        with self._lock:
+            self._subs.setdefault(sid, []).append(q)
+        return q
+
+    def unsubscribe(self, sid: str, q: "queue.Queue"):
+        with self._lock:
+            lst = self._subs.get(sid)
+            if lst and q in lst:
+                lst.remove(q)
+
+    def push(self, sid, ev: dict):
+        with self._lock:
+            subs = list(self._subs.get(sid, []))
+        for q in subs:
+            try:
+                q.put_nowait(ev)
+            except Exception:
+                pass
+
+_realtime_hub = _RealtimeHub()
+
+
+def _sse(data: dict) -> str:
+    """把事件 dict 序列化为 SSE `data:` 帧（UTF-8 安全）。"""
+    return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+
 # ── 深化③：房间持久化（重启不丢房间/记忆） ──────────────────
 class RoomStore:
     """把房间（含共享拓扑 spec / 记忆 / ops / 版本）落盘 JSON，做到重启可恢复。
@@ -269,6 +309,12 @@ def _record_activity(room: dict, user_id: str, action: str, target: str, detail=
         "ts": time.time(), "actor": user_id or "?",
         "action": action, "target": target, "detail": detail,
     })
+    # 实时交互（极致）：房间 activity 也推入事件总线 → 同房成员 SSE 实时可见
+    _sid = room.get("session_id")
+    if _sid:
+        _realtime_hub.push(_sid, {"type": "activity", "actor": user_id or "?",
+                                  "action": action, "target": target,
+                                  "detail": detail, "ts": room["activity"][-1]["ts"]})
 
 # 静态文件根目录
 _HERE = Path(__file__).parent
@@ -1549,6 +1595,8 @@ def topology_session(req: TopologySessionRequest):
             return _base_run(comp, inputs)
         _be.run = _delayed_run
     ex = CircuitExecutor(Circuit(req.spec, _be), verbose=False)
+    # 实时交互（极致）：把执行器事件推入事件总线 → SSE 零延迟送达 UI
+    ex.on_event = lambda ev: _realtime_hub.push(sid, ev)
     done = threading.Event()
     rec = {"executor": ex, "done": done, "result": None, "error": None,
            "thread": None}
@@ -1656,6 +1704,83 @@ def topology_state(sid: str,
     if rec["error"] is not None:
         st["error"] = rec["error"]
     return st
+
+
+@app.get("/topology/stream/{sid}")
+def topology_stream(sid: str,
+                    room_id: Optional[str] = Query(None),
+                    user_id: Optional[str] = Query(None)):
+    """实时交互（极致：连续不中断）：SSE 流式推送该会话的执行事件 + 房间 activity，替代轮询。
+
+    客户端用 EventSource 订阅，零延迟收到 start / node_start / node_done / layer_done /
+    paused / resumed / done / human_question / topology_edit / activity 等事件，
+    交互流不再有刷新空洞。支持可选 room_id（同房成员可见彼此 activity，合并进同一流）。
+    """
+    _room_ctx(room_id, user_id, "read")
+    rec = _topo_session(sid)
+    # 订阅会话事件；房间模式下再订阅房间 activity，合并为同一流（Figma 式实时协同）
+    subs = [(sid, _realtime_hub.subscribe(sid))]
+    if room_id and room_id in _rooms:
+        subs.append((room_id, _realtime_hub.subscribe(room_id)))
+
+    def gen():
+    # 多源合并：把各订阅队列泵入一个 merged 队列，gen 只从 merged 读
+        merged = queue.Queue()
+        _stop = threading.Event()
+
+        def _pump(q):
+            while not _stop.is_set():
+                try:
+                    ev = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                merged.put(ev)
+        _threads = [threading.Thread(target=_pump, args=(q,),
+                                     daemon=True) for _, q in subs]
+        for t in _threads:
+            t.start()
+        try:
+            # ① 历史回放：订阅前已发生的事件补发，保证时间线连续不丢（极致·连续不中断）
+            for ev in list(rec["executor"]._events):
+                yield _sse(ev)
+            # ② 当前快照，客户端据此渲染现状（弥补仍可能遗漏的边界）
+            st = rec["executor"].get_state()
+            st["done"] = rec["done"].is_set()
+            if rec["error"] is not None:
+                st["error"] = rec["error"]
+            yield _sse({"type": "snapshot", **st})
+            while True:
+                try:
+                    ev = merged.get(timeout=2)
+                except queue.Empty:
+                    # 执行已结束且无新事件 → 优雅收尾；否则心跳保活
+                    if rec["done"].is_set():
+                        yield _sse({"type": "closed", "reason": "done"})
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+                # done 事件补上完整结果，省去客户端再拉一次
+                if ev.get("type") == "done" and rec["result"] is not None:
+                    ev = {**ev, "result": rec["result"]}
+                yield _sse(ev)
+                if ev.get("type") == "done":
+                    # 收尾宽限，吞掉可能的 trailing 事件后关闭
+                    try:
+                        tail = merged.get(timeout=1)
+                        if tail.get("type") == "done" and rec["result"] is not None:
+                            tail = {**tail, "result": rec["result"]}
+                        yield _sse(tail)
+                    except queue.Empty:
+                        pass
+                    break
+        finally:
+            _stop.set()
+            for key, q in subs:
+                _realtime_hub.unsubscribe(key, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 class TopologyAnswerRequest(BaseModel):
@@ -3448,6 +3573,64 @@ def selftest():
     assert _rooms[_rA]["session_id"] in _topo_sessions, "S43: include_spec 应重建 session"
     assert _rooms[_rA]["spec"] == _rooms[_rB]["spec"], "S43: include_spec 应并入源拓扑"
     print("✓ S43 深化④跨房间联邦: 目录发现/跨房间拉知识/单向不污染/activity可见/404/可并入拓扑 全通过")
+
+    # ── S44: 实时交互（极致=连续不中断）—— 事件总线 + SSE + 连续干预 ──
+    _spec44 = {
+        "name": "realtime44",
+        "components": {
+            "s1": {"type": "source", "label": "S1", "produced_outputs": ["x"]},
+            "r1": {"type": "resistor", "label": "R1", "model": "small", "produced_outputs": ["y"]},
+            "a1": {"type": "adc", "label": "A1", "threshold": 0.8, "produced_outputs": ["z"]},
+            "out": {"type": "sink", "label": "OUT"},
+        },
+        "wires": [["s1", "r1"], ["r1", "a1"], ["a1", "out"]],
+    }
+    # S44a: 事件总线把执行事件实时送达订阅者（SSE 的数据通路）
+    _s44 = topology_session(TopologySessionRequest(spec=_spec44, seed=1, node_delay_ms=50))
+    _sid44 = _s44["session_id"]
+    _q44 = _realtime_hub.subscribe(_sid44)
+    assert _topo_sessions[_sid44]["done"].wait(timeout=15), "S44a: 会话应在 15s 内完成"
+    _got44 = []
+    try:
+        while True:
+            _got44.append(_q44.get(timeout=1))
+    except queue.Empty:
+        pass
+    _realtime_hub.unsubscribe(_sid44, _q44)
+    _types44 = {e.get("type") for e in _got44}
+    assert "node_done" in _types44, "S44a: 应收到 node_done 事件"
+    assert "done" in _types44, "S44a: 应收到 done 事件"
+    # S44b: 运行中随时干预（不暂停）也能落地且不卡死主进度
+    _s44b = topology_session(TopologySessionRequest(spec=_spec44, seed=2, node_delay_ms=80))
+    _sid44b = _s44b["session_id"]
+    _q44b = _realtime_hub.subscribe(_sid44b)
+    _ed44 = topology_edit(_sid44b, TopologyEditRequest(op="set_gate", cid="a1", threshold=0.5))
+    assert _ed44["edit"].get("applied") is True, "S44b: 运行中干预应成功应用"
+    assert _topo_sessions[_sid44b]["done"].wait(timeout=15), "S44b: 运行中干预后主进度不应卡死"
+    assert _topo_sessions[_sid44b]["error"] is None, "S44b: 运行中干预不应引发异常"
+    _got44b = []
+    try:
+        while True:
+            _got44b.append(_q44b.get(timeout=1))
+    except queue.Empty:
+        pass
+    _realtime_hub.unsubscribe(_sid44b, _q44b)
+    _types44b = {e.get("type") for e in _got44b}
+    assert "topology_edit" in _types44b, "S44b: 干预应作为事件实时流出"
+    assert "done" in _types44b, "S44b: 干预后 done 事件仍应到达"
+    # S44c: 房间 activity 经事件总线实时广播给同房成员
+    _room44 = {"session_id": "rt44_room", "activity": []}
+    _q44c = _realtime_hub.subscribe("rt44_room")
+    _record_activity(_room44, "u1", "edit", "x", detail="test")
+    _got44c = []
+    try:
+        while True:
+            _got44c.append(_q44c.get(timeout=1))
+    except queue.Empty:
+        pass
+    _realtime_hub.unsubscribe("rt44_room", _q44c)
+    assert any(e.get("type") == "activity" for e in _got44c), "S44c: 房间 activity 应推入事件总线"
+    print("✓ S44 实时交互(极致): 事件总线/SSE通路(运行中事件实时达)/连续干预不卡死/房间activity广播 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

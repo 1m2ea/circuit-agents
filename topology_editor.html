@@ -55,6 +55,9 @@
   .node.edited rect{stroke:var(--accent2);stroke-dasharray:5 3}
   .node.done rect{fill:#13301f;stroke:var(--green)}
   .node.active rect{stroke:var(--amber);stroke-width:2.5}
+  .node.running rect{stroke:var(--accent);stroke-width:2.5;filter:drop-shadow(0 0 4px var(--accent))}
+  .node.running{animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.62}}
   .node text{fill:var(--txt);font-size:12px;pointer-events:none}
   .node .t-type{fill:var(--muted);font-size:10px}
   .edge{stroke:var(--gray);stroke-width:1.6;fill:none}
@@ -182,6 +185,10 @@
     <div class="sec" id="learn-sec">
       <h2>你教它的工作流（学习库）</h2>
       <div id="learn-body" style="font-size:12px;color:var(--muted)">暂无人工编辑。每次你改拓扑，都会被它记住，下次类似任务直接复用。</div>
+    </div>
+    <div class="sec" id="tl-sec">
+      <h2>实时时间线 · 连续不中断</h2>
+      <div id="timeline" style="font-size:12px;color:var(--muted);max-height:170px;overflow:auto;font:12px/1.55 ui-monospace,Menlo,Consolas,monospace"></div>
     </div>
     <div class="sec" id="collab-sec" style="display:none;max-height:210px;overflow:auto;flex-direction:column;min-height:0">
       <h2>协同动态 · 房间内所有人</h2>
@@ -687,6 +694,103 @@ async function poll(){
   }catch(e){ log("轮询错误："+e.message); }
 }
 
+// ── 实时交互（极致=连续不中断）：EventSource 流式订阅，替代轮询 ──
+let _es=null;
+function badge(state){
+  const b=$("badge"); if(!b) return;
+  b.className="badge b-"+state; b.textContent=state;
+}
+function markNodeRunning(cid){
+  const el=document.querySelector('.node[data-id="'+cid+'"]');
+  if(el) el.classList.add("running");
+}
+function addTimeline(tag,text,kind){
+  const el=$("timeline"); if(!el) return;
+  const c={start:"var(--muted)",done:"var(--green)",sys:"var(--accent)",
+           q:"var(--amber)",edit:"var(--accent2)",act:"var(--txt)",
+           layer:"var(--muted)"}[kind||"sys"]||"var(--muted)";
+  const t=new Date().toLocaleTimeString("zh-CN",{hour12:false});
+  const d=document.createElement("div");
+  d.style.margin="2px 0"; d.style.color=c;
+  d.innerHTML=`<span style="color:var(--muted)">${t}</span> · <b>${escapeHtml(String(tag))}</b> ${escapeHtml(String(text))}`;
+  el.appendChild(d); el.scrollTop=el.scrollHeight;
+}
+function refreshState(){
+  if(!S.sid) return Promise.resolve();
+  return api("/topology/state/"+S.sid).then(st=>{
+    S.lastState=st.state; badge(st.state); markState(st); updateLearnings(st);
+  }).catch(()=>{});
+}
+function finishRun(st){
+  S.done=true; badge(st.state||"done");
+  $("btn-pause").disabled=true; $("btn-resume").disabled=true;
+  const res=st.result||{};
+  const ok=res.success?"✅ 成功":"❌ 未过门";
+  log(`执行结束：${ok}　质量=${res.final_quality??"?"}　失败节点=${(res.failed_nodes||[]).join(",")||"无"}`);
+  hint("");
+}
+function applyState(st){
+  S.lastState=st.state; badge(st.state); markState(st);
+  if(st.state==="paused") hint("已暂停 —— 可安全编辑拓扑，编辑完点『恢复』");
+  if(st.pending_question && $("qmask").style.display!=="flex") showQuestionModal(st.pending_question);
+  updateLearnings(st);
+  if(S.selected && (st.done_nodes||[]).includes(S.selected)) showReport(S.selected);
+  if(st.done) finishRun(st);
+}
+function onEvent(ev){
+  if(!ev||!ev.type) return;
+  try{
+    switch(ev.type){
+      case "snapshot": applyState(ev); break;
+      case "node_start": markNodeRunning(ev.node); addTimeline(ev.node,(ev.label||ev.ctype||"")+" 开始","start"); break;
+      case "node_done":
+        if(S.selected===ev.node) showReport(ev.node);
+        addTimeline(ev.node,(ev.ok?"✓ ":"✗ ")+"完成 q="+(ev.quality??"?"),"done");
+        refreshState();  // 用最新 done_nodes 重新着色（连续不中断，无轮询空洞）
+        break;
+      case "layer_done": addTimeline("层"+(ev.layer_idx??"?"),"完成","layer"); break;
+      case "paused": S.lastState="paused"; badge("paused"); hint("已暂停 —— 可安全编辑"); addTimeline("⏸","暂停","sys"); break;
+      case "resumed": S.lastState="running"; badge("running"); hint(""); addTimeline("▶","恢复","sys"); break;
+      case "human_question": showQuestionModal(ev); addTimeline("🤔",(ev.label||"")+" 灰色地带","q"); break;
+      case "topology_edit":
+        addTimeline("🔧",ev.op+(ev.cid?" @"+ev.cid:""),"edit");
+        log("🔧 拓扑变更："+ev.op+(ev.cid?" @ "+ev.cid:""));
+        if(S.room) replayRemoteOps().then(()=>render()); else refreshState();
+        break;
+      case "activity":
+        addTimeline("👥",(ev.actor||"?")+" "+(ev.action||""),"act");
+        if(S.room) api("/rooms/"+S.room+"/activity").then(d=>renderCollab(d.activities||[])).catch(()=>{});
+        break;
+      case "done":
+        addTimeline("🏁","执行结束","done");
+        if(ev.result) finishRun(ev);
+        else api("/topology/state/"+S.sid).then(st=>finishRun(st)).catch(()=>{});
+        if(_es) _es.close();
+        break;
+      case "closed": addTimeline("⏹","流关闭","sys"); if(_es) _es.close(); break;
+      default: break; // start / layer_start / retry / human_skip 等静默
+    }
+  }catch(e){ /* 单事件异常不影响整体流 */ }
+}
+function connectStream(){
+  if(!S.sid) return;
+  let url=S.base+"/topology/stream/"+S.sid;
+  if(S.room) url+="?room_id="+encodeURIComponent(S.room)+"&user_id="+encodeURIComponent(S.me);
+  try{
+    if(typeof EventSource==="undefined") throw new Error("no-es");
+    _es=new EventSource(url);
+    _es.onmessage=ev=>{ try{ onEvent(JSON.parse(ev.data)); }catch(e){} };
+    _es.onerror=()=>{
+      if(_es){ _es.close(); _es=null; }
+      if(!S.done && !S.pollTimer){ S.pollTimer=setInterval(poll,600); poll(); }  // 流式不可用→退化轮询
+    };
+    log("🔌 已接入实时流（EventSource）—— 交互连续不中断，无刷新空洞");
+  }catch(e){
+    if(S.pollTimer) clearInterval(S.pollTimer);
+    S.pollTimer=setInterval(poll,600); poll();
+  }
+}
+
 // ── 启动 ──
 async function start(){
   S.base=$("server").value.trim().replace(/\/$/,"");
@@ -702,7 +806,7 @@ async function start(){
     log("会话已建立：<b>"+S.sid+"</b>");
     render(); showInspectorNone();
     if(S.pollTimer) clearInterval(S.pollTimer);
-    S.pollTimer=setInterval(poll,600); poll();
+    connectStream();
   }catch(e){ log("启动失败："+e.message); }
 }
 
@@ -725,7 +829,7 @@ async function startCollab(){
   $("btn-pause").disabled=false; $("btn-resume").disabled=false;
   render(); showInspectorNone();
   if(S.pollTimer) clearInterval(S.pollTimer);
-  S.pollTimer=setInterval(poll,600); poll();
+  connectStream();
 }
 function showRoomBar(){
   $("roombar").classList.add("show");
