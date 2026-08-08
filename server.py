@@ -151,7 +151,41 @@ app.add_middleware(
 _runs: dict[str, dict] = {}
 _longtasks: dict[str, dict] = {}   # ⑦ 长周期任务实例表：id -> {task, status, goal, result, checkpoint, error}
 _topo_sessions: dict[str, dict] = {}  # 在线拓扑编辑会话：sid -> {executor, thread, done, result, error}
+_rooms: dict[str, dict] = {}          # 大规模协作：房间 rid -> {room_id, owner, members:{uid:role}, session_id, activity:[...], created_at}
 _lock = threading.Lock()
+
+# ── 大规模协作：角色与权限（Phase 0 地基） ──────────────────
+ROLE_PERMS = {
+    "observer": {"read"},
+    "student":  {"read", "control"},
+    "reviewer": {"read", "adjudicate"},
+    "mentor":   {"read", "control", "edit", "adjudicate"},
+    "owner":    {"read", "control", "edit", "adjudicate", "manage"},
+}
+
+def _has_perm(room: dict, user_id: str, action: str) -> bool:
+    role = room["members"].get(user_id)
+    if role is None:
+        return False
+    return action in ROLE_PERMS.get(role, set())
+
+def _room_ctx(room_id: Optional[str], user_id: Optional[str], action: Optional[str]):
+    """传了 room_id 时：校验房间存在(404)、用户有该动作权限(403)，返回 room；
+    未传 room_id 或传非字符串(如直接 Python 调用的 Query 默认对象)时返回 None（向后兼容单用户模式）。"""
+    if not room_id or not isinstance(room_id, str):
+        return None
+    room = _rooms.get(room_id)
+    if room is None:
+        raise HTTPException(404, f"room not found: {room_id}")
+    if action and not _has_perm(room, user_id or "", action):
+        raise HTTPException(403, f"user {user_id} 角色 {room['members'].get(user_id)} 无 {action} 权限")
+    return room
+
+def _record_activity(room: dict, user_id: str, action: str, target: str, detail=None):
+    room["activity"].append({
+        "ts": time.time(), "actor": user_id or "?",
+        "action": action, "target": target, "detail": detail,
+    })
 
 # 静态文件根目录
 _HERE = Path(__file__).parent
@@ -1366,14 +1400,22 @@ def topology_session(req: TopologySessionRequest):
 
 
 @app.api_route("/topology/pause/{sid}", methods=["GET", "POST"])
-def topology_pause(sid: str):
+def topology_pause(sid: str,
+                   room_id: Optional[str] = Query(None),
+                   user_id: Optional[str] = Query(None)):
+    room = _room_ctx(room_id, user_id, "control")
     rec = _topo_session(sid)
     paused = rec["executor"].pause()
+    if room:
+        _record_activity(room, user_id, "pause", sid)
     return {"session_id": sid, "paused": paused, "state": rec["executor"].get_state()}
 
 
 @app.post("/topology/edit/{sid}")
-def topology_edit(sid: str, req: TopologyEditRequest):
+def topology_edit(sid: str, req: TopologyEditRequest,
+                  room_id: Optional[str] = Query(None),
+                  user_id: Optional[str] = Query(None)):
+    room = _room_ctx(room_id, user_id, "edit")
     rec = _topo_session(sid)
     try:
         out = rec["executor"].edit(
@@ -1381,18 +1423,28 @@ def topology_edit(sid: str, req: TopologyEditRequest):
             new_cid=req.new_cid, comp=req.comp, threshold=req.threshold)
     except Exception as e:
         raise HTTPException(400, f"编辑失败: {e}")
+    if room:
+        _record_activity(room, user_id, "edit", sid, detail=req.op)
     return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
 
 
 @app.api_route("/topology/resume/{sid}", methods=["GET", "POST"])
-def topology_resume(sid: str):
+def topology_resume(sid: str,
+                    room_id: Optional[str] = Query(None),
+                    user_id: Optional[str] = Query(None)):
+    room = _room_ctx(room_id, user_id, "control")
     rec = _topo_session(sid)
     resumed = rec["executor"].resume()
+    if room:
+        _record_activity(room, user_id, "resume", sid)
     return {"session_id": sid, "resumed": resumed, "state": rec["executor"].get_state()}
 
 
 @app.get("/topology/state/{sid}")
-def topology_state(sid: str):
+def topology_state(sid: str,
+                   room_id: Optional[str] = Query(None),
+                   user_id: Optional[str] = Query(None)):
+    room = _room_ctx(room_id, user_id, "read")
     rec = _topo_session(sid)
     st = rec["executor"].get_state()
     st["done"] = rec["done"].is_set()
@@ -1412,21 +1464,29 @@ class TopologyAnswerRequest(BaseModel):
 def topology_answer(sid: str,
                     req: Optional[TopologyAnswerRequest] = None,
                     choice: Optional[str] = Query(None),
-                    note: Optional[str] = Query(None)):
+                    note: Optional[str] = Query(None),
+                    room_id: Optional[str] = Query(None),
+                    user_id: Optional[str] = Query(None)):
     """人类裁决灰色地带：adc/verify 主动提问后，老板选边（choice=high/low）。
-    支持 JSON body（POST）或 ?choice= 查询参数（GET）。"""
+    支持 JSON body（POST）或 ?choice= 查询参数（GET）。房间模式下需 adjudicate 权限。"""
+    room = _room_ctx(room_id, user_id, "adjudicate")
     rec = _topo_session(sid)
     _choice = (req.choice if req else None) or choice
     _note = (req.note if req else None) or note
     if not _choice:
         raise HTTPException(400, "需提供 choice（body 或 ?choice=）")
     ok = rec["executor"].answer_question(_choice, _note)
+    if room:
+        _record_activity(room, user_id, "answer", sid, detail=_choice)
     return {"session_id": sid, "answered": ok, "state": rec["executor"].get_state()}
 
 
 @app.get("/topology/node/{sid}/{cid}")
-def topology_node_report(sid: str, cid: str):
+def topology_node_report(sid: str, cid: str,
+                         room_id: Optional[str] = Query(None),
+                         user_id: Optional[str] = Query(None)):
     """指挥中⼼①：返回某节点的透明决策工作报告（输入/输出/模型/耗时/质量）。"""
+    _room_ctx(room_id, user_id, "read")
     rec = _topo_session(sid)
     tr = (rec["executor"].get_state().get("node_traces") or {}).get(cid)
     if tr is None:
@@ -1435,8 +1495,11 @@ def topology_node_report(sid: str, cid: str):
 
 
 @app.get("/topology/learnings/{sid}")
-def topology_learnings(sid: str):
+def topology_learnings(sid: str,
+                       room_id: Optional[str] = Query(None),
+                       user_id: Optional[str] = Query(None)):
     """指挥中⼼③：返回本会话中人类教给系统的所有编辑（学习库）。"""
+    _room_ctx(room_id, user_id, "read")
     rec = _topo_session(sid)
     return {"session_id": sid,
             "learnings": rec["executor"].get_state().get("learnings", [])}
@@ -1450,6 +1513,110 @@ def topology_editor_page():
     if not p.exists():
         raise HTTPException(404, "topology_editor.html 未找到")
     return FileResponse(p, media_type="text/html")
+
+
+# ──────────────────────────────────────────────────────────
+# 大规模协作 Phase 0：房间模型 + 角色权限 + activity 流
+# ──────────────────────────────────────────────────────────
+
+class CreateRoomRequest(BaseModel):
+    spec: dict = Field(..., description="房间共享的电路拓扑 Spec")
+    owner_id: str = Field(..., description="房主用户 id")
+    name: Optional[str] = Field(None, description="房间名")
+
+
+class RoomJoinRequest(BaseModel):
+    user_id: str = Field(..., description="加入者用户 id")
+    desired_role: str = Field("observer", description="期望角色（owner 可改）")
+
+
+class RoomRoleRequest(BaseModel):
+    owner_id: str = Field(..., description="操作者须为房主")
+    user_id: str = Field(..., description="被改角色的用户 id")
+    role: str = Field(..., description="新角色")
+
+
+@app.post("/rooms")
+def create_room(req: CreateRoomRequest):
+    """新建协作房间：内部建一个共享 topology session，房主为 owner。"""
+    import uuid as _uuid, time as _tm
+    rid = _uuid.uuid4().hex[:10]
+    _sess = topology_session(TopologySessionRequest(spec=req.spec))
+    room = {
+        "room_id": rid,
+        "name": req.name or req.spec.get("name", "untitled"),
+        "owner": req.owner_id,
+        "members": {req.owner_id: "owner"},
+        "session_id": _sess["session_id"],
+        "activity": [],
+        "created_at": _tm.time(),
+    }
+    with _lock:
+        _rooms[rid] = room
+    _record_activity(room, req.owner_id, "create_room", rid, detail=room["name"])
+    return {"room_id": rid, "session_id": _sess["session_id"],
+            "owner": req.owner_id, "state": _sess["state"]}
+
+
+@app.post("/rooms/{rid}/join")
+def room_join(rid: str, req: RoomJoinRequest):
+    """加入房间（默认 observer；owner 可改角色）。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    role = req.desired_role if req.desired_role in ROLE_PERMS else "observer"
+    with _lock:
+        room["members"][req.user_id] = role
+    _record_activity(room, req.user_id, "join", rid, detail=role)
+    return {"room_id": rid, "user_id": req.user_id, "role": role,
+            "members": dict(room["members"])}
+
+
+@app.post("/rooms/{rid}/role")
+def room_set_role(rid: str, req: RoomRoleRequest):
+    """房主改成员角色。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if req.owner_id != room["owner"]:
+        raise HTTPException(403, "only owner can change roles")
+    if req.role not in ROLE_PERMS:
+        raise HTTPException(400, f"unknown role: {req.role}")
+    with _lock:
+        room["members"][req.user_id] = req.role
+        _record_activity(room, req.owner_id, "set_role", rid,
+                         detail=f"{req.user_id}->{req.role}")
+    return {"room_id": rid, "user_id": req.user_id, "role": req.role}
+
+
+@app.get("/rooms/{rid}")
+def room_info(rid: str, user_id: Optional[str] = None):
+    """房间信息：成员/角色/共享电路状态摘要。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    sess = _topo_sessions.get(room["session_id"], {})
+    st = sess.get("executor") and sess["executor"].get_state()
+    return {"room_id": rid, "name": room["name"], "owner": room["owner"],
+            "members": dict(room["members"]), "session_id": room["session_id"],
+            "created_at": room["created_at"], "state": st,
+            "activity_count": len(room["activity"])}
+
+
+@app.get("/rooms/{rid}/activity")
+def room_activity(rid: str,
+                  user_id: Optional[str] = None,
+                  since: int = 0):
+    """实时协同流：返回房间 activity 事件（供多人客户端轮询，维度三复用）。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    return {"room_id": rid, "activities": room["activity"][since:],
+            "total": len(room["activity"])}
 
 
 # asyncio.sleep 包装（避免底层依赖细节）
@@ -2416,6 +2583,45 @@ def selftest():
     assert _st34b["node_traces"]["adc"].get("human_verdict") == "high", \
         "S34: adc 应记录人类裁决=high"
     print("✓ S34 指挥中⼼: ①节点报告 / ②主动提问→裁决恢复 / ③人工编辑学习库 全通过")
+
+    # S35: 大规模协作 Phase 0 —— 房间模型 + 角色权限 + activity 流
+    _spec = {
+        "name": "s35_room",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "a", "model": "small"},
+            "adc": {"type": "adc", "label": "adc", "threshold": 0.5},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    _cr = create_room(CreateRoomRequest(spec=_spec, owner_id="alice", name="collab"))
+    _rid = _cr["room_id"]; _rsid = _cr["session_id"]
+    assert _rid and _rsid, "S35: 应创建房间并建共享会话"
+    assert _rooms[_rid]["owner"] == "alice", "S35: owner 应记录"
+    # observer 加入
+    _join = room_join(_rid, RoomJoinRequest(user_id="bob", desired_role="observer"))
+    assert _join["role"] == "observer", "S35: bob 应为 observer"
+    # observer 读状态 OK（read 权限）
+    _ok = topology_state(_rsid, room_id=_rid, user_id="bob")
+    assert _ok, "S35: observer 可读状态"
+    # observer 尝试 edit → 403
+    _forbidden = False
+    try:
+        topology_edit(_rsid, TopologyEditRequest(op="set_gate", cid="adc", threshold=0.6),
+                      room_id=_rid, user_id="bob")
+    except Exception as e:
+        _forbidden = (getattr(e, "status_code", None) == 403)
+    assert _forbidden, "S35: observer 编辑应被 403 拦截"
+    # owner 编辑 OK
+    _ok2 = topology_edit(_rsid, TopologyEditRequest(op="set_gate", cid="adc", threshold=0.7),
+                         room_id=_rid, user_id="alice")
+    assert _ok2["edit"]["op"] == "set_gate", "S35: owner 可编辑"
+    # activity 流应记录 create/join/edit
+    _act = room_activity(_rid, user_id="alice")["activities"]
+    _actions = [a["action"] for a in _act]
+    assert "create_room" in _actions and "join" in _actions and "edit" in _actions, \
+        "S35: activity 流应记录动作"
+    print("✓ S35 大规模协作 Phase0: 房间创建/成员角色/权限矩阵/越权403/activity流 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
