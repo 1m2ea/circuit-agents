@@ -161,13 +161,25 @@ class _RealtimeHub:
 
     - 订阅者是一个 queue.Queue；executor.on_event 与 _record_activity 调 push()。
     - 仅在有订阅者时才有开销；无 SSE 连接时 push 是空操作，零拖累 selftest。
+
+    大规模协作（极致·人数众多）扇出加固：
+      · **有界队列**：每个订阅者队列上限 maxsize，杜绝慢消费者把内存吃穿。
+      · **drop-oldest**：队列满时丢最旧事件而非阻塞——一个卡住的观众
+        绝不能拖慢整房的推送（广播不被最慢的人决定速度）。
+      · **coalesce（合并）**：presence 这类高频且只关心最新值的事件，
+        同 key 只保留最新一条，避免 N 人 × 高频心跳把带宽打满。
+      · **stats**：订阅者数 / 推送数 / 丢弃数，供 /rooms/{rid}/stats 观测水位。
     """
-    def __init__(self):
-        self._subs = {}                 # sid -> [Queue, ...]
+    COALESCE_TYPES = {"presence"}        # 只保留最新值的事件类型
+
+    def __init__(self, maxsize: int = 512):
+        self._subs = {}                 # topic -> [Queue, ...]
         self._lock = threading.Lock()
+        self.maxsize = int(maxsize)
+        self.stats = {"pushed": 0, "dropped": 0, "coalesced": 0}
 
     def subscribe(self, sid: str) -> "queue.Queue":
-        q = queue.Queue()
+        q = queue.Queue(maxsize=self.maxsize)
         with self._lock:
             self._subs.setdefault(sid, []).append(q)
         return q
@@ -177,13 +189,58 @@ class _RealtimeHub:
             lst = self._subs.get(sid)
             if lst and q in lst:
                 lst.remove(q)
+            if lst is not None and not lst:
+                self._subs.pop(sid, None)      # 空 topic 不留残渣（众多房间时省内存）
+
+    def subscriber_count(self, sid: str) -> int:
+        with self._lock:
+            return len(self._subs.get(sid, []))
+
+    def _coalesce_key(self, ev: dict):
+        """同 key 的旧事件可被新事件顶替（仅高频只读型事件）。"""
+        if ev.get("type") in self.COALESCE_TYPES:
+            return (ev.get("type"), ev.get("actor") or ev.get("user_id"))
+        return None
 
     def push(self, sid, ev: dict):
         with self._lock:
             subs = list(self._subs.get(sid, []))
+        if not subs:
+            return
+        ck = self._coalesce_key(ev)
         for q in subs:
             try:
-                q.put_nowait(ev)
+                if ck is not None and q.qsize():
+                    # 合并：把队列里同 key 的旧事件剔除，只留最新（人数众多时的关键减压阀）
+                    kept, removed = [], 0
+                    try:
+                        while True:
+                            old = q.get_nowait()
+                            if self._coalesce_key(old) == ck:
+                                removed += 1
+                            else:
+                                kept.append(old)
+                    except queue.Empty:
+                        pass
+                    for o in kept:
+                        try:
+                            q.put_nowait(o)
+                        except queue.Full:
+                            break
+                    if removed:
+                        self.stats["coalesced"] += removed
+                try:
+                    q.put_nowait(ev)
+                except queue.Full:
+                    # drop-oldest：丢最旧的一条给新事件让位，绝不阻塞广播线程
+                    try:
+                        q.get_nowait()
+                        self.stats["dropped"] += 1
+                        q.put_nowait(ev)
+                    except Exception:
+                        self.stats["dropped"] += 1
+                        continue
+                self.stats["pushed"] += 1
             except Exception:
                 pass
 
@@ -225,6 +282,9 @@ class RoomStore:
                            for k, v in mem.items()},
                 "ops": list(room.get("ops", [])),
                 "rev": int(room.get("rev", 0)),
+                # 极致·大规模协作：并发模式与 CRDT op 流也要持久化，重启后仍能收敛
+                "concurrency": room.get("concurrency", "crdt"),
+                "crdt_ops": list(getattr(room.get("crdt"), "log", []) or []),
                 "created_at": room.get("created_at", time.time()),
             }
         with self._wlock:
@@ -268,6 +328,15 @@ def load_rooms(store: "RoomStore" = None):
         room.setdefault("rev", 0)
         room.setdefault("members", {})
         room.setdefault("created_at", time.time())
+        room.setdefault("concurrency", "crdt")
+        room.setdefault("presence", {})       # presence 是易失态，重启后重新心跳建立
+        # 重建 CRDT 副本：优先用持久化的 op 流重放（保留并发历史与 lamport），
+        # 没有 op 流的老快照则退回按 spec 重建。
+        _cops = room.pop("crdt_ops", None)
+        _c = _new_crdt(rid, {} if _cops else (room.get("spec") or {}))
+        if _c is not None and _cops:
+            _c.merge(_cops)
+        room["crdt"] = _c
         try:    # 据持久化的 spec 重建内部 session（新 session_id，后台线程跑电路）
             _sess = topology_session(TopologySessionRequest(spec=room.get("spec") or {}))
             room["session_id"] = _sess["session_id"]
@@ -1501,6 +1570,59 @@ class TopologyEditRequest(BaseModel):
 
 _EDIT_LOCK = threading.RLock()   # 房间编辑串行化：让「检测冲突→应用→记账」成为原子操作
 
+# ──────────────────────────────────────────────────────────
+# 大规模协作 极致：CRDT 无冲突并发编辑（人数众多不再靠 409 重试）
+#
+#   OT-lite 在 2~3 人时优雅，人一多就退化：冲突概率随并发人数近似平方上升，
+#   每个 409 都要客户端拉 op-log→rebase→重提 = 重试风暴 + 必须有全局串行点。
+#   CRDT 让并发 op 天然可合并（任意顺序 / 可重复 / 永不拒绝），
+#   于是「人数众多」不再是并发正确性问题，只剩广播扇出问题（见 _RealtimeHub）。
+#
+#   两种模式共存：房间 concurrency="crdt"（默认，永不 409）或 "ot"（保留旧语义）。
+# ──────────────────────────────────────────────────────────
+PRESENCE_TTL = 30.0      # 超过该秒数没心跳 → 视为离线
+
+
+def _new_crdt(rid: str, spec: dict):
+    """按房间 spec 建 CRDT 副本；runtime 不可用时返回 None（降级为纯 OT）。"""
+    try:
+        from runtime import TopologyCRDT
+        return TopologyCRDT.from_spec(spec or {}, actor=f"room:{rid}")
+    except Exception:
+        return None
+
+
+def _crdt_of(room: dict):
+    """惰性拿房间 CRDT（老房间/持久化恢复的房间也能补上）。"""
+    c = room.get("crdt")
+    if c is None:
+        c = _new_crdt(room.get("room_id", "?"), room.get("spec") or {})
+        room["crdt"] = c
+    return c
+
+
+def _crdt_broadcast(room: dict, actor: str, ops: list):
+    """把新产生的 CRDT op 广播给全房订阅者（他们本地 merge 即收敛，无需回服务端问）。"""
+    if not ops:
+        return
+    sid = room.get("session_id")
+    if not sid:
+        return
+    c = room.get("crdt")
+    _realtime_hub.push(sid, {"type": "crdt_ops", "actor": actor, "ops": ops,
+                             "hash": c.state_hash() if c else None,
+                             "ts": time.time()})
+
+
+def _live_presence(room: dict) -> dict:
+    """剔除超时成员后的在线名单。"""
+    now = time.time()
+    out = {}
+    for uid, p in (room.get("presence") or {}).items():
+        if now - float(p.get("ts", 0)) <= PRESENCE_TTL:
+            out[uid] = {**p, "age": round(now - float(p.get("ts", 0)), 2)}
+    return out
+
 
 def _op_targets(op: str, args: dict) -> set:
     """抽取一个编辑操作实际触碰的「目标集合」，用于判断两个并发操作是否冲突。
@@ -1652,30 +1774,52 @@ def topology_edit(sid: str, req: TopologyEditRequest,
         out = _apply()
         return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
 
-    # ── OT-lite：冲突检测 + 应用编辑 + 记账 必须在同一把锁内原子完成 ──
+    # ── 并发编辑：CRDT（默认，永不拒绝）或 OT-lite（旧语义，同目标 409）──
+    #    两条路径都必须在同一把锁内「检测→应用→记账」原子完成，
     #    否则两人同时改同一节点会双双通过检测（TOCTOU 竞态），后写静默覆盖先写。
+    _mode = room.get("concurrency", "ot")
+    _crdt_ops = []
     with _EDIT_LOCK:
-        rejected, info = _detect_conflict(room, req.base_rev, req.op, _args)
-        if rejected and not req.force:
-            raise HTTPException(409, detail=info)
-        if rejected and req.force:
-            _merge = {**info, "forced": True}
-        elif info:
-            _merge = info                      # 自动 rebase 成功（目标不相交）
+        if _mode == "crdt":
+            # CRDT 模式：不做拒绝式冲突检测——并发 op 天然可合并，人数越多优势越大。
+            _c = _crdt_of(room)
+            _behind = max(0, int(room.get("rev", 0)) - int(req.base_rev)) \
+                if isinstance(req.base_rev, int) else 0
+            if _behind:
+                _merge = {"merged": True, "behind": _behind, "mode": "crdt",
+                          "note": "CRDT 自动合并，无需 rebase / 重试"}
+        else:
+            rejected, info = _detect_conflict(room, req.base_rev, req.op, _args)
+            if rejected and not req.force:
+                raise HTTPException(409, detail=info)
+            if rejected and req.force:
+                _merge = {**info, "forced": True}
+            elif info:
+                _merge = info                  # 自动 rebase 成功（目标不相交）
         out = _apply()
         _rev = _append_op(room, user_id, req.op, _args)
         room["spec"] = rec["executor"].circuit.spec   # 改流向/编辑同步到房间共享拓扑
+        _c = room.get("crdt")
+        if _c is not None:                     # 两种模式都镜像进 CRDT（随时可切换/收敛校验）
+            try:
+                _crdt_ops = _c.apply_edit(req.op, {**_args, "cid": req.cid or _args.get("cid")})
+            except Exception:
+                _crdt_ops = []
         room["memory"]["learnings"].append({
             "ts": time.time(), "actor": user_id, "op": req.op,
             "target": getattr(req, "cid", None) or getattr(req, "u", None),
             "detail": _args,
         })
     _record_activity(room, user_id, "edit", sid, detail=req.op)
+    _crdt_broadcast(room, user_id, _crdt_ops)
     _persist()
     resp = {"session_id": sid, "edit": out, "state": rec["executor"].get_state(),
             "rev": _rev}
     if _merge:
         resp["merge"] = _merge
+    _c = room.get("crdt")
+    if _c is not None:
+        resp["crdt"] = {"mode": _mode, "hash": _c.state_hash(), "ops": _crdt_ops}
     return resp
 
 
@@ -1852,6 +1996,19 @@ class CreateRoomRequest(BaseModel):
     owner_id: str = Field(..., description="房主用户 id")
     name: Optional[str] = Field(None, description="房间名")
     room_id: Optional[str] = Field(None, description="可指定房间 id（便于分享链接；冲突则服务端另生成）")
+    concurrency: str = Field("crdt", description="并发编辑模式：crdt=无冲突合并(人数众多默认) / ot=乐观并发+409")
+
+
+class RoomPresenceRequest(BaseModel):
+    user_id: str = Field(..., description="用户 id")
+    cursor: Optional[list] = Field(None, description="画布光标 [x,y]（可选）")
+    focus: Optional[str] = Field(None, description="正在关注/编辑的节点 cid（可选）")
+    status: str = Field("active", description="active / idle / away")
+
+
+class RoomCRDTOpsRequest(BaseModel):
+    user_id: str = Field(..., description="提交者 id")
+    ops: list = Field(default_factory=list, description="CRDT op 列表（幂等、顺序无关）")
 
 
 class RoomJoinRequest(BaseModel):
@@ -1918,6 +2075,10 @@ def create_room(req: CreateRoomRequest):
         "memory": {"published": [], "learnings": [], "templates": []},
         "ops": [],       # OT op-log：房间共享拓扑的全部变更（可重放）
         "rev": 0,        # 单调递增版本号；客户端据此判断"我落后了没有"
+        # 大规模协作（极致）：CRDT 无冲突合并 + presence 在线感知
+        "concurrency": req.concurrency if req.concurrency in ("crdt", "ot") else "crdt",
+        "crdt": _new_crdt(rid, req.spec),
+        "presence": {},   # uid -> {ts, cursor, focus, status, role}
         "created_at": _tm.time(),
     }
     with _lock:
@@ -1975,7 +2136,12 @@ def room_info(rid: str, user_id: Optional[str] = None):
             "members": dict(room["members"]), "session_id": room["session_id"],
             "created_at": room["created_at"], "state": st, "spec": room.get("spec"),
             "activity_count": len(room["activity"]),
-            "rev": int(room.get("rev", 0))}      # 客户端据此判断自己是否落后
+            "rev": int(room.get("rev", 0)),      # 客户端据此判断自己是否落后
+            # 极致·大规模协作：并发模式 + 在线感知 + CRDT 收敛哈希
+            "concurrency": room.get("concurrency", "crdt"),
+            "online": len(_live_presence(room)),
+            "presence": _live_presence(room),
+            "crdt_hash": (room.get("crdt").state_hash() if room.get("crdt") else None)}
 
 
 @app.get("/rooms/{rid}/ops")
@@ -2008,6 +2174,123 @@ def room_activity(rid: str,
         raise HTTPException(403, "not a member of this room")
     return {"room_id": rid, "activities": room["activity"][since:],
             "total": len(room["activity"])}
+
+
+# ──────────────────────────────────────────────────────────
+# 大规模协作 极致：presence 在线感知 / CRDT 同步 / 扇出水位
+# ──────────────────────────────────────────────────────────
+
+@app.post("/rooms/{rid}/presence")
+def room_presence(rid: str, req: RoomPresenceRequest):
+    """在线感知心跳：我在线、我的光标在哪、我正在看/改哪个节点。
+
+    人数众多时「谁在场、谁在碰哪里」是避免撞车的第一道防线（比冲突提示更早）。
+    心跳经事件总线以 coalesce 方式广播（同一用户只保留最新一条），
+    因此 N 人高频心跳不会把广播通道打满。超过 PRESENCE_TTL 秒无心跳自动判离线。
+    """
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if req.user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    now = time.time()
+    entry = {"ts": now, "cursor": req.cursor, "focus": req.focus,
+             "status": req.status, "role": room["members"].get(req.user_id)}
+    with _lock:
+        room.setdefault("presence", {})[req.user_id] = entry
+    sid = room.get("session_id")
+    if sid:
+        _realtime_hub.push(sid, {"type": "presence", "actor": req.user_id, **entry})
+    live = _live_presence(room)
+    return {"room_id": rid, "user_id": req.user_id, "online": len(live),
+            "presence": live, "ttl": PRESENCE_TTL}
+
+
+@app.get("/rooms/{rid}/presence")
+def room_presence_list(rid: str, user_id: Optional[str] = None):
+    """当前在线名单（已剔除超时者），含各自 focus 节点 → UI 可在节点上标"谁在看"。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if isinstance(user_id, str) and user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    live = _live_presence(room)
+    focus_map = {}
+    for uid, p in live.items():
+        if p.get("focus"):
+            focus_map.setdefault(p["focus"], []).append(uid)
+    return {"room_id": rid, "online": len(live), "presence": live,
+            "focus_map": focus_map, "members_total": len(room["members"])}
+
+
+@app.get("/rooms/{rid}/crdt")
+def room_crdt_state(rid: str, user_id: Optional[str] = None, since: int = 0):
+    """CRDT 视图：物化拓扑 + 状态哈希 + op 流（since 之后的，用于增量追平）。
+
+    状态哈希相同 ⇔ 两个副本已收敛；客户端拿 ops 本地 merge 即可，无需服务端仲裁。
+    """
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if isinstance(user_id, str) and user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    c = _crdt_of(room)
+    if c is None:
+        raise HTTPException(503, "CRDT 不可用（runtime 未加载）")
+    ops = list(c.log)[since:]
+    return {"room_id": rid, "mode": room.get("concurrency", "crdt"),
+            "hash": c.state_hash(), "state": c.materialize(),
+            "ops": ops, "since": since, "total_ops": len(c.log),
+            "lamport": c.lamport}
+
+
+@app.post("/rooms/{rid}/crdt/ops")
+def room_crdt_submit(rid: str, req: RoomCRDTOpsRequest):
+    """提交一批 CRDT op（来自某个客户端副本）。永不拒绝：合并即收敛。
+
+    这是「人数众多」的核心通路——每个客户端本地先改（零延迟），
+    再把 op 异步投递到服务端与其他人；到达顺序、重复投递都不影响最终一致。
+    """
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if not _has_perm(room, req.user_id, "edit"):
+        raise HTTPException(403, f"user {req.user_id} 无 edit 权限")
+    c = _crdt_of(room)
+    if c is None:
+        raise HTTPException(503, "CRDT 不可用（runtime 未加载）")
+    with _EDIT_LOCK:
+        merged = c.merge(req.ops or [])
+        room["spec"] = {**(room.get("spec") or {}), **c.materialize()}
+    if merged:
+        _crdt_broadcast(room, req.user_id, list(req.ops or []))
+        _record_activity(room, req.user_id, "crdt_ops", rid, detail=f"+{merged}")
+        _persist()
+    return {"room_id": rid, "merged": merged, "received": len(req.ops or []),
+            "hash": c.state_hash(), "total_ops": len(c.log)}
+
+
+@app.get("/rooms/{rid}/stats")
+def room_stats(rid: str, user_id: Optional[str] = None):
+    """扇出水位：订阅者数 / 推送 / 丢弃 / 合并 / 在线人数。人数众多时先看这里。"""
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if isinstance(user_id, str) and user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    sid = room.get("session_id") or ""
+    c = room.get("crdt")
+    return {"room_id": rid,
+            "members": len(room.get("members", {})),
+            "online": len(_live_presence(room)),
+            "subscribers": _realtime_hub.subscriber_count(sid),
+            "hub": dict(_realtime_hub.stats),
+            "queue_maxsize": _realtime_hub.maxsize,
+            "concurrency": room.get("concurrency", "crdt"),
+            "rev": int(room.get("rev", 0)),
+            "crdt_ops": len(c.log) if c else 0,
+            "crdt_hash": c.state_hash() if c else None,
+            "activity": len(room.get("activity", []))}
 
 
 # ──────────────────────────────────────────────────────────
@@ -3386,7 +3669,8 @@ def selftest():
               "required_inputs": ["y"], "produced_outputs": ["z"]},
     }, "wires": [["src", "a"], ["a", "b"], ["b", "c"]]}
     _rid7 = "collab_s41"
-    _c7 = create_room(CreateRoomRequest(spec=_spec41, owner_id="mia", name="ot", room_id=_rid7))
+    _c7 = create_room(CreateRoomRequest(spec=_spec41, owner_id="mia", name="ot",
+                                        room_id=_rid7, concurrency="ot"))
     _s7 = _c7["session_id"]
     room_join(_rid7, RoomJoinRequest(user_id="noah", desired_role="mentor"))
     try: topology_pause(_s7)
@@ -3440,7 +3724,8 @@ def selftest():
                      "produced_outputs": [f"o{i}"]} for i in range(8)},
     }, "wires": [["src", f"n{i}"] for i in range(8)]}
     _rid8 = "collab_s41p"
-    _c8 = create_room(CreateRoomRequest(spec=_spec41b, owner_id="mia", name="par", room_id=_rid8))
+    _c8 = create_room(CreateRoomRequest(spec=_spec41b, owner_id="mia", name="par",
+                                        room_id=_rid8, concurrency="ot"))
     _s8 = _c8["session_id"]
     try: topology_pause(_s8)
     except Exception: pass
@@ -3631,6 +3916,123 @@ def selftest():
     _realtime_hub.unsubscribe("rt44_room", _q44c)
     assert any(e.get("type") == "activity" for e in _got44c), "S44c: 房间 activity 应推入事件总线"
     print("✓ S44 实时交互(极致): 事件总线/SSE通路(运行中事件实时达)/连续干预不卡死/房间activity广播 全通过")
+
+    # ── S45: 大规模协作（极致·人数众多）──────────────────────
+    #   ① CRDT 房间：数十人并发抢改同一节点 → 零 409、零重试，且全员收敛同一状态
+    #   ② presence：在线感知/焦点地图/超时离线
+    #   ③ 扇出：慢消费者被 drop-oldest 保护，不拖垮整房；高频 presence 被 coalesce
+    _spec45 = {"name": "s45_scale", "components": {
+        "src": {"type": "power", "label": "task", "task": "x"},
+        "n0": {"type": "resistor", "label": "N0", "model": "small", "produced_outputs": ["x"]},
+        "n1": {"type": "resistor", "label": "N1", "model": "small",
+               "required_inputs": ["x"], "produced_outputs": ["y"]},
+    }, "wires": [["src", "n0"], ["n0", "n1"]]}
+    _rid45 = "collab_s45"
+    _c45 = create_room(CreateRoomRequest(spec=_spec45, owner_id="host", name="scale",
+                                         room_id=_rid45))
+    _s45 = _c45["session_id"]
+    try: topology_pause(_s45)
+    except Exception: pass
+    _r45 = _rooms[_rid45]
+    assert _r45["concurrency"] == "crdt", "S45: 新房间应默认 CRDT（极致路径）"
+
+    # ① 32 人同时抢改**同一节点**，且都基于陈旧 base_rev=0
+    _N45 = 32
+    for i in range(_N45):
+        room_join(_rid45, RoomJoinRequest(user_id=f"p{i}", desired_role="mentor"))
+    import threading as _th45
+    _ok45, _rej45, _err45 = [], [], []
+    def _rush45(i):
+        try:
+            r = topology_edit(_s45, TopologyEditRequest(op="replace", cid="n0",
+                                                        comp={"model": f"m{i}"},
+                                                        base_rev=0),
+                              room_id=_rid45, user_id=f"p{i}")
+            _ok45.append(r)
+        except Exception as ex:
+            (_rej45 if getattr(ex, "status_code", None) == 409 else _err45).append(ex)
+    _ts45 = [_th45.Thread(target=_rush45, args=(i,)) for i in range(_N45)]
+    for t in _ts45: t.start()
+    for t in _ts45: t.join()
+    assert not _err45, f"S45: 并发抢改不应报错 {_err45[:2]}"
+    assert not _rej45, f"S45: CRDT 模式必须零拒绝，实际被拒 {len(_rej45)}"
+    assert len(_ok45) == _N45, f"S45: {_N45} 人应全部成功，实际 {len(_ok45)}"
+    assert _r45["rev"] == _N45, f"S45: rev 应为 {_N45}，实际 {_r45['rev']}"
+
+    # 收敛：把服务端 op 流以两种打乱顺序喂给两个独立副本 → 状态哈希必须一致
+    from runtime import TopologyCRDT as _TC45
+    _srv_hash = _r45["crdt"].state_hash()
+    _ops45 = list(_r45["crdt"].log)
+    import random as _rd45
+    _hashes45 = set()
+    for _seed in (1, 2, 3):
+        _sh = _ops45[:]
+        _rd45.Random(_seed).shuffle(_sh)
+        _rep = _TC45(actor=f"peer{_seed}")
+        _rep.merge(_sh + _sh[:5])               # 乱序 + 重复投递
+        _hashes45.add(_rep.state_hash())
+    assert _hashes45 == {_srv_hash}, f"S45: 副本未与服务端收敛 {_hashes45} vs {_srv_hash}"
+
+    # 客户端直接提交 CRDT op（不走 /topology/edit）也能合并且幂等
+    _peer = _TC45(actor="peer_x"); _peer.merge(_ops45)
+    _peer_ops = [_peer.set_attr("n1", "model", "large"),
+                 _peer.add_node("nx", {"model": "tool"})]
+    _sub1 = room_crdt_submit(_rid45, RoomCRDTOpsRequest(user_id="p0", ops=_peer_ops))
+    _sub2 = room_crdt_submit(_rid45, RoomCRDTOpsRequest(user_id="p0", ops=_peer_ops))
+    assert _sub1["merged"] == 2, f"S45: 应合并 2 个 op，实际 {_sub1['merged']}"
+    assert _sub2["merged"] == 0, "S45: 重复投递应幂等（合并 0 条）"
+    assert _sub1["hash"] == _sub2["hash"], "S45: 幂等后哈希不应变化"
+    _view45 = room_crdt_state(_rid45, user_id="p0")
+    assert _view45["state"]["components"]["n1"]["model"] == "large", "S45: 远端 op 未生效"
+    assert "nx" in _view45["state"]["components"], "S45: 远端新建节点未生效"
+    try:
+        room_crdt_submit(_rid45, RoomCRDTOpsRequest(user_id="ghost", ops=_peer_ops))
+        raise AssertionError("S45: 非成员提交 op 应 403")
+    except HTTPException as _e45:
+        assert _e45.status_code == 403
+
+    # ② presence：心跳 → 在线名单 + 焦点地图；伪造过期心跳 → 自动判离线
+    for i in range(5):
+        room_presence(_rid45, RoomPresenceRequest(user_id=f"p{i}", cursor=[i, i],
+                                                  focus="n0" if i < 3 else "n1"))
+    _pl45 = room_presence_list(_rid45, user_id="p0")
+    assert _pl45["online"] == 5, f"S45: 应 5 人在线，实际 {_pl45['online']}"
+    assert sorted(_pl45["focus_map"]["n0"]) == ["p0", "p1", "p2"], "S45: 焦点地图错误"
+    _r45["presence"]["p4"]["ts"] -= (PRESENCE_TTL + 5)
+    assert room_presence_list(_rid45)["online"] == 4, "S45: 超时成员应自动离线"
+    try:
+        room_presence(_rid45, RoomPresenceRequest(user_id="ghost"))
+        raise AssertionError("S45: 非成员心跳应 403")
+    except HTTPException as _e45b:
+        assert _e45b.status_code == 403
+
+    # ③ 扇出抗压：慢消费者队列打满 → drop-oldest 而非阻塞；presence 高频被 coalesce
+    _hub45 = _RealtimeHub(maxsize=8)
+    _slow = _hub45.subscribe("room45")           # 一个从不消费的"卡死观众"
+    _fast = _hub45.subscribe("room45")
+    for i in range(50):                          # 远超队列容量
+        _hub45.push("room45", {"type": "node_done", "i": i})
+    assert _slow.qsize() == 8, f"S45: 慢消费者队列应被限幅在 8，实际 {_slow.qsize()}"
+    assert _hub45.stats["dropped"] > 0, "S45: 应记录丢弃计数（drop-oldest 生效）"
+    _drained = [_fast.get_nowait() for _ in range(_fast.qsize())]
+    assert _drained[-1]["i"] == 49, "S45: 最新事件必须保留（丢旧不丢新）"
+    _hub45b = _RealtimeHub(maxsize=64)
+    _pq = _hub45b.subscribe("room45b")
+    for i in range(40):                          # 同一用户 40 次心跳
+        _hub45b.push("room45b", {"type": "presence", "actor": "p0", "cursor": [i, i]})
+    assert _pq.qsize() == 1, f"S45: 同用户 presence 应合并为 1 条，实际 {_pq.qsize()}"
+    assert _pq.get_nowait()["cursor"] == [39, 39], "S45: 合并后应保留最新心跳"
+    _hub45b.push("room45b", {"type": "presence", "actor": "p1", "cursor": [0, 0]})
+    _hub45b.push("room45b", {"type": "presence", "actor": "p0", "cursor": [1, 1]})
+    assert _pq.qsize() == 2, "S45: 不同用户的 presence 不应互相合并"
+
+    # 水位可观测
+    _st45 = room_stats(_rid45, user_id="p0")
+    assert _st45["members"] == _N45 + 1 and _st45["online"] >= 4, "S45: stats 人数不对"
+    assert _st45["concurrency"] == "crdt" and _st45["crdt_hash"], "S45: stats 缺 CRDT 水位"
+    print(f"✓ S45 大规模协作(极致): {_N45}人抢改同节点零拒绝零重试 · 3副本乱序+重投全收敛 · "
+          "客户端op幂等合并 · presence在线感知/焦点图/超时离线 · "
+          "慢消费者drop-oldest不拖全房 · presence合并40→1 · 水位可观测 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

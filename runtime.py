@@ -15,6 +15,7 @@ the Backend interface and passing it to Circuit(backend=...).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -4237,6 +4238,271 @@ def human_decision_point_selftest():
     print("✓ ⑧ 人机协同决策点 离线自检通过")
 
 
+# ══════════════════════════════════════════════════════════════
+# 大规模协作（极致·人数众多）：TopologyCRDT —— 无冲突并发编辑
+# ══════════════════════════════════════════════════════════════
+class TopologyCRDT:
+    """让「人数众多」同时改一张拓扑不再需要仲裁与重试。
+
+    为什么不能只靠 OT-lite：
+        OT-lite = 服务端串行 + 版本号 + 语义冲突检测(409)。2~3 人够用；
+        人一多就退化成**重试风暴**——冲突概率随并发人数近似平方上升，
+        每次 409 客户端都要拉 op-log、rebase、重提，延迟与失败率一起爆炸，
+        且必须有一个全局串行点（天然反水平扩展）。
+
+    CRDT 换一条路：让并发操作**天然可合并**——任意到达顺序、任意重复投递，
+    所有副本都收敛到同一状态。于是**永不拒绝、永不重试、无需全局串行点**：
+      · 存在性（节点 / 连线）用 **OR-Set（add-wins）**：每次 add 带唯一 tag，
+        remove 只能删除「自己观察到的 tag」。并发 add|remove → add 胜，
+        绝不会把别人刚建的节点误删。
+      · 属性（gate/threshold/comp 字段）用 **LWW-Map**：每字段带 (lamport, actor)，
+        取大者胜；lamport 相同则比 actor 字典序 → 全序，保证各副本裁决一致。
+      · **Lamport 时钟**承载因果：本地事件 +1，收到远端 op 时抬到 max(local, remote)+1。
+
+    op 是自包含、幂等、可交换的 dict，可直接经事件总线广播给众多订阅者。
+    """
+
+    def __init__(self, actor: str = "srv"):
+        self.actor = str(actor)
+        self.lamport = 0
+        self._seq = 0
+        self.n_add: dict = {}     # cid -> set(tag)
+        self.n_rem: dict = {}     # cid -> set(tag)
+        self.w_add: dict = {}     # (u,v) -> set(tag)
+        self.w_rem: dict = {}
+        self.attrs: dict = {}     # cid -> field -> (lamport, actor, value)
+        self._seen: set = set()   # 已应用 op id（幂等去重）
+        self.log: list = []       # 已应用 op（按本地应用顺序，可广播/回放）
+
+    # ── 内部：时钟与 op 构造 ─────────────────────────────────
+    def _tick(self, observed: int = 0) -> int:
+        self.lamport = max(self.lamport, int(observed or 0)) + 1
+        return self.lamport
+
+    def _mk(self, k: str, **kw) -> dict:
+        self._seq += 1
+        op = {"k": k, "lamport": self._tick(), "actor": self.actor,
+              "oid": f"{self.actor}#{self._seq}"}
+        op.update(kw)
+        return op
+
+    @staticmethod
+    def _tag(op: dict) -> str:
+        return f"{op['actor']}:{op['lamport']}:{op.get('oid', '')}"
+
+    # ── 本地编辑（产生 op 并立即自应用）───────────────────────
+    def add_node(self, cid: str, comp: dict = None) -> dict:
+        op = self._mk("add_node", cid=str(cid), comp=dict(comp or {}))
+        self.apply(op)
+        return op
+
+    def del_node(self, cid: str) -> dict:
+        seen = sorted(self.n_add.get(cid, set()))     # 只删「我观察到的」→ add-wins
+        op = self._mk("del_node", cid=str(cid), tags=seen)
+        self.apply(op)
+        return op
+
+    def set_attr(self, cid: str, field: str, value) -> dict:
+        op = self._mk("set", cid=str(cid), field=str(field), value=value)
+        self.apply(op)
+        return op
+
+    def add_wire(self, u: str, v: str) -> dict:
+        op = self._mk("add_wire", u=str(u), v=str(v))
+        self.apply(op)
+        return op
+
+    def del_wire(self, u: str, v: str) -> dict:
+        seen = sorted(self.w_add.get((str(u), str(v)), set()))
+        op = self._mk("del_wire", u=str(u), v=str(v), tags=seen)
+        self.apply(op)
+        return op
+
+    # ── 应用 / 合并（幂等 + 可交换）──────────────────────────
+    def apply(self, op: dict) -> bool:
+        """应用一个 op（本地或远端均可）。返回是否为新 op（幂等：重复投递返回 False）。"""
+        oid = op.get("oid")
+        if not oid or oid in self._seen:
+            return False
+        self._seen.add(oid)
+        if op.get("actor") != self.actor:          # 远端 op：抬高本地时钟保因果
+            self._tick(op.get("lamport", 0))
+        k = op.get("k")
+        if k == "add_node":
+            self.n_add.setdefault(op["cid"], set()).add(self._tag(op))
+            for f, val in (op.get("comp") or {}).items():
+                self._lww(op["cid"], f, val, op["lamport"], op["actor"])
+        elif k == "del_node":
+            self.n_rem.setdefault(op["cid"], set()).update(op.get("tags") or [])
+        elif k == "set":
+            self._lww(op["cid"], op["field"], op.get("value"), op["lamport"], op["actor"])
+        elif k == "add_wire":
+            self.w_add.setdefault((op["u"], op["v"]), set()).add(self._tag(op))
+        elif k == "del_wire":
+            self.w_rem.setdefault((op["u"], op["v"]), set()).update(op.get("tags") or [])
+        else:
+            self._seen.discard(oid)
+            return False
+        self.log.append(op)
+        return True
+
+    def merge(self, ops) -> int:
+        """合并一批远端 op（顺序无关、可重复）。返回真正新增的条数。"""
+        return sum(1 for op in (ops or []) if self.apply(op))
+
+    def _lww(self, cid: str, field: str, value, lamport: int, actor: str):
+        cur = self.attrs.setdefault(cid, {}).get(field)
+        # 全序比较：(lamport, actor) 大者胜 → 各副本裁决一致
+        if cur is None or (int(lamport), str(actor)) > (int(cur[0]), str(cur[1])):
+            self.attrs[cid][field] = (int(lamport), str(actor), value)
+
+    # ── 物化 / 收敛校验 ─────────────────────────────────────
+    def alive_nodes(self) -> set:
+        return {cid for cid, tags in self.n_add.items()
+                if tags - self.n_rem.get(cid, set())}
+
+    def materialize(self) -> dict:
+        alive = self.alive_nodes()
+        comps = {}
+        for cid in sorted(alive):
+            comps[cid] = {f: v for f, (_, _, v) in
+                          sorted(self.attrs.get(cid, {}).items())}
+        wires = []
+        for (u, v), tags in self.w_add.items():
+            if (tags - self.w_rem.get((u, v), set())) and u in alive and v in alive:
+                wires.append([u, v])
+        return {"components": comps, "wires": sorted(wires)}
+
+    def state_hash(self) -> str:
+        blob = json.dumps(self.materialize(), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+    # ── 与既有 spec / 编辑指令互通 ───────────────────────────
+    @classmethod
+    def from_spec(cls, spec: dict, actor: str = "srv") -> "TopologyCRDT":
+        c = cls(actor=actor)
+        for cid, comp in (spec.get("components") or {}).items():
+            c.add_node(cid, comp if isinstance(comp, dict) else {"value": comp})
+        for w in (spec.get("wires") or []):
+            if isinstance(w, (list, tuple)) and len(w) >= 2:
+                c.add_wire(w[0], w[1])
+        return c
+
+    def apply_edit(self, op: str, args: dict) -> list:
+        """把 server 的编辑指令（set_gate/insert_on_wire/replace_node/reroute…）
+        翻译成 CRDT op 序列。返回本次产生的 op 列表（供广播）。"""
+        a = args or {}
+        out = []
+        if op in ("set_gate", "gate"):
+            if a.get("cid") is not None:
+                out.append(self.set_attr(a["cid"], "threshold", a.get("threshold")))
+        elif op in ("replace_node", "replace"):
+            cid = a.get("cid")
+            comp = a.get("comp") or {}
+            new_cid = a.get("new_cid") or cid
+            if new_cid != cid and cid:
+                out.append(self.del_node(cid))
+            if new_cid:
+                out.append(self.add_node(new_cid, comp))
+        elif op in ("insert_on_wire", "insert"):
+            u, v, cid = a.get("u"), a.get("v"), a.get("cid")
+            if cid:
+                out.append(self.add_node(cid, a.get("comp") or {}))
+            if u and v:
+                out.append(self.del_wire(u, v))
+                if cid:
+                    out.append(self.add_wire(u, cid))
+                    out.append(self.add_wire(cid, v))
+        elif op == "append_parallel":
+            cid, new_cid = a.get("cid"), a.get("new_cid")
+            if new_cid:
+                out.append(self.add_node(new_cid, a.get("comp") or {}))
+                if cid:
+                    out.append(self.add_wire(cid, new_cid))
+        elif op == "reroute":
+            old, new = a.get("old"), a.get("new")
+            if old and len(old) == 2:
+                out.append(self.del_wire(old[0], old[1]))
+            if new and len(new) == 2:
+                if new[0] not in self.alive_nodes():
+                    out.append(self.add_node(new[0], {}))
+                if new[1] not in self.alive_nodes():
+                    out.append(self.add_node(new[1], {}))
+                out.append(self.add_wire(new[0], new[1]))
+        return [o for o in out if o]
+
+
+def topology_crdt_selftest():
+    print("\n=== 大规模协作（极致）：TopologyCRDT 无冲突并发编辑 自检 ===")
+    import random as _rnd
+
+    base = {"components": {"a": {"tier": "small"}, "b": {"tier": "small"},
+                           "c": {"tier": "small"}},
+            "wires": [["a", "b"], ["b", "c"]]}
+
+    # 1) 收敛性：N 个用户各自并发编辑，op 以任意顺序投递 → 所有副本状态一致
+    seed_ops = TopologyCRDT.from_spec(base, actor="seed").log[:]
+    users = [f"u{i}" for i in range(8)]
+    all_ops = list(seed_ops)
+    for i, u in enumerate(users):
+        r = TopologyCRDT(actor=u)
+        r.merge(seed_ops)
+        r.set_attr("b", "tier", f"large_{i}")           # 8 人抢改同一字段
+        r.add_node(f"n_{u}", {"tier": "small"})          # 各自新建节点
+        r.add_wire("a", f"n_{u}")
+        if i % 3 == 0:
+            r.del_node("c")                              # 部分人删同一节点
+        all_ops.extend([o for o in r.log if o["actor"] == u])
+
+    replicas = []
+    for rep in range(5):
+        shuffled = all_ops[:]
+        _rnd.Random(rep).shuffle(shuffled)               # 任意到达顺序
+        shuffled += shuffled[:10]                        # 混入重复投递（幂等考验）
+        c = TopologyCRDT(actor=f"rep{rep}")
+        c.merge(shuffled)
+        replicas.append(c)
+    hashes = {c.state_hash() for c in replicas}
+    assert len(hashes) == 1, f"5 个副本未收敛：{hashes}"
+    print(f"✓ 收敛：8 用户并发 + 5 种到达顺序 + 重复投递 → 状态哈希唯一 {hashes.pop()}")
+
+    st = replicas[0].materialize()
+    # 2) LWW：同字段并发写，胜出者由 (lamport, actor) 全序决定且各副本一致
+    assert st["components"]["b"]["tier"].startswith("large_"), "LWW 应保留某个 large_*"
+    print(f"✓ LWW：8 人抢写 b.tier → 确定性胜出 {st['components']['b']['tier']}")
+
+    # 3) add-wins：并发 add|remove 时新建不被误删
+    for u in users:
+        assert f"n_{u}" in st["components"], f"{u} 新建的节点被误删"
+    print(f"✓ add-wins：{len(users)} 个并发新建节点全部存活，无误删")
+
+    # 4) 删除生效 + 悬空边自动隐藏
+    assert "c" not in st["components"], "被删节点 c 不应存活"
+    assert ["b", "c"] not in st["wires"], "指向已删节点的边应自动隐藏"
+    print("✓ 删除生效且悬空边自动隐藏（b→c 已消失）")
+
+    # 5) 无拒绝：CRDT 路径不产生 409/重试
+    conflicts = [o for o in replicas[0].log if o.get("k") is None]
+    assert not conflicts, "CRDT 不应产生无效 op"
+    print(f"✓ 零拒绝：合并 {len(replicas[0].log)} 个 op，无一次冲突拒绝/重试")
+
+    # 6) 编辑指令翻译（与既有 server op 语义对齐）
+    c = TopologyCRDT.from_spec(base, actor="srv")
+    c.apply_edit("set_gate", {"cid": "b", "threshold": 0.42})
+    c.apply_edit("insert_on_wire", {"u": "a", "v": "b", "cid": "mid",
+                                    "comp": {"tier": "large"}})
+    c.apply_edit("reroute", {"old": ["b", "c"], "new": ["mid", "c"]})
+    m = c.materialize()
+    assert m["components"]["b"]["threshold"] == 0.42
+    assert "mid" in m["components"]
+    assert ["a", "mid"] in m["wires"] and ["mid", "b"] in m["wires"]
+    assert ["a", "b"] not in m["wires"], "insert_on_wire 应断开原直连"
+    assert ["mid", "c"] in m["wires"] and ["b", "c"] not in m["wires"], "reroute 未改流向"
+    print("✓ 编辑翻译：set_gate / insert_on_wire / reroute → CRDT op 语义正确")
+
+    print("✓ TopologyCRDT 离线自检通过")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -4257,6 +4523,7 @@ if __name__ == "__main__":
     self_evolution_selftest()
     quality_gate_selftest()
     skill_registry_selftest()
+    topology_crdt_selftest()
 
 
 def load(path):
