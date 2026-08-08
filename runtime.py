@@ -719,6 +719,12 @@ class CircuitExecutor:
         self._pause_requested = False
         self._resume_event = threading.Event()
         self._topology_dirty = False
+        # 指挥中⼼：① 节点工作报告（透明决策）② 主动提问（驾驭不确定性）
+        #           ③ 人工编辑学习库（教它更聪明）
+        self._node_traces = {}          # cid -> {inputs, output, model, latency, quality, ...}
+        self._pending_question = None   # adc 灰色地带时写入，待人类裁决
+        self._human_answer = None       # answer_question() 写入，恢复时消费
+        self._learnings = []            # 人类每次编辑的记录（human_edited 学习库）
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -964,6 +970,11 @@ class CircuitExecutor:
                     except Exception:
                         pass
                 out[cid] = sig
+                # ── 指挥中⼼① 节点工作报告：记录每节点透明决策轨迹 ──
+                self._record_trace(cid, comp, sig, out)
+                # ── 指挥中⼼② 主动提问：adc/verify 落入灰色地带 → 暂停请人类裁决 ──
+                if comp.get("type") in ("adc", "verify"):
+                    self._check_ambiguity(cid, comp, sig, out)
             self._emit("layer_done", layer_idx=li)
             li += 1
             # ── 在线拓扑编辑检查点：完成当前并行层后，若请求暂停则安全暂停 ──
@@ -1262,6 +1273,10 @@ class CircuitExecutor:
             "done_nodes": list(self._results.keys()),   # 已完成节点（供仪表盘着色）
             "components": list(self.circuit.components.keys()),
             "wires": [list(w) for w in self.circuit.spec.get("wires", [])],
+            # 指挥中⼼：透明决策 + 主动提问 + 人工编辑学习库
+            "node_traces": {k: v for k, v in self._node_traces.items()},
+            "pending_question": self._pending_question,
+            "learnings": list(self._learnings),
         }
 
     def _resume_index(self, layers, out):
@@ -1293,10 +1308,115 @@ class CircuitExecutor:
         else:
             raise ValueError(f"未知编辑操作: {op}")
         self._topology_dirty = True
+        # ── 指挥中⼼③ 教它更聪明：每次人工编辑都记进学习库（成功案例） ──
+        self._record_learning(op, kwargs)
         self._emit("topology_edit", op=op,
                    **{k: v for k, v in kwargs.items() if k != "comp"})
         return {"op": op, "applied": True,
                 "components": list(self.circuit.components.keys())}
+
+    # ── 指挥中⼼① 节点工作报告：逐节点透明决策轨迹 ──
+    def _record_trace(self, cid, comp, sig, out):
+        inputs = {}
+        for p in self.circuit.pred[cid]:
+            s = out.get(p)
+            inputs[p] = (s.value if s is not None and hasattr(s, "value") else None)
+        self._node_traces[cid] = {
+            "node": cid,
+            "type": comp.get("type"),
+            "label": comp.get("label"),
+            "model": comp.get("model") or comp.get("skill") or comp.get("kind"),
+            "inputs": inputs,
+            "output": getattr(sig, "value", None),
+            "quality": round(sig.quality, 3),
+            "ok": bool(sig.ok),
+            "latency_ms": round(getattr(sig, "latency_ms", 0.0), 1),
+            "cost": round(getattr(sig, "cost", 0.0), 4),
+            "gate": sig.meta.get("gate"),
+            "meta": {k: v for k, v in (sig.meta or {}).items()
+                     if k not in ("produced_outputs",)},
+            "ts_ms": round((time.perf_counter() - self._t0) * 1000, 1)
+                     if self._t0 else 0.0,
+        }
+
+    # ── 指挥中⼼② 主动提问：adc/verify 落入灰色地带 → 暂停请人类裁决 ──
+    def _ambiguity_options(self, cid, comp, sig, thr):
+        s = round(sig.quality, 3)
+        return [
+            {"id": "high", "label": f"判定通过（score {s} ≈ 阈值 {round(thr,3)}，采信结论继续）"},
+            {"id": "low",  "label": f"判定不通过（score {s} 落灰色地带，要求重做 / 另寻路径）"},
+        ]
+
+    def _check_ambiguity(self, cid, comp, sig, out):
+        thr = sig.meta.get("threshold", comp.get("threshold", 0.8))
+        band = comp.get("ambiguous_band", 0.05)
+        if sig.quality is None or abs(sig.quality - thr) > band:
+            return  # 判然分明，无需人类介入
+        options = self._ambiguity_options(cid, comp, sig, thr)
+        self._pending_question = {
+            "node": cid, "label": comp.get("label"), "type": comp.get("type"),
+            "score": round(sig.quality, 3), "threshold": round(thr, 3),
+            "band": band, "options": options,
+            "context": {p: (out[p].value if p in out and hasattr(out[p], "value") else None)
+                        for p in self.circuit.pred[cid]},
+        }
+        self._emit("human_question", node=cid, label=comp.get("label"),
+                   score=round(sig.quality, 3), threshold=round(thr, 3),
+                   options=options)
+        # 主动暂停（不依赖外部 pause 指令）—— 执行器在层内直接等待人类作答
+        self._state = "paused"
+        self._resume_event.wait()
+        self._resume_event.clear()
+        self._state = "running"
+        # 消费人类作答：据选择翻转 adc 裁决，让下游按人类意志继续
+        ans = self._human_answer
+        self._human_answer = None
+        self._pending_question = None
+        if ans and "choice" in ans:
+            choice = ans["choice"]
+            if choice in ("high", "accept", "通过"):
+                sig.ok = True
+            elif choice in ("low", "reject", "不通过"):
+                sig.ok = False
+            sig.meta["human_verdict"] = choice
+            if cid in self._node_traces:
+                self._node_traces[cid]["human_verdict"] = choice
+            self._emit("human_answer", node=cid, choice=choice)
+
+    def answer_question(self, choice, note=None):
+        """人类裁决灰色地带：写入答案并尝试恢复（若执行器正因此暂停）。"""
+        self._human_answer = {"choice": choice, "note": note}
+        # 若因本题暂停中，恢复事件会让 _check_ambiguity 消费答案后继续
+        if self._state in ("pausing", "paused"):
+            self._resume_event.set()
+            if self._state == "paused":
+                self._state = "running"
+            return True
+        return False
+
+    # ── 指挥中⼼③ 教它更聪明：记录人工编辑进学习库 ──
+    def _record_learning(self, op, kwargs):
+        rec = {
+            "op": op,
+            "ts_ms": round((time.perf_counter() - self._t0) * 1000, 1)
+                     if self._t0 else 0.0,
+            "target": kwargs.get("cid") or kwargs.get("new_cid")
+                      or f"{kwargs.get('u')}->{kwargs.get('v')}",
+            "components": list(self.circuit.components.keys()),
+            "human_edited": True,
+        }
+        self._learnings.append(rec)
+        # 可选持久化：memory_enabled 时把"人类优化后的拓扑"记入 TopologyMemory，
+        # 使后续类似任务可复用（零回归：失败静默）
+        if self.memory_enabled:
+            try:
+                from compiler.topology_memory import TopologyMemory
+                mem = TopologyMemory()
+                mem.record(f"human-edit:{op}:{rec['target']}",
+                           self.circuit.spec,
+                           {"human_edited": True, "edit_op": op})
+            except Exception:
+                pass
 
 
 class RuntimeTopologyEditor:
@@ -1696,6 +1816,88 @@ def runtime_topology_editor_selftest():
     print("✓ 竞态守护：pause()→立即resume() 不卡死（pausing 窗口幂等置位恢复事件）")
 
     print("\n在线拓扑编辑（人在回路）离线自检全部通过 ✓")
+
+
+def runtime_command_center_selftest():
+    """指挥中⼼离线自检：① 节点工作报告（透明决策）② 主动提问（驾驭不确定性）
+    ③ 人工编辑学习库（教它更聪明）。均为真实线程执行，无网络。"""
+    import threading as _th
+
+    # ── ① 节点工作报告 ──
+    spec = {
+        "name": "cc_demo",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "analyze", "model": "small"},
+            "adc": {"type": "adc", "label": "adc", "threshold": 0.8},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(7))), verbose=False)
+    res = ex.run()
+    traces = ex.get_state()["node_traces"]
+    for cid in ("src", "r1", "adc"):
+        assert cid in traces, f"① 节点 {cid} 应有工作报告"
+        t = traces[cid]
+        assert "output" in t and "model" in t and "latency_ms" in t and "quality" in t, \
+            f"① 节点 {cid} 报告应含 输出/模型/耗时/质量"
+        assert "inputs" in t, f"① 节点 {cid} 报告应含输入上下文"
+    assert traces["adc"]["type"] == "adc"
+    print(f"✓ ① 透明决策：3 节点均产出工作报告（输入/输出/模型/耗时"
+          f"/质量），例如 r1={traces['r1']['model']} 质量={traces['r1']['quality']}")
+
+    # ── ② 主动提问：adc 灰色地带 → 自动暂停请人类裁决 ──
+    spec2 = {
+        "name": "cc_amb",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "analyze", "model": "small"},
+            # ambiguous_band=1.0 让任意 score 都落入灰色地带 → 必触发主动提问（测试可控）
+            "adc": {"type": "adc", "label": "gate", "threshold": 0.8,
+                    "ambiguous_band": 1.0},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    ex2 = CircuitExecutor(Circuit(spec2, SimBackend(random.Random(3))),
+                         verbose=False)
+    _d = _th.Event(); _r = {}
+    def _run():
+        _r["res"] = ex2.run(); _d.set()
+    _th.Thread(target=_run, daemon=True).start()
+    # 轮询直到执行器因灰色地带主动暂停并抛出 pending_question
+    for _ in range(300):
+        if ex2.get_state()["pending_question"]:
+            break
+        time.sleep(0.01)
+    pq = ex2.get_state()["pending_question"]
+    assert pq, "② adc 灰色地带应主动暂停并写入 pending_question"
+    assert pq["type"] == "adc" and len(pq["options"]) == 2, "② 应给出两个对立选项待裁决"
+    print(f"✓ ② 驾驭不确定性：adc score={pq['score']}≈阈值{pq['threshold']} 落入灰色地带"
+          f" → 主动暂停并提问「{pq['label']} 你选哪个？」")
+    # 人类作答：采信通过 → 应恢复且 adc 裁决被翻转为 ok
+    assert ex2.answer_question("high"), "② answer_question 应触发恢复"
+    _d.wait(timeout=10)
+    st = ex2.get_state()
+    assert st["state"] == "done", "② 人类裁决后应恢复并跑完"
+    assert "high" == st["node_traces"]["adc"].get("human_verdict"), \
+        "② adc 应记录人类裁决=high"
+    assert _r["res"]["components"]["adc"]["ok"], "② 人类选 high → adc 应判定通过"
+    print("✓ ② 人类作答（采信通过）→ 执行器恢复、下游按人类意志继续、裁决已记入报告")
+
+    # ── ③ 人工编辑学习库 ──
+    ex3 = CircuitExecutor(Circuit(spec, SimBackend(random.Random(11))), verbose=False)
+    before = len(ex3.get_state()["learnings"])
+    ex3.edit("replace", cid="r1", comp={"type": "resistor", "label": "analyze_v2", "model": "large"})
+    ex3.edit("set_gate", cid="adc", threshold=0.6)
+    learn = ex3.get_state()["learnings"]
+    assert len(learn) == before + 2, "③ 每次人工编辑都应记进学习库"
+    assert all(l.get("human_edited") for l in learn[-2:]), "③ 学习库条目应标记 human_edited"
+    assert learn[-2]["op"] == "replace" and learn[-1]["op"] == "set_gate", \
+        "③ 应记录具体操作类型与目标"
+    print(f"✓ ③ 教它更聪明：2 次人工编辑全部记入学习库（human_edited），"
+          f"下次类似任务可复用你教的工作流")
+
+    print("\n指挥中⼼（透明决策/主动提问/人工编辑学习库）离线自检全部通过 ✓")
 
 
 def circuit_executor_evolve_selftest():

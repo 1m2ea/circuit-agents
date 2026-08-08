@@ -1403,6 +1403,45 @@ def topology_state(sid: str):
     return st
 
 
+class TopologyAnswerRequest(BaseModel):
+    choice: str
+    note: Optional[str] = None
+
+
+@app.api_route("/topology/answer/{sid}", methods=["GET", "POST"])
+def topology_answer(sid: str,
+                    req: Optional[TopologyAnswerRequest] = None,
+                    choice: Optional[str] = Query(None),
+                    note: Optional[str] = Query(None)):
+    """人类裁决灰色地带：adc/verify 主动提问后，老板选边（choice=high/low）。
+    支持 JSON body（POST）或 ?choice= 查询参数（GET）。"""
+    rec = _topo_session(sid)
+    _choice = (req.choice if req else None) or choice
+    _note = (req.note if req else None) or note
+    if not _choice:
+        raise HTTPException(400, "需提供 choice（body 或 ?choice=）")
+    ok = rec["executor"].answer_question(_choice, _note)
+    return {"session_id": sid, "answered": ok, "state": rec["executor"].get_state()}
+
+
+@app.get("/topology/node/{sid}/{cid}")
+def topology_node_report(sid: str, cid: str):
+    """指挥中⼼①：返回某节点的透明决策工作报告（输入/输出/模型/耗时/质量）。"""
+    rec = _topo_session(sid)
+    tr = (rec["executor"].get_state().get("node_traces") or {}).get(cid)
+    if tr is None:
+        raise HTTPException(404, f"节点 {cid} 尚无工作报告（可能尚未执行）")
+    return {"session_id": sid, "node": cid, "report": tr}
+
+
+@app.get("/topology/learnings/{sid}")
+def topology_learnings(sid: str):
+    """指挥中⼼③：返回本会话中人类教给系统的所有编辑（学习库）。"""
+    rec = _topo_session(sid)
+    return {"session_id": sid,
+            "learnings": rec["executor"].get_state().get("learnings", [])}
+
+
 @app.get("/topology/editor")
 def topology_editor_page():
     """可视化拖拽仪表盘（第二步：人在回路）。返回独立 HTML，可直接打开。"""
@@ -2321,6 +2360,62 @@ def selftest():
         # 无 TestClient（未装 httpx2）时跳过路由校验，仅保障字段契约
         pass
     print("✓ S33 可视化仪表盘支撑: get_state.done_nodes/current_layer + /topology/editor 路由就绪")
+
+    # S34: 指挥中⼼ —— 透明决策报告 + 主动提问裁决 + 人工编辑学习库（HTTP 端点级）
+    _cc = {
+        "name": "s34",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "analyze", "model": "small"},
+            "adc": {"type": "adc", "label": "gate", "threshold": 0.8},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    _s34 = topology_session(TopologySessionRequest(spec=_cc, seed=7))
+    _s34id = _s34["session_id"]
+    _topo_sessions[_s34id]["done"].wait(timeout=10)
+    # ① 节点工作报告
+    _rep = topology_node_report(_s34id, "r1")
+    assert "output" in _rep["report"] and "model" in _rep["report"] \
+        and "latency_ms" in _rep["report"] and "quality" in _rep["report"], \
+        "S34: /topology/node 应返回含 输出/模型/耗时/质量 的报告"
+    assert _rep["report"]["model"] == "small", "S34: 报告应记录真实使用的模型档"
+    # ③ 学习库（初始为空，编辑后应有条目）
+    _ln0 = topology_learnings(_s34id)["learnings"]
+    topology_edit(_s34id, TopologyEditRequest(op="set_gate", cid="adc", threshold=0.6))
+    _ln1 = topology_learnings(_s34id)["learnings"]
+    assert len(_ln1) == len(_ln0) + 1, "S34: 一次人工编辑应记入学习库"
+    assert _ln1[-1]["op"] == "set_gate" and _ln1[-1].get("human_edited"), \
+        "S34: 学习库条目应记录操作类型并标记 human_edited"
+    # ② 主动提问：用 ambiguous_band=1.0 的 adc + 延迟，等执行器主动暂停提问
+    _cc2 = {
+        "name": "s34b",
+        "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "r1": {"type": "resistor", "label": "analyze", "model": "small"},
+            "adc": {"type": "adc", "label": "gate", "threshold": 0.8,
+                    "ambiguous_band": 1.0},
+        },
+        "wires": [["src", "r1"], ["r1", "adc"]],
+    }
+    _s34b = topology_session(TopologySessionRequest(
+        spec=_cc2, seed=3, node_delay_ms=150))
+    _s34bid = _s34b["session_id"]
+    for _ in range(300):
+        if topology_state(_s34bid).get("pending_question"):
+            break
+        time.sleep(0.02)
+    assert topology_state(_s34bid).get("pending_question"), \
+        "S34: adc 灰色地带应通过端点暴露 pending_question"
+    # 老板作答（GET 风格：?choice=high）
+    _ans = topology_answer(_s34bid, choice="high")
+    assert _ans["answered"] is True, "S34: 人类裁决应触发恢复"
+    _topo_sessions[_s34bid]["done"].wait(timeout=10)
+    _st34b = topology_state(_s34bid)
+    assert _st34b.get("state") == "done", "S34: 人类裁决后任务应跑完"
+    assert _st34b["node_traces"]["adc"].get("human_verdict") == "high", \
+        "S34: adc 应记录人类裁决=high"
+    print("✓ S34 指挥中⼼: ①节点报告 / ②主动提问→裁决恢复 / ③人工编辑学习库 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

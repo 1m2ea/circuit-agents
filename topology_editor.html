@@ -60,11 +60,22 @@
   .legend{position:absolute;left:12px;bottom:12px;background:rgba(22,28,36,.85);
           border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:11px;color:var(--muted)}
   .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
+  /* 节点工作报告 / 学习库 */
+  #report-body{max-height:200px;overflow:auto}
+  #report-sec,#learn-sec{max-height:230px;overflow:auto}
+  #learn-sec b{color:var(--accent2)}
+  /* 主动提问弹框 */
+  #qmask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;
+         align-items:center;justify-content:center}
+  #qmask .box{background:var(--panel);border:1px solid var(--accent);border-radius:12px;
+         padding:20px;max-width:460px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  #qmask h2{margin:0 0 8px;font-size:15px}
+  #q-opts button{margin:8px 8px 0 0}
 </style>
 </head>
 <body>
 <header>
-  <h1>⚡ 拓扑编辑器</h1><span class="sub">人在回路 · 执行中动态外科手术</span>
+  <h1>🛰 拓扑指挥中心</h1><span class="sub">人在回路 · 实时监控 / 干预 / 接管 / 教它更聪明</span>
   <input type="text" id="server" value="http://127.0.0.1:8765" title="circuit-agents server 地址">
   <select id="preset">
     <option value="demo">示例：双检索→合并→质量门</option>
@@ -121,12 +132,28 @@
         </div>
       </div>
     </div>
-    <div class="sec" style="flex:1;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
+    <div class="sec" id="report-sec" style="display:none">
+      <h2>节点工作报告 · <span id="rep-id"></span></h2>
+      <div id="report-body" style="font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--txt);white-space:pre-wrap"></div>
+    </div>
+    <div class="sec" id="learn-sec">
+      <h2>你教它的工作流（学习库）</h2>
+      <div id="learn-body" style="font-size:12px;color:var(--muted)">暂无人工编辑。每次你改拓扑，都会被它记住，下次类似任务直接复用。</div>
+    </div>
+    <div class="sec" style="max-height:170px;overflow:auto;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
       <h2>事件流</h2>
       <div id="log"></div>
     </div>
   </div>
 </main>
+
+<div id="qmask">
+  <div class="box">
+    <h2>🤔 老板，这个我拿不准</h2>
+    <div id="q-text" style="color:var(--muted);margin-bottom:6px"></div>
+    <div id="q-opts"></div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -294,7 +321,7 @@ function onNodeClick(c){
     S.insertType=null; S.insertU=null;
     return;
   }
-  S.selected=c; render(); showInspector(c);
+  S.selected=c; render(); showInspector(c); showReport(c);
 }
 
 function showInspector(c){
@@ -377,6 +404,52 @@ function updateButtons(st){
   $("btn-resume").disabled=!S.sid||S.done;
 }
 
+// ── 指挥中⼼① 节点工作报告（透明决策）──
+async function showReport(c){
+  if(!S.sid) return;
+  try{
+    const r=await api("/topology/node/"+S.sid+"/"+c);
+    const t=r.report;
+    let h=`<div style="color:var(--muted)">类型 ${t.type} · 模型 <b style="color:var(--txt)">${t.model||"-"}</b></div>`;
+    h+=`<div>质量 <b style="color:${t.ok?'var(--green)':'var(--red)'}">${t.quality}</b> · 耗时 ${t.latency_ms}ms · 成本 ${t.cost}</div>`;
+    h+=`<div style="margin-top:6px;color:var(--muted)">输入上下文：</div>`;
+    const ins=Object.entries(t.inputs||{});
+    h+= ins.length? ins.map(([k,v])=>`<div>· ${k}: ${(v===null?"∅":escapeHtml(String(v)).slice(0,140))}</div>`).join("") : "<div>· （无上游）</div>";
+    h+=`<div style="margin-top:6px;color:var(--muted)">产出：</div><div>${(t.output===null?"∅":escapeHtml(String(t.output)).slice(0,500))}</div>`;
+    if(t.human_verdict) h+=`<div style="margin-top:6px;color:var(--amber)">人类裁决：${t.human_verdict}</div>`;
+    $("report-body").innerHTML=h;
+    $("rep-id").textContent=c;
+    $("report-sec").style.display="block";
+  }catch(e){ /* 节点可能尚未执行，暂无可报告 */ }
+}
+function escapeHtml(s){return s.replace(/[&<>]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[m]));}
+
+// ── 指挥中⼼③ 人工编辑学习库 ──
+function updateLearnings(st){
+  const ls=(st.learnings||[]);
+  const el=$("learn-body");
+  if(!ls.length){ el.innerHTML="暂无人工编辑。每次你改拓扑，都会被它记住，下次类似任务直接复用。"; return; }
+  el.innerHTML=ls.map(l=>`<div style="margin:3px 0">· <b>${l.op}</b> @ ${escapeHtml(l.target||"-")}</div>`).join("");
+}
+
+// ── 指挥中⼼② 主动提问（驾驭不确定性）──
+function showQuestionModal(pq){
+  $("q-text").innerHTML=`节点 <b>${pq.label}</b>（${pq.type}）落在灰色地带：<br>score=<b>${pq.score}</b> ≈ 阈值 ${pq.threshold}。<br>两个方案我无法判断，你选哪个继续？`;
+  const box=$("q-opts"); box.innerHTML="";
+  (pq.options||[]).forEach(o=>{
+    const b=document.createElement("button");
+    b.className="primary"; b.style.margin="8px 8px 0 0"; b.textContent=o.label;
+    b.onclick=()=>answerQuestion(o.id);
+    box.appendChild(b);
+  });
+  $("qmask").style.display="flex";
+}
+async function answerQuestion(choice){
+  await api("/topology/answer/"+S.sid+"?choice="+encodeURIComponent(choice));
+  $("qmask").style.display="none";
+  log(`你裁决：<b>${choice}</b> → 执行器按你的意志继续`);
+}
+
 // ── 轮询 ──
 async function poll(){
   if(!S.sid) return;
@@ -386,6 +459,12 @@ async function poll(){
     const b=$("badge"); b.className="badge b-"+st.state; b.textContent=st.state;
     markState(st);
     if(st.state==="paused") hint("已暂停 —— 可安全编辑拓扑，编辑完点『恢复』");
+    // 指挥中⼼②：执行器主动提问 → 弹框请老板裁决
+    if(st.pending_question && $("qmask").style.display!=="flex") showQuestionModal(st.pending_question);
+    // 指挥中⼼③：刷新学习库
+    updateLearnings(st);
+    // 指挥中⼼①：已完成的选中节点，实时刷新工作报告
+    if(S.selected && (st.done_nodes||[]).includes(S.selected)) showReport(S.selected);
     if(st.done){
       clearInterval(S.pollTimer); S.pollTimer=null; S.done=true;
       $("btn-pause").disabled=true; $("btn-resume").disabled=true;
