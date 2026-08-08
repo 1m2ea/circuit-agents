@@ -154,6 +154,89 @@ _topo_sessions: dict[str, dict] = {}  # 在线拓扑编辑会话：sid -> {execu
 _rooms: dict[str, dict] = {}          # 大规模协作：房间 rid -> {room_id, owner, members:{uid:role}, session_id, activity:[...], created_at}
 _lock = threading.Lock()
 
+# ── 深化③：房间持久化（重启不丢房间/记忆） ──────────────────
+class RoomStore:
+    """把房间（含共享拓扑 spec / 记忆 / ops / 版本）落盘 JSON，做到重启可恢复。
+
+    - 不序列化活对象（CircuitExecutor / threading.Event / 线程），只存可重建字段。
+    - 原子写：先写 .tmp 再 os.replace，避免半截文件。
+    - 重启后 load_rooms() 据 spec 重建内部 topology session（新 session_id）。
+    """
+
+    def __init__(self, path: str = ".rooms.json"):
+        self.path = path
+        self._wlock = threading.RLock()
+
+    def save(self, rooms: dict):
+        snap = {}
+        for rid in list(rooms.keys()):           # 列表快照，迭代期间房间变更也不崩
+            room = rooms.get(rid)
+            if not room:
+                continue
+            mem = room.get("memory", {}) or {}
+            snap[rid] = {
+                "room_id": room.get("room_id", rid),
+                "name": room.get("name", ""),
+                "owner": room.get("owner", ""),
+                "members": dict(room.get("members", {})),
+                "spec": room.get("spec"),
+                "activity": list(room.get("activity", [])),
+                "memory": {k: list(v) if isinstance(v, list) else v
+                           for k, v in mem.items()},
+                "ops": list(room.get("ops", [])),
+                "rev": int(room.get("rev", 0)),
+                "created_at": room.get("created_at", time.time()),
+            }
+        with self._wlock:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)           # 原子替换
+
+    def load(self) -> dict:
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+
+# 房间落盘存储（重启恢复）。_PERSIST=False 时（自检）不写盘，避免污染真实 .rooms.json。
+_ROOMS_FILE = os.environ.get("ROOMS_FILE", ".rooms.json")
+_room_store = RoomStore(_ROOMS_FILE)
+_PERSIST = True
+
+
+def _persist():
+    """把当前所有房间落盘（深化③）。仅在 _PERSIST 时触发。"""
+    if _PERSIST:
+        _room_store.save(_rooms)
+
+
+def load_rooms(store: "RoomStore" = None):
+    """从落盘快照恢复房间，并据 spec 重建内部 topology session。
+
+    模拟『服务重启』：内存房间清空后调用此函数即可全部恢复，且每个房间都有活的 session。
+    """
+    st = store or _room_store
+    for rid, room in st.load().items():
+        room.setdefault("activity", [])
+        room.setdefault("memory", {"published": [], "learnings": [], "templates": []})
+        room.setdefault("ops", [])
+        room.setdefault("rev", 0)
+        room.setdefault("members", {})
+        room.setdefault("created_at", time.time())
+        try:    # 据持久化的 spec 重建内部 session（新 session_id，后台线程跑电路）
+            _sess = topology_session(TopologySessionRequest(spec=room.get("spec") or {}))
+            room["session_id"] = _sess["session_id"]
+        except Exception:
+            room["session_id"] = None
+        with _lock:
+            _rooms[rid] = room
+
+
 # ── 大规模协作：角色与权限（Phase 0 地基） ──────────────────
 ROLE_PERMS = {
     "observer": {"read"},
@@ -1540,6 +1623,7 @@ def topology_edit(sid: str, req: TopologyEditRequest,
             "detail": _args,
         })
     _record_activity(room, user_id, "edit", sid, detail=req.op)
+    _persist()
     resp = {"session_id": sid, "edit": out, "state": rec["executor"].get_state(),
             "rev": _rev}
     if _merge:
@@ -1709,6 +1793,7 @@ def create_room(req: CreateRoomRequest):
     with _lock:
         _rooms[rid] = room
     _record_activity(room, req.owner_id, "create_room", rid, detail=room["name"])
+    _persist()
     return {"room_id": rid, "session_id": _sess["session_id"],
             "owner": req.owner_id, "state": _sess["state"]}
 
@@ -1723,6 +1808,7 @@ def room_join(rid: str, req: RoomJoinRequest):
     with _lock:
         room["members"][req.user_id] = role
     _record_activity(room, req.user_id, "join", rid, detail=role)
+    _persist()
     return {"room_id": rid, "user_id": req.user_id, "role": role,
             "members": dict(room["members"])}
 
@@ -1741,6 +1827,7 @@ def room_set_role(rid: str, req: RoomRoleRequest):
         room["members"][req.user_id] = req.role
         _record_activity(room, req.owner_id, "set_role", rid,
                          detail=f"{req.user_id}->{req.role}")
+    _persist()
     return {"room_id": rid, "user_id": req.user_id, "role": req.role}
 
 
@@ -1818,6 +1905,7 @@ def room_memory_publish(rid: str, req: RoomMemoryPublishRequest):
     with _lock:
         room["memory"]["published"].append(published_name)
         _record_activity(room, req.user_id, "memory_publish", published_name, detail=name)
+    _persist()
     return {"room_id": rid, "published_name": published_name, "tags": tags}
 
 
@@ -1850,6 +1938,7 @@ def room_memory_pull(rid: str, req: RoomMemoryPullRequest):
         room["spec"] = spec
         room["session_id"] = _sess["session_id"]
         _record_activity(room, req.user_id, "memory_pull", req.name, detail=req.name)
+    _persist()
     return {"room_id": rid, "name": req.name, "session_id": _sess["session_id"], "spec": spec}
 
 
@@ -1864,6 +1953,7 @@ def room_memory_distill(rid: str, req: RoomMemoryDistillRequest):
     with _lock:
         room["memory"]["templates"] = templates
         _record_activity(room, req.user_id, "memory_distill", rid, detail=f"{len(templates)} templates")
+    _persist()
     return {"room_id": rid, "templates": templates, "template_count": len(templates)}
 
 
@@ -1906,6 +1996,7 @@ def room_orchestrate(rid: str, req: RoomOrchestrateRequest):
             })
         _record_activity(room, "student", "orchestrate_execute", rid,
                          detail=(trace.get("student") or {}).get("quality_gate_reason"))
+    _persist()
     return {"room_id": rid, "trace": trace,
             "agents": trace.get("agents", {}), "degraded": trace.get("degraded", [])}
 
@@ -2023,7 +2114,11 @@ if mentor_train_cycle is not None:
 
 def selftest():
     """验证 API 模型序列化 + 内存存储 + 后台线程 + SSE 流。"""
-    import random
+    import random, tempfile as _tf
+    # 自检期间改用临时落盘文件 + 关持久化，避免污染真实 .rooms.json
+    global _room_store, _PERSIST
+    _room_store = RoomStore(os.path.join(_tf.mkdtemp(prefix="ca_selftest_"), "rooms.json"))
+    _PERSIST = False
     print("=== server.py 离线自检 ===")
 
     # S1: GoalRequest 反序列化
@@ -3203,6 +3298,56 @@ def selftest():
     print("✓ S41 深化②OT并发编辑: rev/op-log/同目标409/异目标自动rebase/force标记/增量重放/"
           "8线程无丢失/抢改同节点原子(1成功7冲突) 全通过")
 
+    # S42: 深化③ 房间持久化 —— 落盘 .rooms.json，重启加载并据 spec 重建 session
+    _store42 = RoomStore(os.path.join(_tf.mkdtemp(prefix="ca_s42_"), "rooms.json"))
+    _old_store, _old_persist = _room_store, _PERSIST
+    _room_store, _PERSIST = _store42, True   # 临时开启真实落盘
+    try:
+        _spec42 = {"name": "s42_persist", "components": {
+            "src": {"type": "power", "label": "task", "task": "x"},
+            "a": {"type": "resistor", "label": "A", "model": "small",
+                  "required_inputs": ["x"], "produced_outputs": ["y"]},
+        }, "wires": [["src", "a"]]}
+        _rid42 = "collab_s42"
+        _c42 = create_room(CreateRoomRequest(spec=_spec42, owner_id="p1", name="persist", room_id=_rid42))
+        _s42 = _c42["session_id"]
+        room_join(_rid42, RoomJoinRequest(user_id="p2", desired_role="mentor"))
+        # 编辑一次（房间模式 → 触发持久化 + 推进 rev + 写 op）
+        _e42 = topology_edit(_s42, TopologyEditRequest(op="replace", cid="a",
+                                                       comp={"model": "large"}, base_rev=0),
+                             room_id=_rid42, user_id="p1")
+        assert _e42["rev"] == 1, "S42: 编辑应推进 rev"
+        # 沉淀一条记忆，验证 memory 也落盘
+        with _lock:
+            _rooms[_rid42]["memory"]["templates"].append({"name": "t42", "support": 1})
+        _persist()
+        assert os.path.exists(_store42.path), "S42: 落盘文件应存在"
+        # ── 模拟重启：清空内存房间，再用 store 重新加载 ──
+        _rooms.clear()
+        assert _rid42 not in _rooms, "S42: 清空后内存应无此房间"
+        load_rooms(_store42)
+        assert _rid42 in _rooms, "S42: 重启后房间应被加载"
+        _r42 = _rooms[_rid42]
+        assert _r42["owner"] == "p1", "S42: owner 应保留"
+        assert "p2" in _r42["members"] and _r42["members"]["p2"] == "mentor", "S42: 成员/角色应保留"
+        assert _r42["rev"] == 1, "S42: rev 应保留"
+        assert _r42["spec"]["components"]["a"]["model"] == "large", "S42: 编辑后的拓扑应保留"
+        assert _r42["ops"] and _r42["ops"][0]["actor"] == "p1", "S42: op-log 应保留"
+        assert _r42["memory"]["templates"] and _r42["memory"]["templates"][0]["name"] == "t42", \
+            "S42: 发布的记忆应保留"
+        assert _r42["session_id"] in _topo_sessions, "S42: 内部 session 应据 spec 重建"
+        _st42 = _topo_sessions[_r42["session_id"]]["executor"].get_state()
+        assert "components" in _st42, "S42: 重建的 session 应可取状态"
+        # 重新加载的房间仍可继续编辑（session 是活的）
+        _e42b = topology_edit(_r42["session_id"],
+                              TopologyEditRequest(op="replace", cid="a",
+                                                 comp={"model": "small"}, base_rev=1),
+                              room_id=_rid42, user_id="p2")
+        assert _e42b["rev"] == 2, "S42: 重启后房间应能继续编辑"
+    finally:
+        _room_store, _PERSIST = _old_store, _old_persist
+    print("✓ S42 深化③房间持久化: 落盘/重启加载/owner+成员+ops+rev+记忆保留/据spec重建活session/可续编 全通过")
+
     print("\nserver.py 离线自检全部通过 ✓")
 
 
@@ -3217,9 +3362,12 @@ if __name__ == "__main__":
     if args.selftest:
         selftest()
     else:
+        load_rooms()   # 深化③：启动即恢复落盘房间（重启不丢房间/记忆）
         if PI_HEARTBEAT is not None:
             PI_HEARTBEAT.start(interval=60.0)  # 永动心跳：开机即启动
         print(f"circuit-agents API Server → http://{args.host}:{args.port}")
         print("端点: POST /run | GET /run/{id} | GET /run/{id}/stream | GET /health")
         print("π 永动心跳: GET /pi/heartbeat | POST /pi/heartbeat/start|stop|tick")
+        if _rooms:
+            print(f"深化③: 已从 {_room_store.path} 恢复 {len(_rooms)} 个房间")
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
