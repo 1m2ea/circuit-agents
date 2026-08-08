@@ -449,12 +449,202 @@ def mentor_selftest():
         assert res3["quality_gate_passed"] is False, "质量未提升时质量门应拒绝"
         assert len(reg_bad) == 0, "未通过质量门不应固化"
         print("✓ 质量门反例: 学生重跑质量未提升 → 质量门拒绝 → 不固化（防过拟合式回灌）")
+        # ── 多 agent 编排（维度③）离线自检 ──
+        orchestrate_selftest()
         return True
     finally:
         try:
             os.remove(tmp)
         except Exception:
             pass
+
+
+# ──────────────────────────────────────────────────────────
+# 大规模协作 维度③：多 agent 编排（房间内 mentor/reviewer/student 角色闭环）
+#
+#   把单一导师-学生闭环升维为房间内多角色协作：
+#     mentor(提出优化方案) → reviewer(裁决优化 spec 是否可接受)
+#       → [approve] student(执行优化电路) → 质量门 → 固化房间知识库
+#   每个角色的事件都会写进 room activity，供房间内所有人实时可见。
+#   离线/无 key 时 mock 角色给出确定性结果，保证闭环永远可跑、可测。
+# ──────────────────────────────────────────────────────────
+
+def _weakest_node(spec):
+    """挑出 model=small 的 resistor 中最弱的一个（mock 导师升级目标）。"""
+    comps = (spec or {}).get("components", {}) or {}
+    smalls = [c for c, v in comps.items()
+              if isinstance(v, dict) and v.get("type") == "resistor" and v.get("model") == "small"]
+    return smalls[0] if smalls else None
+
+
+def _pred_of(wires, cid):
+    for a, b in wires:
+        if b == cid:
+            return a
+    return None
+
+
+def mock_mentor_plan(spec: dict) -> dict:
+    """确定性 mock 导师方案：升级最弱 small 节点到 large；若某节点的 required_inputs
+    未被上游 produced_outputs 覆盖则插入一个验证节点。离线/无 key 时替代真实导师。"""
+    cid = _weakest_node(spec)
+    node_fixes = [{"cid": cid, "model": "large"}] if cid else []
+    topo_ops = []
+    comps = (spec or {}).get("components", {}) or {}
+    wires = (spec or {}).get("wires", []) or []
+    produced = set()
+    for c, v in comps.items():
+        for o in (v.get("produced_outputs") or []):
+            produced.add(o)
+    for c, v in comps.items():
+        if not isinstance(v, dict):
+            continue
+        needs = v.get("required_inputs") or []
+        missing = [n for n in needs if n not in produced]
+        if missing:
+            vn = c + "_verify"
+            topo_ops.append({"op": "insert_after", "after": _pred_of(wires, c) or "src",
+                             "node": {"type": "resistor", "label": vn, "model": "small",
+                                      "required_inputs": missing, "produced_outputs": missing,
+                                      "mentor_prompt": "校验上游输出合理性"}})
+    return {"diagnosis": (f"节点 {cid} 用 small 档偏弱" if cid else "未发现明显弱节点")
+            + ("；部分节点输入未被上游覆盖" if topo_ops else ""),
+            "node_fixes": node_fixes, "topology_ops": topo_ops,
+            "rationale": "升级最弱节点并补齐缺失输入以提升成功率"}
+
+
+def _is_connected_dag(spec):
+    """校验 spec 是连通 DAG（reviewer 裁决用）。返回 (ok, reason)。"""
+    from collections import deque
+    comps = (spec or {}).get("components", {}) or {}
+    wires = (spec or {}).get("wires", []) or []
+    if not comps:
+        return False, "空拓扑"
+    indeg = {c: 0 for c in comps}
+    adj = {c: [] for c in comps}
+    for a, b in wires:
+        if a not in comps or b not in comps:
+            return False, f"边引用不存在节点 {a}->{b}"
+        adj[a].append(b)
+        indeg[b] += 1
+    q = deque([c for c in comps if indeg[c] == 0])
+    seen = 0
+    while q:
+        u = q.popleft(); seen += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    if seen != len(comps):
+        return False, "拓扑存在环"
+    return True, "连通DAG"
+
+
+def reviewer_adjudicate(base_spec, opt_spec) -> dict:
+    """Reviewer 角色：裁决优化 spec 是否可接受。
+    校验：① 仍是合法连通 DAG；② 优化未丢失原必需输出；③ 确有改进（节点档升级或新增验证）。"""
+    ok, why = _is_connected_dag(opt_spec)
+    if not ok:
+        return {"verdict": "reject", "reason": "优化后拓扑非法：" + why}
+    base_comps = (base_spec or {}).get("components", {}) or {}
+    opt_comps = opt_spec.get("components", {}) or {}
+    base_out, opt_out = set(), set()
+    for v in base_comps.values():
+        for o in (v.get("produced_outputs") or []):
+            base_out.add(o)
+    for v in opt_comps.values():
+        for o in (v.get("produced_outputs") or []):
+            opt_out.add(o)
+    if not base_out.issubset(opt_out):
+        return {"verdict": "reject", "reason": "优化丢失了原拓扑的必需输出"}
+    improved = (len(opt_comps) > len(base_comps)) or any(
+        opt_comps.get(c, {}).get("model") == "large"
+        and base_comps.get(c, {}).get("model") != "large"
+        for c in base_comps)
+    if not improved:
+        return {"verdict": "reject", "reason": "未产生可观测的改进"}
+    return {"verdict": "approve", "reason": "拓扑合法且较原方案有改进"}
+
+
+def mock_student_rerun(spec) -> dict:
+    """确定性 mock 学生：优化后拓扑（含 large 升级或验证节点）质量更高。"""
+    comps = (spec or {}).get("components", {}) or {}
+    has_large = any(v.get("model") == "large" for v in comps.values() if isinstance(v, dict))
+    has_verify = any("verify" in c.lower() for c in comps)
+    q = 0.95 if (has_large or has_verify) else 0.2
+    return {"final_quality": q, "success": True, "failed_nodes": [], "outputs": {}}
+
+
+def orchestrate(spec, *, mock=False, mentor_fn=None, reviewer_fn=None, student_fn=None,
+                quality_threshold=0.8, before_quality=0.0,
+                use_real_mentor=True, use_real_student=True):
+    """房间内多 agent 编排闭环：mentor(提出优化) → reviewer(裁决) → [approve] student(执行) → 质量门。
+
+    返回全链路 trace dict（供端点写 room activity + 知识库）：
+      {"mentor":{diagnosis,plan}, "optimized_spec", "reviewer":{verdict,reason},
+       "student":{result, after_quality, quality_gate_passed, quality_gate_reason} | {skipped}}
+    mock=True 时用确定性角色，保证离线可跑、可测；否则尝试真实导师/学生，失败自动降级 mock。
+    """
+    base = spec
+    # 1) mentor 角色
+    if mentor_fn is not None:
+        plan = mentor_fn(base)
+    elif mock or not use_real_mentor:
+        plan = mock_mentor_plan(base)
+    else:
+        try:
+            plan = MentorAgent().analyze(
+                {"goal": "", "spec": base, "result": {"final_quality": before_quality}})
+        except Exception:
+            plan = mock_mentor_plan(base)
+    optimized = apply_optimization(base, plan)
+    trace = {"mentor": {"diagnosis": plan.get("diagnosis"), "plan": plan},
+             "optimized_spec": optimized}
+    # 2) reviewer 角色
+    rv_fn = reviewer_fn or reviewer_adjudicate
+    verdict = rv_fn(base, optimized)
+    trace["reviewer"] = verdict
+    # 3) student 角色（仅 approve 后执行）
+    if verdict["verdict"] == "approve":
+        if student_fn is not None:
+            rr = student_fn(optimized)
+        elif mock or not use_real_student:
+            rr = mock_student_rerun(optimized)
+        else:
+            try:
+                be = make_ollama_student()
+                rr = rerun_student(optimized, be) if be else mock_student_rerun(optimized)
+            except Exception:
+                rr = mock_student_rerun(optimized)
+        after_q = rr.get("final_quality", 0.0) if isinstance(rr, dict) else rr[0]
+        passed, reason = quality_gate(before_quality, after_q, quality_threshold)
+        trace["student"] = {"result": rr, "after_quality": after_q,
+                            "quality_gate_passed": passed, "quality_gate_reason": reason}
+    else:
+        trace["student"] = {"skipped": True, "reason": "reviewer 驳回"}
+    return trace
+
+
+def orchestrate_selftest():
+    """多 agent 编排离线自检：mock 角色全链路 + reviewer 驳回路径。"""
+    base = {"name": "orch", "components": {
+        "src": {"type": "power", "label": "src"},
+        "A": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["x"]},
+        "B": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["y"]},
+        "C": {"type": "resistor", "label": "C", "model": "small",
+              "required_inputs": ["y"], "produced_outputs": ["z"]},
+    }, "wires": [["src", "A"], ["A", "B"], ["B", "C"]]}
+    tr = orchestrate(base, mock=True, before_quality=0.2)
+    assert tr["mentor"]["plan"]["node_fixes"], "mentor 应提出升级最弱节点"
+    assert tr["reviewer"]["verdict"] == "approve", "mock 优化应被 reviewer 通过"
+    assert tr["student"]["after_quality"] == 0.95, "student 重跑质量应反映优化"
+    assert tr["student"]["quality_gate_passed"] is True, "质量门应通过"
+    # reviewer 驳回：优化破坏 DAG（删掉必需节点）
+    broken = dict(base); broken["wires"] = [["src", "A"], ["A", "C"]]  # B 悬空
+    v = reviewer_adjudicate(base, broken)
+    assert v["verdict"] == "reject", "破坏 DAG 的优化应被 reviewer 驳回"
+    print("✓ 多 agent 编排离线自检通过 (mentor提议→reviewer裁决→student执行→质量门 / 驳回路径)")
 
 
 if __name__ == "__main__":

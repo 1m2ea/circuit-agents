@@ -109,6 +109,7 @@
   <span>我是 <span class="me" id="rb-me"></span></span>
   <span id="rb-members"></span>
   <button id="btn-invite">📋 复制邀请</button>
+  <button id="btn-orchestrate">⚙ 多agent编排</button>
   <span class="hint" id="rb-hint"></span>
 </div>
 <main>
@@ -665,6 +666,23 @@ async function pullMemory(name){
     render();
   }catch(e){ $("kb-hint").textContent="拉取失败："+e.message; }
 }
+
+// ── 多 agent 编排（维度③）：mentor 提优化 → reviewer 裁决 → student 执行 ──
+function _canOrchestrate(){ const r=(S.members[S.me]||S.role); return r==="owner"||r==="mentor"||r==="student"; }
+async function orchestrate(){
+  if(!S.room) return;
+  if(!_canOrchestrate()){ $("rb-hint").textContent="⛔ 需 owner/mentor/student 权限"; return; }
+  try{
+    const r=await api("/rooms/"+S.room+"/orchestrate",{user_id:S.me, mock:true});
+    const t=r.trace;
+    const v=t.reviewer.verdict;
+    const st = t.student.skipped ? "（reviewer 驳回）"
+              : (" → student 质量=" + t.student.after_quality + (t.student.quality_gate_passed ? " ✓" : " ✗"));
+    $("rb-hint").textContent="⚙ mentor: "+(t.mentor.diagnosis||"")+" → reviewer: "+v+st;
+    log("⚙ 多agent编排：mentor 提议 → reviewer:"+v+st);
+    loadMemory();
+  }catch(e){ $("rb-hint").textContent="编排失败："+e.message; }
+}
 function renderMembers(){
   const el=$("rb-members"); if(!el) return; el.innerHTML="";
   for(const [u,r] of Object.entries(S.members||{})){
@@ -692,6 +710,7 @@ $("btn-pause").addEventListener("click",pause);
 $("btn-resume").addEventListener("click",resume);
 $("btn-kb-publish").addEventListener("click",publishMemory);
 $("btn-kb-distill").addEventListener("click",distillMemory);
+$("btn-orchestrate").addEventListener("click",orchestrate);
 $("ins-replace").addEventListener("click",replaceNode);
 $("ins-append").addEventListener("click",appendParallel);
 $("ins-gate").addEventListener("change",setGate);

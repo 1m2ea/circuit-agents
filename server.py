@@ -1561,6 +1561,13 @@ class RoomMemoryDistillRequest(BaseModel):
     min_support: int = Field(2, description="motif 最小支持度")
 
 
+class RoomOrchestrateRequest(BaseModel):
+    user_id: str = Field(..., description="编排发起者（需 control 权限：owner/mentor/student）")
+    case: Optional[dict] = Field(None, description="失败案例 {goal,spec,result}；不传用房间 spec")
+    mock: bool = Field(False, description="离线/无 key 时用确定性角色，保证闭环可跑")
+    quality_threshold: float = Field(0.8, description="质量门阈值")
+
+
 @app.post("/rooms")
 def create_room(req: CreateRoomRequest):
     """新建协作房间：内部建一个共享 topology session，房主为 owner。"""
@@ -1718,6 +1725,37 @@ def room_memory_distill(rid: str, req: RoomMemoryDistillRequest):
         room["memory"]["templates"] = templates
         _record_activity(room, req.user_id, "memory_distill", rid, detail=f"{len(templates)} templates")
     return {"room_id": rid, "templates": templates, "template_count": len(templates)}
+
+
+@app.post("/rooms/{rid}/orchestrate")
+def room_orchestrate(rid: str, req: RoomOrchestrateRequest):
+    """房间内多 agent 编排闭环（维度③）：mentor 提优化 → reviewer 裁决 → [通过] student 执行 → 质量门。
+    全链路事件写入 room activity 供所有人可见；通过则固化进房间知识库。需 control 权限。"""
+    room = _room_ctx(rid, req.user_id, "control")
+    case = req.case or {}
+    base_spec = case.get("spec") or room.get("spec") or {}
+    before_q = (case.get("result", {}) or {}).get("final_quality", 0.0) if case else 0.0
+    from mentor import orchestrate as _orchestrate
+    trace = _orchestrate(base_spec, mock=req.mock, before_quality=before_q,
+                         quality_threshold=req.quality_threshold)
+    diag = (trace.get("mentor", {}).get("diagnosis") or "")[:60]
+    _record_activity(room, req.user_id, "orchestrate", rid,
+                     detail=f"mentor:{diag} → reviewer:{trace['reviewer']['verdict']}")
+    if trace["reviewer"]["verdict"] == "approve":
+        with _lock:
+            room["memory"]["templates"].append({
+                "name": f"orchestrate_{rid}", "support": 1,
+                "diagnosis": trace["mentor"]["diagnosis"],
+                "optimized_spec": trace["optimized_spec"],
+                "quality": (trace.get("student") or {}).get("after_quality"),
+            })
+            room["memory"]["learnings"].append({
+                "ts": time.time(), "actor": "orchestrator", "op": "orchestrate",
+                "detail": trace["reviewer"],
+            })
+        _record_activity(room, "student", "orchestrate_execute", rid,
+                         detail=(trace.get("student") or {}).get("quality_gate_reason"))
+    return {"room_id": rid, "trace": trace}
 
 
 # asyncio.sleep 包装（避免底层依赖细节）
@@ -2773,6 +2811,32 @@ def selftest():
     _dist = room_memory_distill(_rid3, RoomMemoryDistillRequest(user_id="erin"))
     assert "templates" in _dist, "S37: 应返回蒸馏模板"
     print("✓ S37 大规模协作维度②: 发布到共享仓库/多人可读记忆/越权403/pull复用/蒸馏模板 全通过")
+
+    # S38: 大规模协作维度③ —— 多 agent 编排（房间内 mentor/reviewer/student 闭环）
+    _rid4 = "collab_s38"
+    _c4 = create_room(CreateRoomRequest(spec=_spec, owner_id="grant", name="orch", room_id=_rid4))
+    assert _c4["room_id"] == _rid4, "S38: 应创建编排房间"
+    # grant(owner) 发起编排（mock 模式，确定性可测）
+    _orc = room_orchestrate(_rid4, RoomOrchestrateRequest(user_id="grant", mock=True))
+    _t = _orc["trace"]
+    assert _t["mentor"]["plan"]["node_fixes"], "S38: mentor 应提出优化"
+    assert _t["reviewer"]["verdict"] == "approve", "S38: mock 优化应被 reviewer 通过"
+    assert _t["student"]["quality_gate_passed"] is True, "S38: student 执行应过质量门"
+    # 编排事件写入 room activity（所有人可见）
+    _acts4 = room_activity(_rid4, user_id="grant")["activities"]
+    assert any(a["action"] == "orchestrate" for a in _acts4), "S38: 应有 orchestrate 事件"
+    assert any(a["actor"] == "student" for a in _acts4), "S38: student 执行应可见"
+    # 通过则固化进房间知识库
+    assert room_memory(_rid4, user_id="grant")["templates"], "S38: 编排通过应固化模板"
+    # reviewer 角色(grace) 有 adjudicate 但无 control → 不能发起编排 → 403
+    room_join(_rid4, RoomJoinRequest(user_id="grace", desired_role="reviewer"))
+    _forbidden_orc = False
+    try:
+        room_orchestrate(_rid4, RoomOrchestrateRequest(user_id="grace", mock=True))
+    except Exception as e:
+        _forbidden_orc = (getattr(e, "status_code", None) == 403)
+    assert _forbidden_orc, "S38: reviewer 无 control 发起编排应被 403 拦截"
+    print("✓ S38 大规模协作维度③: mentor提议/reviewer裁决/student执行/质量门/activity可见/越权403 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
