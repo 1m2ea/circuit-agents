@@ -64,6 +64,23 @@
   #report-body{max-height:200px;overflow:auto}
   #report-sec,#learn-sec{max-height:230px;overflow:auto}
   #learn-sec b{color:var(--accent2)}
+  /* 协同模式 */
+  #roombar{display:none;align-items:center;gap:8px;padding:6px 12px;background:var(--panel2);
+           border-bottom:1px solid var(--line);flex-wrap:wrap}
+  #roombar.show{display:flex}
+  #roombar .rname{font-weight:600;color:var(--accent2)}
+  #roombar .me{color:var(--txt)}
+  .mbadge{padding:2px 8px;border-radius:14px;font-size:11px;font-weight:600;border:1px solid var(--line)}
+  .mb-owner{background:#10243a;color:var(--accent);border-color:var(--accent)}
+  .mb-mentor{background:#241a3a;color:var(--accent2);border-color:var(--accent2)}
+  .mb-reviewer{background:#3a2a12;color:var(--amber);border-color:var(--amber)}
+  .mb-student{background:#0f2e1c;color:var(--green);border-color:var(--green)}
+  .mb-observer{background:#222c38;color:var(--muted)}
+  #collab-body{font-size:12px;max-height:200px;overflow:auto}
+  #collab-body .ca{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--line);align-items:baseline}
+  #collab-body .ca .who{font-weight:600;min-width:54px}
+  #collab-body .ca .act{color:var(--muted)}
+  #collab-body .ca .tm{color:var(--gray);font-size:10px;margin-left:auto}
   /* 主动提问弹框 */
   #qmask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;
          align-items:center;justify-content:center}
@@ -87,6 +104,13 @@
   <span id="badge" class="badge b-idle">idle</span>
   <span class="hint" id="hint"></span>
 </header>
+<div id="roombar">
+  <span class="rname" id="rb-name"></span>
+  <span>我是 <span class="me" id="rb-me"></span></span>
+  <span id="rb-members"></span>
+  <button id="btn-invite">📋 复制邀请</button>
+  <span class="hint" id="rb-hint"></span>
+</div>
 <main>
   <div id="canvas-wrap">
     <svg id="svg" width="1200" height="700"></svg>
@@ -140,6 +164,10 @@
       <h2>你教它的工作流（学习库）</h2>
       <div id="learn-body" style="font-size:12px;color:var(--muted)">暂无人工编辑。每次你改拓扑，都会被它记住，下次类似任务直接复用。</div>
     </div>
+    <div class="sec" id="collab-sec" style="display:none;max-height:210px;overflow:auto;flex-direction:column;min-height:0">
+      <h2>协同动态 · 房间内所有人</h2>
+      <div id="collab-body"></div>
+    </div>
     <div class="sec" style="max-height:170px;overflow:auto;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
       <h2>事件流</h2>
       <div id="log"></div>
@@ -163,8 +191,15 @@ let S = {
   base:"http://127.0.0.1:8765", sid:null, spec:null,
   pos:{}, selected:null, edited:new Set(),
   insertType:null, insertU:null,
-  pollTimer:null, done:false
+  pollTimer:null, done:false,
+  room:null, me:null, role:null, members:{}, lastAct:-1
 };
+
+// ── 协同模式：解析 URL 参数 ?room=&me=&role= ──
+(function parseRoom(){
+  const q=new URLSearchParams(location.search);
+  S.room=q.get("room"); S.me=q.get("me"); S.role=q.get("role")||"observer";
+})();
 
 const PRESETS = {
   demo:{
@@ -197,7 +232,11 @@ function log(msg,cls){const d=$("log");const t=document.createElement("div");
 function hint(msg){$("hint").textContent=msg||"";}
 
 async function api(path,body){
-  const url=S.base+path;
+  let url=S.base+path;
+  if(S.room && S.me){
+    const sep=path.includes("?")?"&":"?";
+    url+=sep+"room_id="+encodeURIComponent(S.room)+"&user_id="+encodeURIComponent(S.me);
+  }
   const opt={method:body?"POST":"GET",headers:{"Content-Type":"application/json"}};
   if(body) opt.body=JSON.stringify(body);
   const r=await fetch(url,opt);
@@ -450,6 +489,22 @@ async function answerQuestion(choice){
   log(`你裁决：<b>${choice}</b> → 执行器按你的意志继续`);
 }
 
+// ── 协同动态渲染 ──
+function renderCollab(acts){
+  const el=$("collab-body"); if(!el) return;
+  const zh={"create_room":"创建房间","join":"加入","pause":"暂停","resume":"恢复","edit":"编辑","answer":"裁决"};
+  const rows=(acts||[]).slice().reverse().map(a=>{
+    const role=S.members[a.actor]||"?";
+    const actZh=zh[a.action]||a.action;
+    const t=new Date((a.ts||0)*1000);
+    const tm=t.toLocaleTimeString("zh-CN",{hour12:false});
+    return `<div class="ca"><span class="who" style="color:var(--${roleColor(role)})">${escapeHtml(a.actor)}</span>`+
+           `<span class="act">${actZh}${a.detail?(" · "+escapeHtml(String(a.detail))):""}</span>`+
+           `<span class="tm">${tm}</span></div>`;
+  }).join("");
+  el.innerHTML=rows||'<div class="act" style="color:var(--muted)">暂无其他人动作</div>';
+}
+
 // ── 轮询 ──
 async function poll(){
   if(!S.sid) return;
@@ -465,6 +520,15 @@ async function poll(){
     updateLearnings(st);
     // 指挥中⼼①：已完成的选中节点，实时刷新工作报告
     if(S.selected && (st.done_nodes||[]).includes(S.selected)) showReport(S.selected);
+    // 协同模式：拉取房间动态 + 刷新成员（实时看到他人动作）
+    if(S.room){
+      try{
+        const act=await api("/rooms/"+S.room+"/activity");
+        const info=await api("/rooms/"+S.room);
+        S.members=info.members||S.members; renderMembers();
+        renderCollab(act.activities||[]);
+      }catch(e){}
+    }
     if(st.done){
       clearInterval(S.pollTimer); S.pollTimer=null; S.done=true;
       $("btn-pause").disabled=true; $("btn-resume").disabled=true;
@@ -479,9 +543,10 @@ async function poll(){
 // ── 启动 ──
 async function start(){
   S.base=$("server").value.trim().replace(/\/$/,"");
+  S.pos={}; S.edited.clear(); S.selected=null; S.done=false; S.insertType=null; S.insertU=null;
+  if(S.room && S.me){ await startCollab(); return; }
   const p=PRESETS[$("preset").value];
   S.spec=JSON.parse(JSON.stringify(p));
-  S.pos={}; S.edited.clear(); S.selected=null; S.done=false; S.insertType=null; S.insertU=null;
   log("启动会话："+p.name+"（每节点 600ms 延迟，便于暂停干预）");
   try{
     const r=await api("/topology/session",{spec:S.spec,seed:1,node_delay_ms:600});
@@ -493,6 +558,44 @@ async function start(){
     S.pollTimer=setInterval(poll,600); poll();
   }catch(e){ log("启动失败："+e.message); }
 }
+
+// ── 协同模式启动：加入已存在房间，或首次用 preset 创建（自己为 owner）──
+async function startCollab(){
+  try{
+    const info=await api("/rooms/"+S.room);
+    S.sid=info.session_id; S.spec=info.spec||{}; S.members=info.members||{};
+    log("加入房间 <b>"+S.room+"</b> · 你是 "+S.me);
+  }catch(e){
+    if(e.message.startsWith("404")){
+      const p=PRESETS[$("preset").value];
+      const r=await api("/rooms",{spec:p, owner_id:S.me, name:p.name, room_id:S.room});
+      S.sid=r.session_id; S.spec=p; S.members={[S.me]:"owner"};
+      log("创建并加入房间 <b>"+S.room+"</b> · 你是 owner（分享 ?room="+S.room+"&me=名字 给协作者）");
+    }else{ log("协同启动失败："+e.message); return; }
+  }
+  try{ await api("/rooms/"+S.room+"/join",{user_id:S.me, desired_role:S.role}); }catch(e){}
+  showRoomBar();
+  $("btn-pause").disabled=false; $("btn-resume").disabled=false;
+  render(); showInspectorNone();
+  if(S.pollTimer) clearInterval(S.pollTimer);
+  S.pollTimer=setInterval(poll,600); poll();
+}
+function showRoomBar(){
+  $("roombar").classList.add("show");
+  $("rb-name").textContent="房间 "+S.room;
+  $("rb-me").textContent=S.me+"（"+(S.members[S.me]||S.role)+"）";
+  $("collab-sec").style.display="flex";
+  renderMembers();
+}
+function renderMembers(){
+  const el=$("rb-members"); if(!el) return; el.innerHTML="";
+  for(const [u,r] of Object.entries(S.members||{})){
+    const s=document.createElement("span");
+    s.className="mbadge mb-"+r; s.textContent=u+"·"+r; s.style.marginLeft="4px";
+    el.appendChild(s);
+  }
+}
+function roleColor(r){return {owner:"accent",mentor:"accent2",reviewer:"amber",student:"green",observer:"muted"}[r]||"muted";}
 function showInspectorNone(){
   $("ins-empty").style.display="block"; $("ins-body").style.display="none";
 }
@@ -501,6 +604,12 @@ async function resume(){ if(!S.sid)return; const r=await api("/topology/resume/"
 
 // ── 绑定 ──
 $("btn-start").addEventListener("click",start);
+$("btn-invite").addEventListener("click",()=>{
+  const u=location.origin+location.pathname+"?room="+encodeURIComponent(S.room);
+  navigator.clipboard.writeText(u).then(()=>{
+    $("rb-hint").textContent="邀请链接已复制 → 让协作者打开后把 &me=他的名字 加在 URL 末尾";
+  }).catch(()=>{ $("rb-hint").textContent="邀请链接："+u; });
+});
 $("btn-pause").addEventListener("click",pause);
 $("btn-resume").addEventListener("click",resume);
 $("ins-replace").addEventListener("click",replaceNode);

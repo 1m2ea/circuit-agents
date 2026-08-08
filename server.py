@@ -1523,6 +1523,7 @@ class CreateRoomRequest(BaseModel):
     spec: dict = Field(..., description="房间共享的电路拓扑 Spec")
     owner_id: str = Field(..., description="房主用户 id")
     name: Optional[str] = Field(None, description="房间名")
+    room_id: Optional[str] = Field(None, description="可指定房间 id（便于分享链接；冲突则服务端另生成）")
 
 
 class RoomJoinRequest(BaseModel):
@@ -1540,7 +1541,7 @@ class RoomRoleRequest(BaseModel):
 def create_room(req: CreateRoomRequest):
     """新建协作房间：内部建一个共享 topology session，房主为 owner。"""
     import uuid as _uuid, time as _tm
-    rid = _uuid.uuid4().hex[:10]
+    rid = req.room_id if (req.room_id and req.room_id not in _rooms) else _uuid.uuid4().hex[:10]
     _sess = topology_session(TopologySessionRequest(spec=req.spec))
     room = {
         "room_id": rid,
@@ -1548,6 +1549,7 @@ def create_room(req: CreateRoomRequest):
         "owner": req.owner_id,
         "members": {req.owner_id: "owner"},
         "session_id": _sess["session_id"],
+        "spec": req.spec,
         "activity": [],
         "created_at": _tm.time(),
     }
@@ -1601,7 +1603,7 @@ def room_info(rid: str, user_id: Optional[str] = None):
     st = sess.get("executor") and sess["executor"].get_state()
     return {"room_id": rid, "name": room["name"], "owner": room["owner"],
             "members": dict(room["members"]), "session_id": room["session_id"],
-            "created_at": room["created_at"], "state": st,
+            "created_at": room["created_at"], "state": st, "spec": room.get("spec"),
             "activity_count": len(room["activity"])}
 
 
@@ -2622,6 +2624,25 @@ def selftest():
     assert "create_room" in _actions and "join" in _actions and "edit" in _actions, \
         "S35: activity 流应记录动作"
     print("✓ S35 大规模协作 Phase0: 房间创建/成员角色/权限矩阵/越权403/activity流 全通过")
+
+    # S36: 大规模协作维度三 —— 实时协同同步（多人动作互相可见 + 指定 room_id + spec 共享）
+    _rid2 = "collab_s36"
+    _c = create_room(CreateRoomRequest(spec=_spec, owner_id="carol", name="c", room_id=_rid2))
+    assert _c["room_id"] == _rid2, "S36: 应可用指定 room_id 创建（便于分享链接）"
+    _sid2 = _c["session_id"]
+    room_join(_rid2, RoomJoinRequest(user_id="dave", desired_role="mentor"))
+    # carol(owner) 编辑
+    topology_edit(_sid2, TopologyEditRequest(op="set_gate", cid="adc", threshold=0.9),
+                 room_id=_rid2, user_id="carol")
+    # dave(mentor) 拉 activity 应看到 carol 的动作（多人动作互通）
+    _act2 = room_activity(_rid2, user_id="dave")["activities"]
+    _actors = {a["actor"] for a in _act2}
+    assert "carol" in _actors, "S36: dave 应能看到 carol 的动作（协同互通）"
+    assert "edit" in [a["action"] for a in _act2], "S36: activity 应含 edit 动作"
+    # dave 也能看到房间 spec（协同渲染用）
+    _info2 = room_info(_rid2, user_id="dave")
+    assert _info2.get("spec"), "S36: room_info 应返回 spec 供协作者渲染拓扑"
+    print("✓ S36 大规模协作维度三: 指定room_id/多人动作互通/spec共享 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
