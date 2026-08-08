@@ -159,8 +159,8 @@ ROLE_PERMS = {
     "observer": {"read"},
     "student":  {"read", "control"},
     "reviewer": {"read", "adjudicate"},
-    "mentor":   {"read", "control", "edit", "adjudicate"},
-    "owner":    {"read", "control", "edit", "adjudicate", "manage"},
+    "mentor":   {"read", "control", "edit", "adjudicate", "publish"},
+    "owner":    {"read", "control", "edit", "adjudicate", "manage", "publish"},
 }
 
 def _has_perm(room: dict, user_id: str, action: str) -> bool:
@@ -1425,6 +1425,11 @@ def topology_edit(sid: str, req: TopologyEditRequest,
         raise HTTPException(400, f"编辑失败: {e}")
     if room:
         _record_activity(room, user_id, "edit", sid, detail=req.op)
+        room["memory"]["learnings"].append({
+            "ts": time.time(), "actor": user_id, "op": req.op,
+            "target": getattr(req, "cid", None) or getattr(req, "u", None),
+            "detail": req.model_dump(exclude_none=True),
+        })
     return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
 
 
@@ -1537,6 +1542,25 @@ class RoomRoleRequest(BaseModel):
     role: str = Field(..., description="新角色")
 
 
+# ── 大规模协作 维度②：共享记忆与知识库（桥接 ⑬ 共享生态 / ⑭ 自我进化） ──
+class RoomMemoryPublishRequest(BaseModel):
+    user_id: str = Field(..., description="操作者（需 publish 权限：mentor/owner）")
+    spec: Optional[dict] = Field(None, description="要发布的拓扑；不传则发房间当前共享 spec")
+    name: Optional[str] = Field(None, description="发布名；不传按 room+topo 名生成")
+    tags: list[str] = Field(default_factory=list, description="附加标签（自动加 room:{rid}）")
+
+
+class RoomMemoryPullRequest(BaseModel):
+    user_id: str = Field(..., description="操作者（需 read 权限，所有角色可 pull）")
+    name: str = Field(..., description="共享仓库中的拓扑名")
+
+
+class RoomMemoryDistillRequest(BaseModel):
+    user_id: str = Field(..., description="操作者（需 publish 权限）")
+    history: Optional[list] = Field(None, description="蒸馏历史；不传用房间已发布项")
+    min_support: int = Field(2, description="motif 最小支持度")
+
+
 @app.post("/rooms")
 def create_room(req: CreateRoomRequest):
     """新建协作房间：内部建一个共享 topology session，房主为 owner。"""
@@ -1551,6 +1575,7 @@ def create_room(req: CreateRoomRequest):
         "session_id": _sess["session_id"],
         "spec": req.spec,
         "activity": [],
+        "memory": {"published": [], "learnings": [], "templates": []},
         "created_at": _tm.time(),
     }
     with _lock:
@@ -1619,6 +1644,80 @@ def room_activity(rid: str,
         raise HTTPException(403, "not a member of this room")
     return {"room_id": rid, "activities": room["activity"][since:],
             "total": len(room["activity"])}
+
+
+# ──────────────────────────────────────────────────────────
+# 大规模协作 维度②：共享记忆与知识库
+#   桥接 ⑬ 共享生态(/topology/publish|repo|pull) 与 ⑭ 自我进化(/evolve)
+# ──────────────────────────────────────────────────────────
+
+def _room_repo_items(room_id: str) -> list:
+    """列出共享仓库中标记为某 room 的条目（tag=room:{rid}）。"""
+    from compiler.share import ShareRepo
+    items = ShareRepo(SHARE_REPO_PATH).list()
+    tag = f"room:{room_id}"
+    return [v for v in items if tag in (v.get("tags") or [])]
+
+
+@app.post("/rooms/{rid}/memory/publish")
+def room_memory_publish(rid: str, req: RoomMemoryPublishRequest):
+    """把房间当前/指定拓扑发布到共享仓库（⑬），打 room 标签，沉淀为知识库。需 publish 权限。"""
+    room = _room_ctx(rid, req.user_id, "publish")
+    spec = req.spec or room.get("spec") or {}
+    name = req.name or f"{room['room_id']}_{spec.get('name', 'topo')}"
+    tags = list(req.tags) + [f"room:{rid}"]
+    from compiler.share import ShareRepo
+    published_name = ShareRepo(SHARE_REPO_PATH).publish(spec, author=req.user_id, tags=tags, name=name)
+    with _lock:
+        room["memory"]["published"].append(published_name)
+        _record_activity(room, req.user_id, "memory_publish", published_name, detail=name)
+    return {"room_id": rid, "published_name": published_name, "tags": tags}
+
+
+@app.get("/rooms/{rid}/memory")
+def room_memory(rid: str, user_id: Optional[str] = None):
+    """房间知识库视图：本房发布的条目 + 沉淀的 learnings + 蒸馏模板 + 仓库总量。需 read 权限。"""
+    room = _room_ctx(rid, user_id, "read")
+    from compiler.share import ShareRepo
+    repo_items = _room_repo_items(rid)
+    return {"room_id": rid,
+            "published": room["memory"]["published"],
+            "repo_items": repo_items,
+            "learnings": room["memory"]["learnings"],
+            "templates": room["memory"]["templates"],
+            "repo_total": len(ShareRepo(SHARE_REPO_PATH).list())
+            }
+
+
+@app.post("/rooms/{rid}/memory/pull")
+def room_memory_pull(rid: str, req: RoomMemoryPullRequest):
+    """从共享仓库拉取某拓扑到房间（更新共享 spec + 新建内部会话）。需 read 权限。"""
+    room = _room_ctx(rid, req.user_id, "read")
+    from compiler.share import ShareRepo
+    try:
+        spec = ShareRepo(SHARE_REPO_PATH).pull(req.name)
+    except KeyError:
+        raise HTTPException(404, f"仓库中无此拓扑：{req.name}")
+    _sess = topology_session(TopologySessionRequest(spec=spec))
+    with _lock:
+        room["spec"] = spec
+        room["session_id"] = _sess["session_id"]
+        _record_activity(room, req.user_id, "memory_pull", req.name, detail=req.name)
+    return {"room_id": rid, "name": req.name, "session_id": _sess["session_id"], "spec": spec}
+
+
+@app.post("/rooms/{rid}/memory/distill")
+def room_memory_distill(rid: str, req: RoomMemoryDistillRequest):
+    """蒸馏房间历史为可复用模板（⑭），存入房间知识库。需 publish 权限。"""
+    room = _room_ctx(rid, req.user_id, "publish")
+    history = req.history or [{"name": n, "spec": room["spec"]} for n in room["memory"]["published"]]
+    from runtime import SelfEvolution
+    ev = SelfEvolution(history, min_support=req.min_support)
+    templates = ev.templates
+    with _lock:
+        room["memory"]["templates"] = templates
+        _record_activity(room, req.user_id, "memory_distill", rid, detail=f"{len(templates)} templates")
+    return {"room_id": rid, "templates": templates, "template_count": len(templates)}
 
 
 # asyncio.sleep 包装（避免底层依赖细节）
@@ -2643,6 +2742,37 @@ def selftest():
     _info2 = room_info(_rid2, user_id="dave")
     assert _info2.get("spec"), "S36: room_info 应返回 spec 供协作者渲染拓扑"
     print("✓ S36 大规模协作维度三: 指定room_id/多人动作互通/spec共享 全通过")
+
+    # S37: 大规模协作维度② —— 共享记忆与知识库（桥接 ⑬ / ⑭）
+    _rid3 = "collab_s37"
+    _c3 = create_room(CreateRoomRequest(spec=_spec, owner_id="erin", name="kb", room_id=_rid3))
+    assert _c3["room_id"] == _rid3, "S37: 应创建知识库房间"
+    # erin(owner) 发布当前拓扑到共享仓库（打 room 标签）
+    _pub = room_memory_publish(_rid3, RoomMemoryPublishRequest(user_id="erin"))
+    assert _pub["published_name"], "S37: owner 应能把拓扑发布到共享仓库"
+    # 知识库视图：published 含该条目，repo_items 非空，且带 room 标签
+    _mem = room_memory(_rid3, user_id="erin")
+    assert _pub["published_name"] in _mem["published"], "S37: 知识库应记录已发布项"
+    assert any(f"room:{_rid3}" in (it.get("tags") or []) for it in _mem["repo_items"]), \
+        "S37: 仓库条目应带 room 标签"
+    # observer(frank) 有 read 权限 → 能看到知识库（多人共享记忆）
+    room_join(_rid3, RoomJoinRequest(user_id="frank", desired_role="observer"))
+    _mem2 = room_memory(_rid3, user_id="frank")
+    assert _mem2["repo_items"], "S37: observer 应能看到房间共享记忆"
+    # observer 尝试发布 → 403（无 publish 权限）
+    _forbidden_pub = False
+    try:
+        room_memory_publish(_rid3, RoomMemoryPublishRequest(user_id="frank"))
+    except Exception as e:
+        _forbidden_pub = (getattr(e, "status_code", None) == 403)
+    assert _forbidden_pub, "S37: observer 发布应被 403 拦截"
+    # observer 拉取已发布拓扑到房间（read 即可）→ 更新共享 spec/会话
+    _pull = room_memory_pull(_rid3, RoomMemoryPullRequest(user_id="frank", name=_pub["published_name"]))
+    assert _pull["session_id"], "S37: observer 应能 pull 到房间（共享记忆复用）"
+    # 蒸馏：把已发布历史升华为模板（⑭）
+    _dist = room_memory_distill(_rid3, RoomMemoryDistillRequest(user_id="erin"))
+    assert "templates" in _dist, "S37: 应返回蒸馏模板"
+    print("✓ S37 大规模协作维度②: 发布到共享仓库/多人可读记忆/越权403/pull复用/蒸馏模板 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

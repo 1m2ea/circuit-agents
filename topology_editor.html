@@ -168,6 +168,15 @@
       <h2>协同动态 · 房间内所有人</h2>
       <div id="collab-body"></div>
     </div>
+    <div class="sec" id="kb-sec" style="display:none;max-height:280px;overflow:auto;flex-direction:column;min-height:0">
+      <h2>🧠 共享记忆与知识库</h2>
+      <div class="row" style="margin-bottom:6px">
+        <button id="btn-kb-publish">📤 发布当前拓扑</button>
+        <button id="btn-kb-distill">⚗ 蒸馏模板</button>
+        <span class="hint" id="kb-hint"></span>
+      </div>
+      <div id="kb-body" style="font-size:12px;color:var(--muted)">加入房间后可见共享记忆。</div>
+    </div>
     <div class="sec" style="max-height:170px;overflow:auto;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
       <h2>事件流</h2>
       <div id="log"></div>
@@ -527,6 +536,7 @@ async function poll(){
         const info=await api("/rooms/"+S.room);
         S.members=info.members||S.members; renderMembers();
         renderCollab(act.activities||[]);
+        loadMemory();
       }catch(e){}
     }
     if(st.done){
@@ -585,7 +595,75 @@ function showRoomBar(){
   $("rb-name").textContent="房间 "+S.room;
   $("rb-me").textContent=S.me+"（"+(S.members[S.me]||S.role)+"）";
   $("collab-sec").style.display="flex";
+  $("kb-sec").style.display="flex";
   renderMembers();
+  loadMemory();
+}
+
+// ── 共享记忆与知识库（维度②）──
+function _canPublish(){ const r=(S.members[S.me]||S.role); return r==="owner"||r==="mentor"; }
+async function loadMemory(){
+  if(!S.room) return;
+  try{
+    const m=await api("/rooms/"+S.room+"/memory");
+    renderMemory(m);
+  }catch(e){}
+}
+function renderMemory(m){
+  const el=$("kb-body"); if(!el) return;
+  const pub=(m.published||[]);
+  const items=(m.repo_items||[]);
+  const learn=(m.learnings||[]);
+  const tpl=(m.templates||[]);
+  let h="";
+  h+=`<div style="margin:2px 0 6px"><b>本房发布（知识库）</b>：${pub.length} 项　全局仓库 ${m.repo_total||0} 项</div>`;
+  if(items.length){
+    h+='<div style="display:flex;flex-direction:column;gap:3px">';
+    for(const it of items){
+      h+=`<div style="display:flex;gap:6px;align-items:center;border-bottom:1px solid var(--line);padding:3px 0">`+
+         `<span style="font-weight:600">${escapeHtml(it.name)}</span>`+
+         `<span style="color:var(--muted);font-size:11px">@${escapeHtml(it.author||"?")}</span>`+
+         `<button class="kb-pull" data-name="${escapeHtml(it.name)}" style="margin-left:auto">↧ 拉取到房间</button></div>`;
+    }
+    h+='</div>';
+  }else{
+    h+='<div style="color:var(--muted)">共享仓库暂无本房条目（点『发布当前拓扑』沉淀第一份）</div>';
+  }
+  if(learn.length){
+    h+=`<div style="margin-top:8px"><b>人工编辑沉淀</b>（${learn.length}）：</div><div style="color:var(--muted)">`+
+       learn.slice().reverse().map(l=>`· ${escapeHtml(String(l.actor))}：${escapeHtml(String(l.op))}${l.target?(" @ "+escapeHtml(String(l.target))):""}`).join("<br>")+
+       `</div>`;
+  }
+  if(tpl.length){
+    h+=`<div style="margin-top:8px"><b>蒸馏模板</b>（${tpl.length}）：</div><div style="color:var(--muted)">`+
+       tpl.map(t=>`· ${(t.name||"模板")}（支持度 ${t.support??"-"}）`).join("<br>")+`</div>`;
+  }
+  el.innerHTML=h;
+  el.querySelectorAll(".kb-pull").forEach(b=>b.addEventListener("click",()=>pullMemory(b.dataset.name)));
+}
+async function publishMemory(){
+  if(!S.room) return;
+  if(!_canPublish()){ $("kb-hint").textContent="⛔ 需 owner/mentor 权限"; return; }
+  try{ const r=await api("/rooms/"+S.room+"/memory/publish",{user_id:S.me});
+    $("kb-hint").textContent="✓ 已发布："+r.published_name; log("📤 发布拓扑到共享知识库："+r.published_name);
+    await loadMemory();
+  }catch(e){ $("kb-hint").textContent="发布失败："+e.message; }
+}
+async function distillMemory(){
+  if(!S.room) return;
+  if(!_canPublish()){ $("kb-hint").textContent="⛔ 需 owner/mentor 权限"; return; }
+  try{ const r=await api("/rooms/"+S.room+"/memory/distill",{user_id:S.me});
+    $("kb-hint").textContent="✓ 蒸馏出 "+r.template_count+" 个模板"; log("⚗ 蒸馏房间历史为 "+r.template_count+" 个可复用模板");
+    await loadMemory();
+  }catch(e){ $("kb-hint").textContent="蒸馏失败："+e.message; }
+}
+async function pullMemory(name){
+  if(!S.room) return;
+  try{ const r=await api("/rooms/"+S.room+"/memory/pull",{user_id:S.me, name});
+    S.sid=r.session_id; S.spec=r.spec||S.spec;
+    $("kb-hint").textContent="✓ 已拉取并载入："+name; log("↧ 从共享知识库拉取拓扑到房间："+name);
+    render();
+  }catch(e){ $("kb-hint").textContent="拉取失败："+e.message; }
 }
 function renderMembers(){
   const el=$("rb-members"); if(!el) return; el.innerHTML="";
@@ -612,6 +690,8 @@ $("btn-invite").addEventListener("click",()=>{
 });
 $("btn-pause").addEventListener("click",pause);
 $("btn-resume").addEventListener("click",resume);
+$("btn-kb-publish").addEventListener("click",publishMemory);
+$("btn-kb-distill").addEventListener("click",distillMemory);
 $("ins-replace").addEventListener("click",replaceNode);
 $("ins-append").addEventListener("click",appendParallel);
 $("ins-gate").addEventListener("change",setGate);
