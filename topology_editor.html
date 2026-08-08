@@ -116,6 +116,7 @@
   <span id="rb-members"></span>
   <button id="btn-invite">📋 复制邀请</button>
   <button id="btn-orchestrate">⚙ 多agent编排</button>
+  <button id="btn-fed">🌐 联邦</button>
   <label id="llm-toggle" title="开启后 mentor/reviewer 走真实云端模型、student 走本机 Ollama；任一不可用会自动降级 mock">
     <input type="checkbox" id="chk-llm"> 真实LLM
   </label>
@@ -194,6 +195,14 @@
         <span class="hint" id="kb-hint"></span>
       </div>
       <div id="kb-body" style="font-size:12px;color:var(--muted)">加入房间后可见共享记忆。</div>
+    </div>
+    <div class="sec" id="fed-sec" style="display:none;max-height:260px;overflow:auto;flex-direction:column;min-height:0">
+      <h2>🌐 跨房间联邦</h2>
+      <div class="row" style="margin-bottom:6px">
+        <button id="btn-fed-reload">🔄 刷新联邦目录</button>
+        <span class="hint" id="fed-hint"></span>
+      </div>
+      <div id="fed-body" style="font-size:12px;color:var(--muted)">点『联邦』查看其他房间的知识库并拉取。</div>
     </div>
     <div class="sec" style="max-height:170px;overflow:auto;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
       <h2>事件流</h2>
@@ -724,6 +733,7 @@ function showRoomBar(){
   $("rb-me").textContent=S.me+"（"+(S.members[S.me]||S.role)+"）";
   $("collab-sec").style.display="flex";
   $("kb-sec").style.display="flex";
+  $("fed-sec").style.display="flex";
   renderMembers();
   loadMemory();
   loadAvailability();
@@ -850,6 +860,35 @@ function showInspectorNone(){
 async function pause(){ if(!S.sid)return; const r=await api("/topology/pause/"+S.sid); log("⏸ 暂停"); updateButtons(r); }
 async function resume(){ if(!S.sid)return; const r=await api("/topology/resume/"+S.sid); log("▶ 恢复执行"); hint(""); updateButtons(r); }
 
+// ── 跨房间联邦（深化④）：发现其他房间并拉取其知识/模板 ──
+async function loadFederation(){
+  if(!S.room) return;
+  const el=$("fed-body"); if(!el) return;
+  try{
+    const f=await api("/federation");
+    const others=(f.rooms||[]).filter(e=>e.room_id!==S.room);
+    if(!others.length){ el.innerHTML="联邦目录暂无其他房间。"; return; }
+    let h="";
+    for(const e of others){
+      h+=`<div style="display:flex;gap:6px;align-items:center;border-bottom:1px solid var(--line);padding:4px 0">`+
+         `<span style="font-weight:600">${escapeHtml(e.name||e.room_id)}</span>`+
+         `<span style="color:var(--muted);font-size:11px">${escapeHtml(e.room_id)} · 👥${e.members} · 📚${e.published} · 🧩${e.templates}</span>`+
+         `<button class="fed-pull" data-rid="${escapeHtml(e.room_id)}" style="margin-left:auto">↧ 拉取知识</button></div>`;
+    }
+    el.innerHTML=h;
+    el.querySelectorAll(".fed-pull").forEach(b=>b.addEventListener("click",()=>federatePull(b.dataset.rid)));
+  }catch(e){ el.textContent="联邦目录加载失败："+e.message; }
+}
+async function federatePull(otherRid){
+  if(!S.room) return;
+  try{
+    const r=await api("/rooms/"+S.room+"/memory/pull-from/"+otherRid,{user_id:S.me});
+    $("fed-hint").textContent="✓ 已从 "+otherRid+" 汇入 "+r.imported_published+" 条知识 / "+r.imported_templates+" 个模板";
+    log("🌐 联邦拉取：从 "+otherRid+" 汇入 "+r.imported_published+" 知识 / "+r.imported_templates+" 模板");
+    loadMemory(); loadFederation();
+  }catch(e){ $("fed-hint").textContent="拉取失败："+e.message; }
+}
+
 // ── 绑定 ──
 $("btn-start").addEventListener("click",start);
 $("btn-invite").addEventListener("click",()=>{
@@ -863,6 +902,8 @@ $("btn-resume").addEventListener("click",resume);
 $("btn-kb-publish").addEventListener("click",publishMemory);
 $("btn-kb-distill").addEventListener("click",distillMemory);
 $("btn-orchestrate").addEventListener("click",orchestrate);
+$("btn-fed").addEventListener("click",loadFederation);
+$("btn-fed-reload").addEventListener("click",loadFederation);
 $("btn-reroute").addEventListener("click",()=>{
   S.rerouteMode=!S.rerouteMode;
   $("btn-reroute").classList.toggle("on",S.rerouteMode);

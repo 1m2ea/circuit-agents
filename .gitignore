@@ -45,3 +45,11 @@ _live_*.log
 _ot_server.log
 .bridge.log
 .wb_write_test.txt
+
+# Debug / throwaway probe artifacts (not for VCS)
+_editor_served.html
+_fedlive.log
+_procs*.txt
+_s*.log
+_test_*.py
+_ui_*.log

@@ -1759,6 +1759,11 @@ class RoomMemoryDistillRequest(BaseModel):
     min_support: int = Field(2, description="motif 最小支持度")
 
 
+class RoomFederatePullRequest(BaseModel):
+    user_id: str = Field(..., description="操作者（需目标房间 read 权限）")
+    include_spec: bool = Field(False, description="是否同时把源房间共享拓扑并入（重建 session）；默认 False 仅联邦知识")
+
+
 class RoomOrchestrateRequest(BaseModel):
     user_id: str = Field(..., description="编排发起者（需 control 权限：owner/mentor/student）")
     case: Optional[dict] = Field(None, description="失败案例 {goal,spec,result}；不传用房间 spec")
@@ -1955,6 +1960,66 @@ def room_memory_distill(rid: str, req: RoomMemoryDistillRequest):
         _record_activity(room, req.user_id, "memory_distill", rid, detail=f"{len(templates)} templates")
     _persist()
     return {"room_id": rid, "templates": templates, "template_count": len(templates)}
+
+
+# ──────────────────────────────────────────────────────────
+# 深化④：跨房间联邦（federation）
+#   房间之间不再是孤岛：联邦目录发现彼此 + 跨房间拉取知识/拓扑
+# ──────────────────────────────────────────────────────────
+@app.get("/federation")
+def federation_directory(user_id: Optional[str] = None):
+    """联邦目录：列出当前所有房间摘要，供其他房间发现并拉取知识（深化④）。"""
+    entries = []
+    for rid, room in _rooms.items():
+        mem = room.get("memory", {}) or {}
+        entries.append({
+            "room_id": rid, "name": room.get("name"), "owner": room.get("owner"),
+            "members": len(room.get("members", {})),
+            "published": len(mem.get("published", [])),
+            "templates": len(mem.get("templates", [])),
+            "rev": int(room.get("rev", 0)),
+        })
+    return {"rooms": entries, "count": len(entries)}
+
+
+@app.post("/rooms/{rid}/memory/pull-from/{other_rid}")
+def room_federate_pull(rid: str, other_rid: str, req: RoomFederatePullRequest):
+    """跨房间联邦拉取（深化④）：把源房间的已发布知识 + 蒸馏模板并入本房间知识库。
+
+    - 需目标房间 read 权限；源房间只要存在（其 published 即视为对联邦公开）。
+    - 默认只联邦『知识』（不破坏本房间当前电路）；include_spec=true 才并入共享拓扑。
+    - 联邦是单向汇入，绝不反向改动源房间。
+    """
+    room = _room_ctx(rid, req.user_id, "read")
+    other = _rooms.get(other_rid)
+    if other is None:
+        raise HTTPException(404, f"源房间不存在: {other_rid}")
+    omem = other.get("memory", {}) or {}
+    imported_pub, imported_tpl = 0, 0
+    _inc_spec = bool(req.include_spec)
+    _other_spec = other.get("spec") if _inc_spec else None
+    with _lock:
+        for name in omem.get("published", []):
+            if name not in room["memory"]["published"]:
+                room["memory"]["published"].append(name); imported_pub += 1
+        _existing_tpl = {t.get("name") for t in room["memory"]["templates"] if isinstance(t, dict)}
+        for t in omem.get("templates", []):
+            if isinstance(t, dict) and t.get("name") in _existing_tpl:
+                continue
+            room["memory"]["templates"].append(t); imported_tpl += 1
+        _record_activity(room, req.user_id, "federate_pull", other_rid,
+                         detail=f"从 {other_rid} 汇入 {imported_pub} 条知识 / {imported_tpl} 个模板")
+    # include_spec 需在锁外重建 session：topology_session 内部会再取 _lock，非重入锁会死锁
+    if _inc_spec:
+        _sess = topology_session(TopologySessionRequest(spec=_other_spec or {}))
+        with _lock:
+            room["spec"] = _other_spec
+            room["session_id"] = _sess["session_id"]
+    _persist()
+    return {"room_id": rid, "from": other_rid,
+            "imported_published": imported_pub, "imported_templates": imported_tpl,
+            "published": room["memory"]["published"],
+            "templates": room["memory"]["templates"]}
 
 
 @app.post("/rooms/{rid}/orchestrate")
@@ -3347,6 +3412,42 @@ def selftest():
     finally:
         _room_store, _PERSIST = _old_store, _old_persist
     print("✓ S42 深化③房间持久化: 落盘/重启加载/owner+成员+ops+rev+记忆保留/据spec重建活session/可续编 全通过")
+
+    # S43: 深化④ 跨房间联邦 —— 联邦目录发现 + 跨房间拉取知识
+    _rA, _rB = "fed_A", "fed_B"
+    create_room(CreateRoomRequest(spec=_spec41, owner_id="fa", name="A", room_id=_rA))
+    create_room(CreateRoomRequest(spec=_spec41, owner_id="fb", name="B", room_id=_rB))
+    with _lock:
+        _rooms[_rB]["memory"]["published"].append("kb_b1")
+        _rooms[_rB]["memory"]["templates"].append({"name": "t_b1", "support": 2})
+        _rooms[_rB]["memory"]["templates"].append({"name": "t_b2", "support": 3})
+    # ① 联邦目录应列出所有房间
+    _fed = federation_directory()
+    assert _fed["count"] >= 2, "S43: 联邦目录应至少列出 2 个房间"
+    assert {e["room_id"] for e in _fed["rooms"]} >= {_rA, _rB}, "S43: 目录应含 A/B"
+    _b_entry = next(e for e in _fed["rooms"] if e["room_id"] == _rB)
+    assert _b_entry["published"] == 1 and _b_entry["templates"] == 2, "S43: 目录应带知识量摘要"
+    # ② A 从 B 联邦拉取知识
+    _fp = room_federate_pull(_rA, _rB, RoomFederatePullRequest(user_id="fa"))
+    assert "kb_b1" in _fp["published"], "S43: A 应拉到 B 的已发布知识"
+    assert _fp["imported_templates"] == 2 and len(_fp["templates"]) >= 2, "S43: A 应拉到 B 的模板"
+    # ③ 联邦是单向汇入，绝不反向污染源房间
+    assert _rooms[_rB]["memory"]["published"] == ["kb_b1"], "S43: 拉取不应改动源房间"
+    assert len(_rooms[_rB]["memory"]["templates"]) == 2, "S43: 源房间模板不被改动"
+    # ④ 联邦动作写入 A 的 activity（跨房间协作可见）
+    _act = room_activity(_rA, user_id="fa")
+    assert any(a["action"] == "federate_pull" for a in _act["activities"]), "S43: 联邦拉取应入 activity"
+    # ⑤ 源房间不存在应 404（而非悄悄空拉）
+    try:
+        room_federate_pull(_rA, "nobody", RoomFederatePullRequest(user_id="fa"))
+        assert False, "S43: 源房间不存在应 404"
+    except HTTPException as ex:
+        assert ex.status_code == 404, "S43: 源房间不存在应 404"
+    # ⑥ include_spec 可连共享拓扑一并并入（重建 session）
+    _fp2 = room_federate_pull(_rA, _rB, RoomFederatePullRequest(user_id="fa", include_spec=True))
+    assert _rooms[_rA]["session_id"] in _topo_sessions, "S43: include_spec 应重建 session"
+    assert _rooms[_rA]["spec"] == _rooms[_rB]["spec"], "S43: include_spec 应并入源拓扑"
+    print("✓ S43 深化④跨房间联邦: 目录发现/跨房间拉知识/单向不污染/activity可见/404/可并入拓扑 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
