@@ -670,7 +670,11 @@ class CircuitExecutor:
                  decision_points: "Optional[object]" = None,
                  auto_select_models: bool = False,
                  on_node_done: "Optional[callable]" = None,
-                 backend_map: "Optional[dict]" = None):
+                 backend_map: "Optional[dict]" = None,
+                 collaborators: "Optional[object]" = None,
+                 recruiter: "Optional[object]" = None,
+                 coop_timeout: float = 5.0,
+                 coop_help_threshold: "Optional[float]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
@@ -729,6 +733,27 @@ class CircuitExecutor:
         self._pending_question = None   # adc 灰色地带时写入，待人类裁决
         self._human_answer = None       # answer_question() 写入，恢复时消费
         self._learnings = []            # 人类每次编辑的记录（human_edited 学习库）
+        # ── 人机协同·极致：协作者不分人机，机器卡住时主动招募（零回归：不传=不启用）──
+        self.coop_timeout = float(coop_timeout)
+        self.coop_help_threshold = coop_help_threshold
+        self.collaborators = collaborators
+        if recruiter is not None:
+            self.recruiter = recruiter
+            if getattr(self.recruiter, "on_event", None) is None:
+                self.recruiter.on_event = self._recruiter_event
+        elif collaborators is not None:
+            self.recruiter = Recruiter(collaborators, on_event=self._recruiter_event,
+                                       default_timeout=self.coop_timeout)
+        else:
+            self.recruiter = None
+        self._coop_log = []             # 每次求援的结果轨迹（供 UI / CI 断言）
+
+    def _recruiter_event(self, etype, fields):
+        """把招募引擎的事件桥接进统一事件流（→ SSE / 房间 activity，实时可见）。"""
+        try:
+            self._emit(etype, **fields)
+        except Exception:
+            pass
 
     # ---- 观察窗（B）：事件流发射 ----
     def _emit(self, etype: str, **fields):
@@ -976,6 +1001,9 @@ class CircuitExecutor:
                 out[cid] = sig
                 # ── 指挥中⼼① 节点工作报告：记录每节点透明决策轨迹 ──
                 self._record_trace(cid, comp, sig, out)
+                # ── 人机协同·极致：卡住就主动招募（人/agent/知识源/系统同池）──
+                if self.recruiter is not None:
+                    out[cid] = self._seek_help(cid, comp, sig, out)
                 # ── 指挥中⼼② 主动提问：adc/verify 落入灰色地带 → 暂停请人类裁决 ──
                 if comp.get("type") in ("adc", "verify"):
                     self._check_ambiguity(cid, comp, sig, out)
@@ -1282,6 +1310,9 @@ class CircuitExecutor:
             "node_traces": {k: v for k, v in self._node_traces.items()},
             "pending_question": self._pending_question,
             "learnings": list(self._learnings),
+            # 人机协同·极致：求援轨迹 + 正等人类作答的求援
+            "coop_log": list(self._coop_log),
+            "help_pending": (self.recruiter.pending() if self.recruiter else []),
         }
 
     def _resume_index(self, layers, out):
@@ -1354,6 +1385,72 @@ class CircuitExecutor:
             "ts_ms": round((time.perf_counter() - self._t0) * 1000, 1)
                      if self._t0 else 0.0,
         }
+
+    # ── 人机协同·极致：节点卡住 → 机器主动招募（人/agent/知识源/系统同池择优）──
+    def _help_need(self, cid, comp, sig):
+        """推断"我到底缺什么能力"——先看节点显式声明，再看缺失字段，最后退化到类型标签。"""
+        need = [str(s).lower() for s in
+                (comp.get("needs") or comp.get("need") or [])]
+        if need:
+            return need
+        missing = sig.meta.get("missing") or []
+        if missing:
+            return [str(m).lower() for m in missing]
+        lab = (comp.get("label") or comp.get("type") or "").lower()
+        return [lab] if lab else []
+
+    def _seek_help(self, cid, comp, sig, out):
+        """三种触发：① 补数预算耗尽仍缺数据 ② 声明了需要的能力但没做成 ③ 质量低于求助线。
+        触发后不是"暂停等操作者"，而是主动在协作者池里择优派单、超时自动升级。"""
+        if self.recruiter is None:
+            return sig
+        thr = comp.get("help_threshold", self.coop_help_threshold)
+        q = sig.quality if sig.quality is not None else 1.0
+        if sig.meta.get("gate") == "fail_linear":
+            reason = "missing_data"
+        elif comp.get("needs") and (not sig.ok or (thr is not None and q < thr)):
+            reason = "capability_gap"
+        elif thr is not None and q < float(thr):
+            reason = "low_quality"
+        else:
+            return sig
+        need = self._help_need(cid, comp, sig)
+        ctx = {p: (out[p].value if p in out and hasattr(out[p], "value") else None)
+               for p in self.circuit.pred.get(cid, [])}
+        question = (comp.get("help_question")
+                    or f"节点「{comp.get('label') or cid}」需要协助："
+                       f"{reason}（当前质量 {round(q, 3)}）。缺：{', '.join(need) or '未知'}")
+        req = HelpRequest(node=cid, need=need, question=question, context=ctx,
+                          requester=self.scope or "machine", reason=reason,
+                          kinds=comp.get("help_kinds"))
+        self.recruiter.recruit(req, timeout=comp.get("help_timeout", self.coop_timeout))
+        rec = {"hid": req.hid, "node": cid, "reason": reason, "need": need,
+               "status": req.status, "assignee": req.assignee,
+               "dispatch_log": list(req.dispatch_log),
+               "answer": (req.answer or {}).get("value")}
+        self._coop_log.append(rec)
+        if req.status != "answered" or not req.answer:
+            return sig
+        ans = req.answer
+        if ans.get("value") is not None:
+            sig.value = ans["value"]
+        if ans.get("accept", True):
+            sig.ok = True
+            if sig.meta.get("gate") == "fail_linear":
+                sig.meta["gate"] = "helped"
+        sig.quality = max(q, float(ans.get("confidence", 0.85)))
+        sig.meta["helped_by"] = ans.get("by")
+        sig.meta["help_kind"] = ans.get("kind")
+        sig.meta["help_hid"] = req.hid
+        if cid in self._node_traces:
+            self._node_traces[cid].update({
+                "helped_by": ans.get("by"), "help_kind": ans.get("kind"),
+                "help_reason": reason, "output": sig.value,
+                "quality": round(sig.quality, 3), "ok": bool(sig.ok)})
+        self._emit("help_applied", node=cid, hid=req.hid, by=ans.get("by"),
+                   kind=ans.get("kind"), reason=reason,
+                   quality=round(sig.quality, 3))
+        return sig
 
     # ── 指挥中⼼② 主动提问：adc/verify 落入灰色地带 → 暂停请人类裁决 ──
     def _ambiguity_options(self, cid, comp, sig, thr):
@@ -4503,6 +4600,466 @@ def topology_crdt_selftest():
     print("✓ TopologyCRDT 离线自检通过")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  人机协同·极致：协作者不分人机 + 机器主动招募
+#  ------------------------------------------------------------------------
+#  过去的「人机协同」是二元的：机器卡住 → 暂停 → 问"那个操作者"。
+#  极致形态是多元的：协作者是一等公民，可以是**另一个人类专家**、**其他 agent**、
+#  **外部知识源**、**外部系统**；机器自己判断需要什么能力，在同一个池子里择优
+#  主动派单，超时/无解自动升级到下一位，最后才兜底给操作者。
+#  ——机器主动引入资源与人，而不是被问才答。
+# ══════════════════════════════════════════════════════════════════════════
+
+COLLAB_KINDS = ("human", "agent", "knowledge", "system")
+
+
+class Collaborator:
+    """一等公民协作者。人/机/知识/系统统一建模，才能被同一套择优逻辑调度。
+
+    skills       : 能力标签（小写），机器按需求标签匹配
+    trust        : 信任分 0~1，随每次求援成败做 EMA 更新（越用越懂谁靠谱）
+    availability : online / busy / offline
+    handler      : 可选可调用对象 (HelpRequest) -> str|dict，自动型协作者用
+    channel      : 通道描述，如 {"type":"web"} / {"type":"http","url":...} / {"type":"inbox"}
+    """
+
+    def __init__(self, cid, name=None, kind="human", skills=None, trust=0.7,
+                 latency_ms=1000.0, cost=0.0, availability="online",
+                 channel=None, handler=None, meta=None):
+        if kind not in COLLAB_KINDS:
+            raise ValueError(f"未知协作者类型 {kind!r}，应为 {COLLAB_KINDS}")
+        self.id = str(cid)
+        self.name = name or self.id
+        self.kind = kind
+        self.skills = [str(s).lower() for s in (skills or [])]
+        self.trust = float(trust)
+        self.latency_ms = float(latency_ms)
+        self.cost = float(cost)
+        self.availability = availability
+        self.channel = dict(channel or {})
+        self.handler = handler
+        self.meta = dict(meta or {})
+        self.asked = 0
+        self.answered = 0
+
+    # 能力覆盖率：需求标签中有多少被这位协作者覆盖
+    def covers(self, need):
+        if not need:
+            return 1.0
+        need = [str(n).lower() for n in need]
+        return sum(1 for n in need if n in self.skills) / float(len(need))
+
+    def rank_key(self, need):
+        """确定性排序键：覆盖率↓ → 信任↓ → 在线↓ → 时延↑ → 成本↑ → id（稳定）。"""
+        online = 1 if self.availability == "online" else 0
+        return (-round(self.covers(need), 6), -round(self.trust, 6), -online,
+                self.latency_ms, self.cost, self.id)
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "kind": self.kind,
+                "skills": list(self.skills), "trust": round(self.trust, 3),
+                "latency_ms": self.latency_ms, "cost": self.cost,
+                "availability": self.availability, "channel": dict(self.channel),
+                "auto": self.handler is not None, "asked": self.asked,
+                "answered": self.answered, "meta": dict(self.meta)}
+
+
+class CollaboratorRegistry:
+    """协作者池。线程安全；match() 给出确定性排序，便于自检与复现。"""
+
+    def __init__(self):
+        self._c = {}
+        self._lock = threading.RLock()
+
+    def register(self, cid=None, **kw):
+        cid = cid or kw.pop("id", None) or f"co-{uuid.uuid4().hex[:8]}"
+        kw.pop("id", None)
+        c = Collaborator(cid, **kw)
+        with self._lock:
+            self._c[c.id] = c
+        return c
+
+    def add(self, collaborator):
+        with self._lock:
+            self._c[collaborator.id] = collaborator
+        return collaborator
+
+    def get(self, cid):
+        with self._lock:
+            return self._c.get(cid)
+
+    def remove(self, cid):
+        with self._lock:
+            return self._c.pop(cid, None) is not None
+
+    def list(self):
+        with self._lock:
+            return [c.to_dict() for c in sorted(self._c.values(), key=lambda x: x.id)]
+
+    def set_availability(self, cid, status):
+        with self._lock:
+            c = self._c.get(cid)
+            if not c:
+                return False
+            c.availability = status
+            return True
+
+    def match(self, need, kinds=None, exclude=(), top=3, require_cover=0.0):
+        """择优：按能力需求排序，返回前 top 位候选（不过滤 offline，交给升级链兜底）。"""
+        with self._lock:
+            pool = list(self._c.values())
+        exclude = set(exclude or ())
+        if kinds:
+            kinds = set(kinds)
+            pool = [c for c in pool if c.kind in kinds]
+        pool = [c for c in pool if c.id not in exclude
+                and c.availability != "offline"
+                and c.covers(need) >= require_cover]
+        pool.sort(key=lambda c: c.rank_key(need))
+        return pool[:max(1, int(top))]
+
+    def record_outcome(self, cid, ok, alpha=0.25):
+        """信任 EMA：帮上忙↑、掉链子↓。让"该找谁"随时间自我校准。"""
+        with self._lock:
+            c = self._c.get(cid)
+            if not c:
+                return None
+            c.asked += 1
+            if ok:
+                c.answered += 1
+            target = 1.0 if ok else 0.0
+            c.trust = round((1 - alpha) * c.trust + alpha * target, 4)
+            return c.trust
+
+
+class HelpRequest:
+    """一次求援：机器说明"我在哪个节点、缺什么能力、问题是什么、上下文是什么"。"""
+
+    def __init__(self, node=None, need=None, question="", context=None,
+                 requester="machine", kinds=None, hid=None, reason=None):
+        self.hid = hid or f"help-{uuid.uuid4().hex[:8]}"
+        self.node = node
+        self.need = [str(n).lower() for n in (need or [])]
+        self.question = question
+        self.context = context or {}
+        self.requester = requester
+        self.kinds = list(kinds) if kinds else None
+        self.reason = reason
+        self.status = "pending"          # pending/dispatched/answered/unanswered
+        self.assignee = None
+        self.answer = None               # {"value","by","kind","confidence","note","accept"}
+        self.dispatch_log = []           # [{"to","kind","result"}]
+        self.created_ts = time.time()
+        self._event = threading.Event()
+
+    def to_dict(self):
+        return {"hid": self.hid, "node": self.node, "need": list(self.need),
+                "question": self.question, "context": self.context,
+                "requester": self.requester, "kinds": self.kinds,
+                "reason": self.reason, "status": self.status,
+                "assignee": self.assignee, "answer": self.answer,
+                "dispatch_log": list(self.dispatch_log),
+                "created_ts": round(self.created_ts, 3)}
+
+
+class Recruiter:
+    """主动招募引擎。
+
+    recruit() = 择优 → 派单 → 等待 → （超时/无解）自动升级下一位 → 兜底人类操作者。
+    自动型协作者（agent/knowledge/system 带 handler 或已知 channel）即时应答；
+    人类型协作者进 inbox，等 respond() 唤醒（有超时，不会把电路吊死）。
+    """
+
+    def __init__(self, registry, on_event=None, default_timeout=5.0,
+                 max_escalations=3, fallback_operator=None, min_cover=0.34):
+        self.registry = registry
+        self.on_event = on_event
+        self.default_timeout = float(default_timeout)
+        self.max_escalations = int(max_escalations)
+        # 最低能力覆盖率：够不上就不派单，宁可诚实上报"无人可解"，也不乱找人
+        self.min_cover = float(min_cover)
+        self.fallback_operator = fallback_operator   # 可调用：最后兜底的人类操作者
+        self.inbox = {}          # hid -> HelpRequest（等待人类作答）
+        self.history = []        # 全部求援记录（含已结）
+        self._lock = threading.RLock()
+
+    def _emit(self, etype, **f):
+        if self.on_event:
+            try:
+                self.on_event(etype, f)
+            except Exception:
+                pass
+
+    # ---- 主流程 ----
+    def recruit(self, req, timeout=None, max_escalations=None):
+        timeout = self.default_timeout if timeout is None else float(timeout)
+        esc = self.max_escalations if max_escalations is None else int(max_escalations)
+        with self._lock:
+            self.history.append(req)
+        cands = self.registry.match(req.need, kinds=req.kinds, top=esc,
+                                    require_cover=(self.min_cover if req.need else 0.0))
+        self._emit("help_open", hid=req.hid, node=req.node, need=req.need,
+                   reason=req.reason, question=req.question,
+                   candidates=[c.id for c in cands])
+        for c in cands:
+            req.status = "dispatched"
+            req.assignee = c.id
+            self._emit("help_dispatch", hid=req.hid, node=req.node,
+                       to=c.id, name=c.name, kind=c.kind,
+                       cover=round(c.covers(req.need), 3), trust=round(c.trust, 3))
+            ans = self._ask(c, req, timeout)
+            req.dispatch_log.append({"to": c.id, "kind": c.kind,
+                                     "result": "answered" if ans else "no_answer"})
+            if ans:
+                req.answer = ans
+                req.status = "answered"
+                self.registry.record_outcome(c.id, True)
+                self._emit("help_answered", hid=req.hid, node=req.node,
+                           by=ans.get("by"), kind=ans.get("kind"),
+                           confidence=ans.get("confidence"))
+                return req
+            self.registry.record_outcome(c.id, False)
+            self._emit("help_escalate", hid=req.hid, node=req.node, from_=c.id)
+        # 全员未解 → 兜底人类操作者
+        if self.fallback_operator is not None:
+            try:
+                r = self.fallback_operator(req)
+            except Exception:
+                r = None
+            ans = self._norm(r, by="operator", kind="human")
+            if ans:
+                req.answer = ans
+                req.status = "answered"
+                req.assignee = "operator"
+                req.dispatch_log.append({"to": "operator", "kind": "human",
+                                         "result": "answered"})
+                self._emit("help_answered", hid=req.hid, node=req.node,
+                           by="operator", kind="human",
+                           confidence=ans.get("confidence"))
+                return req
+        req.status = "unanswered"
+        req.assignee = None
+        self._emit("help_unanswered", hid=req.hid, node=req.node,
+                   tried=[d["to"] for d in req.dispatch_log])
+        return req
+
+    # ---- 单个协作者问询 ----
+    def _ask(self, c, req, timeout):
+        if c.handler is not None:
+            try:
+                return self._norm(c.handler(req), by=c.id, kind=c.kind)
+            except Exception as e:
+                self._emit("help_error", hid=req.hid, to=c.id, error=str(e)[:200])
+                return None
+        if c.kind == "human":
+            return self._ask_human(c, req, timeout)
+        ch = (c.channel or {}).get("type")
+        if c.kind == "knowledge" and ch == "web":
+            try:
+                txt = _web_search(req.question or " ".join(req.need))
+            except Exception:
+                return None
+            return self._norm(txt, by=c.id, kind=c.kind, confidence=0.8)
+        if c.kind == "system" and ch == "http" and c.channel.get("url"):
+            try:
+                import urllib.request
+                body = json.dumps(req.to_dict()).encode("utf-8")
+                rq = urllib.request.Request(
+                    c.channel["url"], data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(rq, timeout=min(timeout, 10)) as r:
+                    raw = r.read().decode("utf-8")
+            except Exception:
+                return None
+            try:                      # 外部系统回 JSON 就按结构化答案解，否则当纯文本
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    parsed = raw
+            except Exception:
+                parsed = raw
+            return self._norm(parsed, by=c.id, kind=c.kind)
+        return None
+
+    def _ask_human(self, c, req, timeout):
+        req._event.clear()
+        with self._lock:
+            self.inbox[req.hid] = req
+        self._emit("help_waiting_human", hid=req.hid, node=req.node,
+                   to=c.id, name=c.name, question=req.question,
+                   timeout_s=timeout)
+        got = req._event.wait(timeout)
+        with self._lock:
+            self.inbox.pop(req.hid, None)
+        if got and req.answer:
+            ans = dict(req.answer)
+            ans.setdefault("by", c.id)
+            ans.setdefault("kind", "human")
+            return ans
+        self._emit("help_timeout", hid=req.hid, node=req.node, to=c.id)
+        return None
+
+    # ---- 人类应答入口 ----
+    def respond(self, hid, value, by=None, confidence=0.9, note=None, accept=True):
+        with self._lock:
+            req = self.inbox.get(hid)
+        if req is None:
+            return False
+        req.answer = {"value": value, "by": by or "human", "kind": "human",
+                      "confidence": float(confidence), "note": note,
+                      "accept": bool(accept)}
+        req._event.set()
+        return True
+
+    def pending(self):
+        with self._lock:
+            return [r.to_dict() for r in self.inbox.values()]
+
+    def log(self, limit=50):
+        with self._lock:
+            return [r.to_dict() for r in self.history[-int(limit):]]
+
+    @staticmethod
+    def _norm(r, by=None, kind=None, confidence=0.85):
+        if r is None:
+            return None
+        if isinstance(r, dict):
+            if not r.get("value") and not r.get("accept"):
+                return None
+            d = dict(r)
+        else:
+            s = str(r).strip()
+            if not s:
+                return None
+            d = {"value": s}
+        d.setdefault("by", by)
+        d.setdefault("kind", kind)
+        d.setdefault("confidence", confidence)
+        d.setdefault("accept", True)
+        return d
+
+
+def collaboration_selftest():
+    """人机协同·极致 离线自检：协作者不分人机 + 机器主动招募 + 自动升级 + 信任自校准。"""
+    print("\n=== 人机协同·极致 自检（协作者一等公民 + 主动招募）===")
+    reg = CollaboratorRegistry()
+    # ① 四类协作者同池：人类专家 / 其他 agent / 知识源 / 外部系统
+    reg.register("expert_li", name="李工(材料学)", kind="human",
+                 skills=["material", "physics"], trust=0.9, latency_ms=60000)
+    reg.register("agent_math", kind="agent", skills=["math", "calc"], trust=0.75,
+                 handler=lambda req: {"value": "42", "confidence": 0.9})
+    reg.register("kb_specs", kind="knowledge", skills=["material", "spec"],
+                 trust=0.6, latency_ms=200,
+                 handler=lambda req: {"value": "铝合金 6061 屈服强度 276MPa",
+                                      "confidence": 0.82})
+    reg.register("erp", kind="system", skills=["inventory"], trust=0.8,
+                 handler=lambda req: {"value": "库存 137 件", "confidence": 0.95})
+    assert len(reg.list()) == 4
+    kinds = {c["kind"] for c in reg.list()}
+    assert kinds == {"human", "agent", "knowledge", "system"}, "四类协作者应同池"
+    print("✓ ① 协作者不分人机：human/agent/knowledge/system 四类同池，统一建模")
+
+    # ② 择优：按能力标签匹配，而不是"只会问操作者"
+    top = reg.match(["material"], top=3)
+    assert top[0].id == "expert_li", f"material 应首选人类专家，实际 {top[0].id}"
+    assert reg.match(["inventory"], top=1)[0].id == "erp"
+    assert reg.match(["math"], top=1)[0].id == "agent_math"
+    print("✓ ② 按能力择优：material→人类专家 / inventory→外部系统 / math→其他 agent")
+
+    # ③ 主动招募：机器自己发起，自动型协作者即时应答
+    evs = []
+    rec = Recruiter(reg, on_event=lambda t, f: evs.append((t, f)), default_timeout=0.2)
+    r1 = rec.recruit(HelpRequest(node="n1", need=["inventory"],
+                                 question="当前库存多少？", reason="capability_gap"))
+    assert r1.status == "answered" and r1.answer["value"] == "库存 137 件"
+    assert r1.assignee == "erp"
+    assert [t for t, _ in evs].count("help_dispatch") == 1
+    print(f"✓ ③ 机器主动招募：自动派单给 {r1.assignee}（外部系统）并即时得到答案")
+
+    # ④ 自动升级：首选人类超时（无人应答）→ 自动降级到知识源，不吊死电路
+    r2 = rec.recruit(HelpRequest(node="n2", need=["material"],
+                                 question="6061 屈服强度？", reason="low_quality"),
+                     timeout=0.05)
+    assert r2.status == "answered", "首选人类超时后应自动升级"
+    assert r2.assignee == "kb_specs", f"应升级到知识源，实际 {r2.assignee}"
+    assert r2.dispatch_log[0]["to"] == "expert_li"
+    assert r2.dispatch_log[0]["result"] == "no_answer"
+    assert any(t == "help_timeout" for t, _ in evs)
+    assert any(t == "help_escalate" for t, _ in evs)
+    print("✓ ④ 超时自动升级：人类专家未及时响应 → 顺位知识源接管（电路不吊死）")
+
+    # ⑤ 真人异步应答：机器等待期间，人类通过 respond() 回填
+    def _late_answer(hid):
+        for _ in range(200):
+            if hid in rec.inbox:
+                rec.respond(hid, "钛合金更合适", by="expert_li", confidence=0.97)
+                return
+            time.sleep(0.005)
+    req3 = HelpRequest(node="n3", need=["physics"], question="选什么材料？")
+    th = threading.Thread(target=_late_answer, args=(req3.hid,), daemon=True)
+    th.start()
+    r3 = rec.recruit(req3, timeout=2.0)
+    th.join(timeout=2)
+    assert r3.status == "answered" and r3.assignee == "expert_li"
+    assert r3.answer["value"] == "钛合金更合适" and r3.answer["kind"] == "human"
+    print("✓ ⑤ 人类异步应答：inbox 派单 → respond() 唤醒 → 答案回流（非阻塞超时保护）")
+
+    # ⑥ 信任自校准：帮上忙的↑，掉链子的↓
+    t_kb = reg.get("kb_specs").trust
+    t_li = reg.get("expert_li").trust
+    assert t_kb > 0.6, "答对的知识源信任应上升"
+    assert reg.get("erp").trust > 0.8
+    assert 0.0 <= t_li <= 1.0
+    print(f"✓ ⑥ 信任自校准：kb_specs {0.6}→{t_kb} · expert_li {0.9}→{t_li}（越用越懂找谁）")
+
+    # ⑦ 无人可解：诚实上报 unanswered，绝不假装成功
+    r4 = rec.recruit(HelpRequest(node="n4", need=["quantum_alchemy"],
+                                 kinds=["system"], question="点石成金？"),
+                     timeout=0.05)
+    assert r4.status == "unanswered", f"无人可解应诚实上报，实际 {r4.status}"
+    print("✓ ⑦ 无人可解 → unanswered 诚实上报（不伪造答案）")
+
+    # ⑧ 兜底操作者：全员无解时回落到人类操作者
+    rec2 = Recruiter(reg, default_timeout=0.05,
+                     fallback_operator=lambda req: "操作者兜底：先按经验值 250MPa 走")
+    r5 = rec2.recruit(HelpRequest(node="n5", need=["quantum_alchemy"], kinds=["system"]))
+    assert r5.status == "answered" and r5.assignee == "operator"
+    print("✓ ⑧ 兜底链：候选全无解 → 回落人类操作者")
+
+    # ⑨ 执行器闭环：节点缺能力 → 主动招募 → 答案回灌电路，节点转正
+    spec = {
+        "name": "coop-loop",
+        "components": {
+            "src": {"type": "source", "value": "订单"},
+            "r1": {"type": "resistor", "label": "库存核对", "model": "small",
+                   "needs": ["inventory"], "help_threshold": 0.99},
+        },
+        "wires": [["src", "r1"]],
+    }
+    ex = CircuitExecutor(Circuit(spec, SimBackend(random.Random(3))),
+                         collaborators=reg, coop_timeout=0.3,
+                         memory_enabled=False, evolve_enabled=False)
+    ex.run()
+    tr = ex.get_state()["coop_log"]
+    assert tr, "执行器应记录求援轨迹"
+    assert tr[0]["status"] == "answered" and tr[0]["assignee"] == "erp", tr
+    assert ex._node_traces["r1"]["output"] == "库存 137 件", "答案应回灌电路节点输出"
+    assert ex._node_traces["r1"].get("helped_by") == "erp"
+    assert any(e["type"] == "help_applied" for e in ex._events)
+    print("✓ ⑨ 执行器闭环：低质节点主动求援 → 外部系统作答 → 答案回灌电路输出")
+
+    # ⑩ 零回归：不传 collaborators 时行为完全不变
+    ex0 = CircuitExecutor(Circuit(json.loads(json.dumps(spec)),
+                                  SimBackend(random.Random(3))),
+                          memory_enabled=False, evolve_enabled=False)
+    ex0.run()
+    assert ex0.recruiter is None and ex0.get_state()["coop_log"] == []
+    assert ex0._node_traces["r1"]["output"] != "库存 137 件"
+    assert not any(e["type"].startswith("help_") for e in ex0._events)
+    print("✓ ⑩ 零回归：未注册协作者时执行路径与行为完全不变")
+
+    print("✓ 人机协同·极致 离线自检通过")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -4524,6 +5081,7 @@ if __name__ == "__main__":
     quality_gate_selftest()
     skill_registry_selftest()
     topology_crdt_selftest()
+    collaboration_selftest()
 
 
 def load(path):

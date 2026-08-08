@@ -1539,6 +1539,32 @@ class TopologySessionRequest(BaseModel):
     spec: dict
     seed: int = Field(0, description="SimBackend 随机种子（确定性用）")
     node_delay_ms: int = Field(0, description="每节点人为延迟(ms)，用于演示/仪表盘制造可暂停窗口")
+    coop_enabled: bool = Field(True, description="人机协同：节点卡住时机器主动向协作者池求援")
+    coop_timeout: float = Field(5.0, description="单个协作者应答等待上限(秒)，超时自动升级下一位")
+
+
+class CollaboratorRequest(BaseModel):
+    """注册协作者：人类专家 / 其他 agent / 外部知识源 / 外部系统，同池同权。"""
+    id: Optional[str] = None
+    name: Optional[str] = None
+    kind: str = Field("human", description="human | agent | knowledge | system")
+    skills: Optional[list] = Field(None, description="能力标签，机器据此择优派单")
+    trust: float = Field(0.7, description="信任分 0~1，随求援成败自动 EMA 校准")
+    latency_ms: float = Field(1000.0, description="预期响应时延（排序用）")
+    cost: float = Field(0.0, description="每次求援的成本（排序用）")
+    availability: str = Field("online", description="online | busy | offline")
+    channel: Optional[dict] = Field(None, description='如 {"type":"web"} / {"type":"http","url":...}')
+    meta: Optional[dict] = None
+
+
+class HelpRespondRequest(BaseModel):
+    """人类（或任何外部主体）应答一条求援。"""
+    value: str
+    by: Optional[str] = None
+    confidence: float = 0.9
+    note: Optional[str] = None
+    accept: bool = True
+    room_id: Optional[str] = None
 
 
 class TopologyEditRequest(BaseModel):
@@ -1581,6 +1607,32 @@ _EDIT_LOCK = threading.RLock()   # 房间编辑串行化：让「检测冲突→
 #   两种模式共存：房间 concurrency="crdt"（默认，永不 409）或 "ot"（保留旧语义）。
 # ──────────────────────────────────────────────────────────
 PRESENCE_TTL = 30.0      # 超过该秒数没心跳 → 视为离线
+
+# ── 人机协同·极致：全局协作者池（人类专家 / 其他 agent / 知识源 / 外部系统 同池）──
+_collab_registry = None
+
+
+def _collab_reg():
+    """惰性建全局协作者池（runtime 不可用时返回 None → 完全退回旧行为）。"""
+    global _collab_registry
+    if _collab_registry is None:
+        try:
+            from runtime import CollaboratorRegistry
+            _collab_registry = CollaboratorRegistry()
+        except Exception:
+            return None
+    return _collab_registry
+
+
+def _find_help(hid: str):
+    """在所有活会话里定位一条待答求援（人类可能在任何一个会话被点名）。"""
+    with _lock:
+        recs = list(_topo_sessions.items())
+    for sid, rec in recs:
+        r = getattr(rec.get("executor"), "recruiter", None)
+        if r is not None and hid in getattr(r, "inbox", {}):
+            return sid, r
+    return None, None
 
 
 def _new_crdt(rid: str, spec: dict):
@@ -1716,7 +1768,11 @@ def topology_session(req: TopologySessionRequest):
             _tmod.sleep(req.node_delay_ms / 1000.0)
             return _base_run(comp, inputs)
         _be.run = _delayed_run
-    ex = CircuitExecutor(Circuit(req.spec, _be), verbose=False)
+    # 人机协同（极致）：把全局协作者池注入执行器 —— 节点卡住时机器自己择优派单，
+    # 协作者可以是另一个人类专家 / 其他 agent / 外部知识源 / 外部系统。
+    _reg = _collab_reg() if req.coop_enabled else None
+    ex = CircuitExecutor(Circuit(req.spec, _be), verbose=False,
+                         collaborators=_reg, coop_timeout=req.coop_timeout)
     # 实时交互（极致）：把执行器事件推入事件总线 → SSE 零延迟送达 UI
     ex.on_event = lambda ev: _realtime_hub.push(sid, ev)
     done = threading.Event()
@@ -2291,6 +2347,115 @@ def room_stats(rid: str, user_id: Optional[str] = None):
             "crdt_ops": len(c.log) if c else 0,
             "crdt_hash": c.state_hash() if c else None,
             "activity": len(room.get("activity", []))}
+
+
+# ──────────────────────────────────────────────────────────
+# 人机协同·极致：协作者不分人机 + 机器主动招募
+#   协作者 = 人类专家 / 其他 agent / 外部知识源 / 外部系统（同池同权）
+#   机器判断"我缺什么能力" → 择优派单 → 超时自动升级 → 答案回灌电路
+# ──────────────────────────────────────────────────────────
+
+@app.post("/collaborators")
+def collaborator_register(req: CollaboratorRequest):
+    """注册一位协作者。kind=human/agent/knowledge/system —— 人和机在同一个池子里。"""
+    reg = _collab_reg()
+    if reg is None:
+        raise HTTPException(500, "collaborator registry unavailable")
+    try:
+        c = reg.register(cid=req.id, name=req.name, kind=req.kind,
+                         skills=req.skills or [], trust=req.trust,
+                         latency_ms=req.latency_ms, cost=req.cost,
+                         availability=req.availability,
+                         channel=req.channel or {}, meta=req.meta or {})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"registered": c.to_dict(), "total": len(reg.list())}
+
+
+@app.get("/collaborators")
+def collaborator_list(need: Optional[str] = None, kind: Optional[str] = None,
+                      top: int = 5):
+    """列出协作者池；带 need=标签1,标签2 时同时返回机器会怎么择优（透明可解释）。"""
+    reg = _collab_reg()
+    if reg is None:
+        return {"collaborators": [], "match": []}
+    out = {"collaborators": reg.list()}
+    if isinstance(need, str) and need.strip():
+        tags = [t.strip().lower() for t in need.split(",") if t.strip()]
+        kinds = [kind] if isinstance(kind, str) and kind else None
+        cands = reg.match(tags, kinds=kinds, top=top, require_cover=0.34)
+        out["need"] = tags
+        out["match"] = [{"id": c.id, "name": c.name, "kind": c.kind,
+                         "cover": round(c.covers(tags), 3),
+                         "trust": round(c.trust, 3),
+                         "availability": c.availability} for c in cands]
+    return out
+
+
+@app.post("/collaborators/{cid}/availability")
+def collaborator_availability(cid: str, status: str = "online"):
+    """人类专家上下线；offline 的协作者不会被派单（机器自动绕开）。"""
+    reg = _collab_reg()
+    if reg is None or not reg.set_availability(cid, status):
+        raise HTTPException(404, f"collaborator not found: {cid}")
+    return {"id": cid, "availability": status}
+
+
+@app.delete("/collaborators/{cid}")
+def collaborator_remove(cid: str):
+    reg = _collab_reg()
+    if reg is None or not reg.remove(cid):
+        raise HTTPException(404, f"collaborator not found: {cid}")
+    return {"removed": cid}
+
+
+@app.get("/help/pending")
+def help_pending(sid: Optional[str] = None, assignee: Optional[str] = None):
+    """人类的"待办求援箱"：机器主动点名找我的问题都在这里（跨会话汇总）。"""
+    with _lock:
+        items = list(_topo_sessions.items())
+    out = []
+    for s, rec in items:
+        if isinstance(sid, str) and sid and s != sid:
+            continue
+        r = getattr(rec.get("executor"), "recruiter", None)
+        if r is None:
+            continue
+        for h in r.pending():
+            if isinstance(assignee, str) and assignee and h.get("assignee") != assignee:
+                continue
+            out.append({**h, "session_id": s})
+    return {"pending": out, "count": len(out)}
+
+
+@app.post("/help/{hid}/respond")
+def help_respond(hid: str, req: HelpRespondRequest):
+    """人类作答一条求援：答案立刻回灌到正在等待的电路节点（执行器不必重跑全图）。"""
+    sid, r = _find_help(hid)
+    if r is None:
+        raise HTTPException(404, f"help request not found or already closed: {hid}")
+    ok = r.respond(hid, req.value, by=req.by, confidence=req.confidence,
+                   note=req.note, accept=req.accept)
+    if not ok:
+        raise HTTPException(409, "help request已被其它协作者抢答或已超时关闭")
+    if isinstance(req.room_id, str) and req.room_id:
+        room = _rooms.get(req.room_id)
+        if room:
+            _record_activity(room, req.by or "human", "help_respond", sid,
+                             detail={"hid": hid})
+    return {"hid": hid, "session_id": sid, "answered_by": req.by or "human"}
+
+
+@app.get("/help/log/{sid}")
+def help_log(sid: str, limit: int = 50):
+    """求援全轨迹：机器找过谁、谁没答上、最终谁解决的（可审计的协同过程）。"""
+    rec = _topo_session(sid)
+    ex = rec["executor"]
+    r = getattr(ex, "recruiter", None)
+    return {"session_id": sid,
+            "coop_log": ex.get_state().get("coop_log", []),
+            "pending": (r.pending() if r else []),
+            "history": (r.log(limit) if r else [])}
 
 
 # ──────────────────────────────────────────────────────────
@@ -4033,6 +4198,103 @@ def selftest():
     print(f"✓ S45 大规模协作(极致): {_N45}人抢改同节点零拒绝零重试 · 3副本乱序+重投全收敛 · "
           "客户端op幂等合并 · presence在线感知/焦点图/超时离线 · "
           "慢消费者drop-oldest不拖全房 · presence合并40→1 · 水位可观测 全通过")
+
+    # ── S46 人机协同(极致)：协作者不分人机 + 机器主动招募 + 人类异步作答回灌 ──
+    import threading as _th46
+    # ① 四类协作者同池注册（人类专家 / 其他 agent / 知识源 / 外部系统）
+    for _c46 in (
+        {"id": "expert_zhang", "name": "张工(工艺)", "kind": "human",
+         "skills": ["process", "material"], "trust": 0.92, "latency_ms": 60000},
+        {"id": "kb_std", "name": "国标知识库", "kind": "knowledge",
+         "skills": ["material", "spec"], "trust": 0.6, "latency_ms": 150},
+        {"id": "mes", "name": "MES系统", "kind": "system",
+         "skills": ["inventory"], "trust": 0.8, "latency_ms": 300},
+        {"id": "agent_calc", "kind": "agent", "skills": ["math"], "trust": 0.7},
+    ):
+        collaborator_register(CollaboratorRequest(**_c46))
+    _all46 = collaborator_list()
+    assert len(_all46["collaborators"]) >= 4, "S46: 协作者池注册失败"
+    assert {c["kind"] for c in _all46["collaborators"]} >= {
+        "human", "knowledge", "system", "agent"}, "S46: 四类协作者应同池"
+    # ② 择优可解释：机器会挑谁，接口能说清楚
+    _m46 = collaborator_list(need="material", top=3)["match"]
+    assert _m46 and _m46[0]["id"] == "expert_zhang", f"S46: material 应首选人类专家 {_m46}"
+    assert collaborator_list(need="inventory", top=1)["match"][0]["id"] == "mes"
+    # ③ 下线的协作者不被派单
+    collaborator_availability("expert_zhang", status="offline")
+    assert all(x["id"] != "expert_zhang"
+               for x in collaborator_list(need="material", top=3)["match"]), \
+        "S46: offline 协作者不应出现在候选里"
+    collaborator_availability("expert_zhang", status="online")
+    # ④ 端到端：跑一个「必然求援」的电路，机器主动点名人类专家，人类异步作答后答案回灌
+    _spec46 = {"name": "coop-server", "components": {
+        "src": {"type": "source", "value": "工艺参数评审"},
+        "r1": {"type": "resistor", "label": "工艺判定", "model": "small",
+               "needs": ["process"], "help_threshold": 0.99,
+               "help_kinds": ["human"], "help_timeout": 6.0}},
+        "wires": [["src", "r1"]]}
+    _s46 = topology_session(TopologySessionRequest(spec=_spec46, seed=1,
+                                                   coop_timeout=6.0))
+    _sid46 = _s46["session_id"]
+    _hid46 = {}
+
+    def _answer46():
+        for _ in range(400):
+            _p = help_pending(sid=_sid46)["pending"]
+            if _p:
+                _hid46["hid"] = _p[0]["hid"]
+                _hid46["assignee"] = _p[0]["assignee"]
+                help_respond(_p[0]["hid"], HelpRespondRequest(
+                    value="改用 6061-T6，回火 175℃×8h", by="expert_zhang",
+                    confidence=0.96))
+                return
+            time.sleep(0.01)
+    _t46 = _th46.Thread(target=_answer46, daemon=True)
+    _t46.start()
+    _topo_sessions[_sid46]["done"].wait(timeout=15)
+    _t46.join(timeout=2)
+    assert _hid46.get("hid"), "S46: 机器应主动发出求援并进人类待办箱"
+    assert _hid46["assignee"] == "expert_zhang", \
+        f"S46: 应点名人类专家，实际 {_hid46.get('assignee')}"
+    _lg46 = help_log(_sid46)
+    _cl46 = _lg46["coop_log"]
+    assert _cl46 and _cl46[0]["status"] == "answered", f"S46: 求援未闭环 {_cl46}"
+    assert _cl46[0]["answer"] == "改用 6061-T6，回火 175℃×8h", "S46: 答案未回灌"
+    _tr46 = _topo_sessions[_sid46]["executor"].get_state()["node_traces"]["r1"]
+    assert _tr46.get("helped_by") == "expert_zhang" and _tr46["output"] == _cl46[0]["answer"], \
+        "S46: 节点工作报告应记录是谁帮的、帮出了什么"
+    # ⑤ 求援过程实时可见（事件进了总线，SSE 订阅者能看到机器在找谁）
+    _evs46 = [e for e in _topo_sessions[_sid46]["executor"]._events
+              if str(e.get("type", "")).startswith("help_")]
+    assert any(e["type"] == "help_dispatch" for e in _evs46), "S46: 缺 help_dispatch 事件"
+    assert any(e["type"] == "help_applied" for e in _evs46), "S46: 缺 help_applied 事件"
+    # ⑥ 重复应答：已关闭的求援诚实报错，不静默吞掉
+    try:
+        help_respond(_hid46["hid"], HelpRespondRequest(value="迟到的答案"))
+        raise AssertionError("S46: 已关闭求援重复应答应 404")
+    except HTTPException as e:
+        assert e.status_code == 404
+    # ⑦ 无人可解也不吊死：需要没人具备的能力时，电路照常收敛
+    _spec47 = {"name": "coop-none", "components": {
+        "src": {"type": "source", "value": "x"},
+        "r1": {"type": "resistor", "label": "炼金", "model": "small",
+               "needs": ["quantum_alchemy"], "help_threshold": 0.99}},
+        "wires": [["src", "r1"]]}
+    _s47 = topology_session(TopologySessionRequest(spec=_spec47, seed=1,
+                                                   coop_timeout=0.2))
+    _topo_sessions[_s47["session_id"]]["done"].wait(timeout=10)
+    _cl47 = help_log(_s47["session_id"])["coop_log"]
+    assert _cl47 and _cl47[0]["status"] == "unanswered", f"S46: 应诚实上报无人可解 {_cl47}"
+    assert _topo_sessions[_s47["session_id"]]["error"] is None, "S46: 无人可解不应崩电路"
+    # ⑧ 零回归：coop_enabled=False 时完全走旧路径
+    _s48 = topology_session(TopologySessionRequest(spec=_spec47, seed=1,
+                                                   coop_enabled=False))
+    _topo_sessions[_s48["session_id"]]["done"].wait(timeout=10)
+    assert _topo_sessions[_s48["session_id"]]["executor"].recruiter is None
+    assert help_log(_s48["session_id"])["coop_log"] == [], "S46: 关闭协同应零求援"
+    print("✓ S46 人机协同(极致): 人/agent/知识源/系统四类协作者同池 · 按能力择优可解释 · "
+          "offline自动绕开 · 机器主动点名人类专家并异步作答回灌节点 · "
+          "求援过程SSE实时可见 · 重复应答404 · 无人可解不吊死 · 关闭开关零回归 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

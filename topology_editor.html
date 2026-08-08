@@ -97,6 +97,20 @@
          padding:20px;max-width:460px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
   #qmask h2{margin:0 0 8px;font-size:15px}
   #q-opts button{margin:8px 8px 0 0}
+  /* 待办求援箱（人机协同·极致）：机器主动找人类帮忙 */
+  #help-sec{display:none;max-height:300px;overflow:auto;flex-direction:column;min-height:0}
+  #help-body .hreq{border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:8px}
+  #help-body .hreq .hneed{color:var(--muted);font-weight:400;font-size:11px}
+  #help-body .hreq .hq{color:var(--txt);margin:4px 0}
+  #help-body .hreq .hreason{color:var(--muted);font-size:11px}
+  #help-body .hreq .hassign{color:var(--amber);font-size:11px}
+  #helpmask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:51;
+            align-items:center;justify-content:center}
+  #helpmask .box{background:var(--panel);border:1px solid var(--accent2);border-radius:12px;
+         padding:20px;max-width:480px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  #helpmask textarea{width:100%;background:var(--panel2);color:var(--txt);
+         border:1px solid var(--line);border-radius:7px;padding:6px 9px;font:inherit;resize:vertical}
+  #helpmask label{display:block;font-size:12px;color:var(--muted);margin:8px 0 3px}
 </style>
 </head>
 <body>
@@ -211,6 +225,10 @@
       </div>
       <div id="fed-body" style="font-size:12px;color:var(--muted)">点『联邦』查看其他房间的知识库并拉取。</div>
     </div>
+    <div class="sec" id="help-sec">
+      <h2>🆘 待办求援箱 · 机器在找我帮忙</h2>
+      <div id="help-body" style="font-size:12px;color:var(--muted)">机器遇到自己搞不定的事，会主动在这里求援。你有空点『我来答』，答案立刻回灌电路，它不用重跑全图。</div>
+    </div>
     <div class="sec" style="max-height:170px;overflow:auto;display:flex;flex-direction:column;min-height:0;padding-bottom:0">
       <h2>事件流</h2>
       <div id="log"></div>
@@ -223,6 +241,21 @@
     <h2>🤔 老板，这个我拿不准</h2>
     <div id="q-text" style="color:var(--muted);margin-bottom:6px"></div>
     <div id="q-opts"></div>
+  </div>
+</div>
+
+<div id="helpmask">
+  <div class="box">
+    <h2>🤝 帮它一把</h2>
+    <div id="help-q-text" style="color:var(--muted);margin-bottom:6px"></div>
+    <label>你的答案 / 提供的资源</label>
+    <textarea id="help-value" rows="3" placeholder="例如：6061-T6 在库 137 件，批次 B2409"></textarea>
+    <label>署名（你是谁）</label>
+    <input type="text" id="help-by" style="width:100%">
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="help-send">✓ 作答并回灌电路</button>
+      <button id="help-cancel">取消</button>
+    </div>
   </div>
 </div>
 
@@ -669,6 +702,8 @@ async function poll(){
     if(st.pending_question && $("qmask").style.display!=="flex") showQuestionModal(st.pending_question);
     // 指挥中⼼③：刷新学习库
     updateLearnings(st);
+    // 人机协同·极致：刷新「待办求援箱」（机器主动找我帮忙的都在这里）
+    loadHelp();
     // 指挥中⼼①：已完成的选中节点，实时刷新工作报告
     if(S.selected && (st.done_nodes||[]).includes(S.selected)) showReport(S.selected);
     // 协同模式：拉取房间动态 + 刷新成员（实时看到他人动作）
@@ -761,6 +796,14 @@ function onEvent(ev){
         addTimeline("👥",(ev.actor||"?")+" "+(ev.action||""),"act");
         if(S.room) api("/rooms/"+S.room+"/activity").then(d=>renderCollab(d.activities||[])).catch(()=>{});
         break;
+      // ── 人机协同·极致：机器主动求援，人类「待办求援箱」实时可见 ──
+      case "help_open": loadHelp(); addTimeline("🆘","求援："+(ev.need||[]).join(","),"act"); break;
+      case "help_dispatch": addTimeline("📡","派单→"+escapeHtml(ev.name||ev.to||""),"act"); break;
+      case "help_waiting_human": loadHelp(); addTimeline("⏳","等 "+escapeHtml(ev.to||"")+" 作答","act"); break;
+      case "help_answered": loadHelp(); addTimeline("✅","获解 by "+escapeHtml(ev.by||""),"done"); break;
+      case "help_escalate": addTimeline("⬆","升级（"+(ev.from_||"")+" 无解）","act"); break;
+      case "help_unanswered": addTimeline("⚠","无人可解，诚实上报","q"); break;
+      case "help_applied": addTimeline("🔌","答案已回灌节点 "+escapeHtml(ev.node||""),"done"); break;
       case "done":
         addTimeline("🏁","执行结束","done");
         if(ev.result) finishRun(ev);
@@ -993,6 +1036,62 @@ async function federatePull(otherRid){
   }catch(e){ $("fed-hint").textContent="拉取失败："+e.message; }
 }
 
+// ── 人机协同·极致：人类「待办求援箱」 ──
+// 机器卡住时会主动招募协作者；若点名的是人类（或无人可解兜底人类操作者），
+// 求援会进这里，真人点『我来答』即可把答案回灌电路，不必重跑全图。
+let _help_hid=null;
+async function loadHelp(){
+  if(!S.sid) return;
+  try{
+    const d=await api("/help/pending?sid="+encodeURIComponent(S.sid));
+    renderHelp(d.pending||[]);
+  }catch(e){}
+}
+function renderHelp(list){
+  const sec=$("help-sec"), el=$("help-body");
+  if(!sec||!el) return;
+  if(!list.length){ sec.style.display="none"; return; }
+  sec.style.display="flex";
+  let h="";
+  for(const it of list){
+    const need=(it.need||[]).join(", ")||"—";
+    const assignee=it.assignee?("指定："+escapeHtml(it.assignee)):"";
+    const q=it.question||"（机器没细说，大概是缺数据或需要你拍板）";
+    h+='<div class="hreq">'+
+       '<div style="font-weight:600">节点 '+escapeHtml(it.node||"?")+
+       '　<span class="hneed">需要能力：'+escapeHtml(need)+'</span></div>'+
+       '<div class="hq">'+escapeHtml(q)+'</div>'+
+       (it.reason?'<div class="hreason">原因：'+escapeHtml(it.reason)+'</div>':"")+
+       (assignee?'<div class="hassign">'+escapeHtml(assignee)+'</div>':"")+
+       '<div style="margin-top:6px"><button class="primary help-ans" data-hid="'+escapeHtml(it.hid)+'">🤝 我来答</button></div>'+
+       '</div>';
+  }
+  el.innerHTML=h;
+  el.querySelectorAll(".help-ans").forEach(b=>b.addEventListener("click",()=>openHelpModal(b.dataset.hid, b)));
+}
+function openHelpModal(hid, btn){
+  _help_hid=hid;
+  const box=btn&&btn.closest?btn.closest(".hreq"):null;
+  const q=box?(box.querySelector(".hq").textContent||""):"";
+  $("help-q-text").textContent=q||"（机器没细说，大概是缺数据或需要你拍板）";
+  $("help-q-text").style.color="var(--muted)";
+  $("help-value").value="";
+  $("help-by").value=S.me||"human";
+  $("helpmask").style.display="flex";
+}
+async function sendHelp(){
+  const hid=_help_hid; if(!hid) return;
+  const value=$("help-value").value.trim();
+  if(!value){ $("help-q-text").style.color="var(--red)"; $("help-q-text").textContent="请先填写答案再发送。"; return; }
+  try{
+    await api("/help/"+encodeURIComponent(hid)+"/respond",{value:value, by:($("help-by").value.trim()||"human")});
+    $("helpmask").style.display="none";
+    log("🤝 你已作答，答案回灌电路："+hid);
+    await loadHelp();
+  }catch(e){ $("help-q-text").style.color="var(--red)"; $("help-q-text").textContent="作答失败："+e.message; }
+}
+function closeHelpModal(){ $("helpmask").style.display="none"; }
+
 // ── 绑定 ──
 $("btn-start").addEventListener("click",start);
 $("btn-invite").addEventListener("click",()=>{
@@ -1008,6 +1107,8 @@ $("btn-kb-distill").addEventListener("click",distillMemory);
 $("btn-orchestrate").addEventListener("click",orchestrate);
 $("btn-fed").addEventListener("click",loadFederation);
 $("btn-fed-reload").addEventListener("click",loadFederation);
+$("help-send").addEventListener("click",sendHelp);
+$("help-cancel").addEventListener("click",closeHelpModal);
 $("btn-reroute").addEventListener("click",()=>{
   S.rerouteMode=!S.rerouteMode;
   $("btn-reroute").classList.toggle("on",S.rerouteMode);
