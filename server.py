@@ -1344,13 +1344,15 @@ class TopologySessionRequest(BaseModel):
 
 
 class TopologyEditRequest(BaseModel):
-    op: str                           # insert | replace | append_parallel | set_gate
+    op: str                           # insert | replace | append_parallel | set_gate | reroute
     u: Optional[str] = None
     v: Optional[str] = None
     cid: Optional[str] = None
     new_cid: Optional[str] = None
     comp: Optional[dict] = None
     threshold: Optional[float] = None
+    old: Optional[list] = None        # reroute: 被替换的 wire [u,v]
+    new: Optional[list] = None        # reroute: 新 wire [u,v]
 
 
 def _topo_session(sid: str):
@@ -1420,11 +1422,13 @@ def topology_edit(sid: str, req: TopologyEditRequest,
     try:
         out = rec["executor"].edit(
             req.op, u=req.u, v=req.v, cid=req.cid,
-            new_cid=req.new_cid, comp=req.comp, threshold=req.threshold)
+            new_cid=req.new_cid, comp=req.comp, threshold=req.threshold,
+            old=req.old, new=req.new)
     except Exception as e:
         raise HTTPException(400, f"编辑失败: {e}")
     if room:
         _record_activity(room, user_id, "edit", sid, detail=req.op)
+        room["spec"] = rec["executor"].circuit.spec   # 改流向/编辑同步到房间共享拓扑
         room["memory"]["learnings"].append({
             "ts": time.time(), "actor": user_id, "op": req.op,
             "target": getattr(req, "cid", None) or getattr(req, "u", None),
@@ -2837,6 +2841,43 @@ def selftest():
         _forbidden_orc = (getattr(e, "status_code", None) == 403)
     assert _forbidden_orc, "S38: reviewer 无 control 发起编排应被 403 拦截"
     print("✓ S38 大规模协作维度③: mentor提议/reviewer裁决/student执行/质量门/activity可见/越权403 全通过")
+
+    # S39: 大规模协作维度④ —— reroute 拖拽改流向（edit op 扩展 + 房间共享拓扑同步）
+    _spec39 = {"name": "s39_reroute",
+               "components": {
+                   "src": {"type": "power", "label": "task", "task": "x"},
+                   "a": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["x"]},
+                   "b": {"type": "resistor", "label": "B", "model": "small", "required_inputs": ["x"], "produced_outputs": ["y"]},
+                   "c": {"type": "resistor", "label": "C", "model": "small", "required_inputs": ["y"], "produced_outputs": ["z"]},
+               },
+               "wires": [["src", "a"], ["a", "b"], ["b", "c"]]}
+    _s39 = topology_session(TopologySessionRequest(spec=_spec39))
+    _s39id = _s39["session_id"]
+    try: topology_pause(_s39id)
+    except Exception: pass
+    # 把 a->b 重定向为 a->c
+    _r39 = topology_edit(_s39id, TopologyEditRequest(op="reroute", old=["a", "b"], new=["a", "c"]))
+    _w39 = topology_state(_s39id)["wires"]
+    assert ["a", "c"] in _w39, "S39: reroute 应把 a->b 改为 a->c"
+    assert ["a", "b"] not in _w39, "S39: 旧 wire a->b 应消失"
+    # old=None → 新建 wire
+    _r39b = topology_edit(_s39id, TopologyEditRequest(op="reroute", old=None, new=["a", "b"]))
+    _w39b = topology_state(_s39id)["wires"]
+    assert ["a", "b"] in _w39b, "S39: old=None 应新建 wire a->b"
+    # 房间模式：reroute 应写 activity + 同步房间共享 spec
+    _rid5 = "collab_s39"
+    _c5 = create_room(CreateRoomRequest(spec=_spec39, owner_id="kara", name="rt", room_id=_rid5))
+    _s5 = _c5["session_id"]
+    try: topology_pause(_s5)
+    except Exception: pass
+    topology_edit(_s5, TopologyEditRequest(op="reroute", old=["a", "b"], new=["a", "c"]),
+                 room_id=_rid5, user_id="kara")
+    _act5 = room_activity(_rid5, user_id="kara")["activities"]
+    assert any(a["action"] == "edit" and a["detail"] == "reroute" for a in _act5), \
+        "S39: 房间模式 reroute 应记 edit/reroute 事件"
+    assert ["a", "c"] in room_info(_rid5, user_id="kara").get("spec", {}).get("wires", []), \
+        "S39: reroute 应同步到房间共享 spec（协作者可见）"
+    print("✓ S39 大规模协作维度④: reroute 改流向(替换/新建 wire) + 房间 activity + 共享拓扑同步 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

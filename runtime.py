@@ -1305,6 +1305,16 @@ class CircuitExecutor:
             editor.append_parallel(kwargs["cid"], kwargs["new_cid"], kwargs["comp"])
         elif op == "set_gate":
             editor.set_gate(kwargs["cid"], kwargs["threshold"])
+        elif op == "reroute":
+            # 改 DAG 流向：old 为空则新增一条 wire，否则把 old 重定向为 new。
+            old = kwargs.get("old")
+            new = kwargs.get("new")
+            if not new:
+                raise ValueError("reroute 需要 new wire")
+            if old:
+                self.circuit.spec = CircuitMutator.reroute(self.circuit.spec, old, new)
+            elif list(new) not in [list(w) for w in self.circuit.spec.get("wires", [])]:
+                self.circuit.spec.setdefault("wires", []).append(list(new))
         else:
             raise ValueError(f"未知编辑操作: {op}")
         self._topology_dirty = True

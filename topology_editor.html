@@ -40,6 +40,8 @@
   .side .sec h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin:0 0 8px}
   .palette{display:flex;flex-wrap:wrap;gap:6px}
   .palette button{font-size:12px;padding:5px 9px}
+  .palette button.on{background:var(--accent);color:#06121f;border-color:var(--accent);font-weight:600}
+  #__rt_line{pointer-events:none}
   .inspector label{display:block;font-size:12px;color:var(--muted);margin:8px 0 3px}
   .inspector .row{display:flex;gap:6px}
   #log{flex:1;overflow:auto;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
@@ -133,6 +135,13 @@
       </div>
       <div class="hint" id="ins-hint">点面板按钮 → 点源节点(u) → 点目标节点(v) 即在连线插入</div>
     </div>
+    <div class="sec">
+      <h2>改流向 · 拖拽重连 DAG</h2>
+      <div class="palette">
+        <button id="btn-reroute">🔗 改流向模式</button>
+      </div>
+      <div class="hint" id="rt-hint">开启后：从某节点拖到另一节点，即把该节点的输出重定向到新目标（改数据流向）。房间内所有人可见。</div>
+    </div>
     <div class="sec inspector" id="inspector">
       <h2>节点检查器</h2>
       <div id="ins-empty" style="color:var(--muted);font-size:13px">点击画布中的任意节点以查看 / 修改属性。</div>
@@ -200,7 +209,7 @@ const SVGNS = "http://www.w3.org/2000/svg";
 let S = {
   base:"http://127.0.0.1:8765", sid:null, spec:null,
   pos:{}, selected:null, edited:new Set(),
-  insertType:null, insertU:null,
+  insertType:null, insertU:null, rerouteMode:false,
   pollTimer:null, done:false,
   room:null, me:null, role:null, members:{}, lastAct:-1
 };
@@ -347,11 +356,68 @@ function markState(st){
 // ── 拖拽重排（仅视觉）──
 let drag=null;
 function startDrag(ev,c){
+  if(S.rerouteMode){ startRerouteDrag(ev,c); return; }
   ev.preventDefault();
   const g=ev.currentTarget;
   const m=ev; drag={c,g,sx:m.clientX,sy:m.clientY,ox:S.pos[c]?S.pos[c].x:S._pos[c].x,oy:S.pos[c]?S.pos[c].y:S._pos[c].y};
   window.addEventListener("mousemove",onDrag);
   window.addEventListener("mouseup",endDrag);
+}
+
+// ── 改流向拖拽（维度④）：从源节点拖到目标节点 → 重定向其输出 wire ──
+let rerouteDrag=null;
+function _canEdit(){ const r=(S.members[S.me]||S.role); return r==="owner"||r==="mentor"; }
+function startRerouteDrag(ev,c){
+  ev.preventDefault();
+  if(!_canEdit()){ hint("⛔ 改流向需 owner/mentor 权限"); return; }
+  rerouteDrag={src:c};
+  window.addEventListener("mousemove",onRerouteDrag);
+  window.addEventListener("mouseup",endRerouteDrag);
+}
+function onRerouteDrag(ev){
+  if(!rerouteDrag) return;
+  const svg=$("svg"), r=svg.getBoundingClientRect();
+  const p=S.pos[rerouteDrag.src]; if(!p) return;
+  let line=document.getElementById("__rt_line");
+  if(!line){
+    line=document.createElementNS(SVGNS,"line"); line.id="__rt_line";
+    line.setAttribute("stroke","var(--accent)"); line.setAttribute("stroke-width","2.5");
+    line.setAttribute("stroke-dasharray","6,4"); line.setAttribute("marker-end","url(#arw)");
+    svg.appendChild(line);
+  }
+  line.setAttribute("x1",p.x+130); line.setAttribute("y1",p.y+26);
+  line.setAttribute("x2",ev.clientX-r.left); line.setAttribute("y2",ev.clientY-r.top);
+}
+function endRerouteDrag(ev){
+  window.removeEventListener("mousemove",onRerouteDrag);
+  window.removeEventListener("mouseup",endRerouteDrag);
+  const line=document.getElementById("__rt_line"); if(line) line.remove();
+  if(!rerouteDrag) return;
+  const src=rerouteDrag.src; rerouteDrag=null;
+  const el=document.elementFromPoint(ev.clientX,ev.clientY);
+  const g=el&&el.closest?el.closest(".node"):null;
+  const tgt=g?g.dataset.id:null;
+  if(!tgt||tgt===src){ hint("改流向取消"); return; }
+  doReroute(src,tgt);
+}
+async function doReroute(src,tgt){
+  if(!S.sid) return;
+  if(!_canEdit()){ hint("⛔ 改流向需 owner/mentor 权限"); return; }
+  const outs=S.spec.wires.filter(w=>w[0]===src);
+  const oldWire=outs[0]||null;
+  const newWire=[src,tgt];
+  try{
+    await ensurePaused();
+    const r=await api("/topology/edit/"+S.sid,{op:"reroute", old:oldWire, new:newWire});
+    if(r.state&&r.state.wires){ S.spec.wires=r.state.wires; }
+    else { // 乐观更新（与后端保持一致）
+      const i=oldWire?S.spec.wires.findIndex(w=>w[0]===oldWire[0]&&w[1]===oldWire[1]):-1;
+      if(i>=0) S.spec.wires[i]=newWire;
+      else if(!S.spec.wires.some(w=>w[0]===newWire[0]&&w[1]===newWire[1])) S.spec.wires.push(newWire);
+    }
+    log("🔗 改流向："+(oldWire?JSON.stringify(oldWire):"(新建)")+" → "+JSON.stringify(newWire));
+    render();
+  }catch(e){ log("改流向失败："+e.message); }
 }
 function onDrag(ev){
   if(!drag) return;
@@ -711,6 +777,11 @@ $("btn-resume").addEventListener("click",resume);
 $("btn-kb-publish").addEventListener("click",publishMemory);
 $("btn-kb-distill").addEventListener("click",distillMemory);
 $("btn-orchestrate").addEventListener("click",orchestrate);
+$("btn-reroute").addEventListener("click",()=>{
+  S.rerouteMode=!S.rerouteMode;
+  $("btn-reroute").classList.toggle("on",S.rerouteMode);
+  hint(S.rerouteMode?"🔗 改流向模式：从某节点拖到另一节点即重定向其输出（改数据流向）":"已退出改流向模式");
+});
 $("ins-replace").addEventListener("click",replaceNode);
 $("ins-append").addEventListener("click",appendParallel);
 $("ins-gate").addEventListener("change",setGate);
