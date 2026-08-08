@@ -1353,6 +1353,90 @@ class TopologyEditRequest(BaseModel):
     threshold: Optional[float] = None
     old: Optional[list] = None        # reroute: 被替换的 wire [u,v]
     new: Optional[list] = None        # reroute: 新 wire [u,v]
+    base_rev: Optional[int] = None    # 客户端提交时看到的房间版本（乐观并发控制）
+    force: bool = False               # 冲突时强推（后写覆盖），默认 false → 409
+
+
+# ──────────────────────────────────────────────────────────
+# 大规模协作 深化②：OT-lite 并发编辑
+#
+#   多人同时改同一张拓扑的冲突问题，用「服务端权威串行化 + 版本号 + 语义冲突检测」解决：
+#     · 所有房间编辑在 _lock 下串行，产生单调递增 rev 并写入 op-log；
+#     · 客户端提交编辑时带上自己看到的 base_rev；
+#     · 服务端把 (base_rev, 当前rev] 之间的并发操作取出，比对「操作目标」：
+#         - 目标不相交 → 自动 rebase 放行（这是常态：两人改不同节点本就不冲突）
+#         - 目标相交   → 409 + 冲突详情，客户端刷新后重试（或 force 强推）
+#     · 落后的客户端用 GET /rooms/{rid}/ops?since=N 重放追平，无需全量刷新。
+#   相比全量锁：不同节点的并发编辑不互相阻塞；相比无冲突检测：同一节点不会被静默覆盖。
+# ──────────────────────────────────────────────────────────
+
+_EDIT_LOCK = threading.RLock()   # 房间编辑串行化：让「检测冲突→应用→记账」成为原子操作
+
+
+def _op_targets(op: str, args: dict) -> set:
+    """抽取一个编辑操作实际触碰的「目标集合」，用于判断两个并发操作是否冲突。
+
+    节点级操作 → ("node", cid)；连线级操作 → ("wire", u, v)。
+    目标不相交的两个操作可安全并发（自动 rebase）。
+    """
+    a = args or {}
+    t = set()
+    if op in ("replace_node", "replace", "set_gate", "append_parallel"):
+        cid = a.get("cid")
+        if cid:
+            t.add(("node", cid))
+        if a.get("new_cid"):
+            t.add(("node", a["new_cid"]))
+    if op in ("insert_on_wire", "insert"):
+        u, v = a.get("u"), a.get("v")
+        if u and v:
+            t.add(("wire", u, v))
+            # 在一条线上插节点会改变 u/v 的下游关系 → 也算触碰这两个节点
+            t.add(("node", u)); t.add(("node", v))
+    if op == "reroute":
+        for w in (a.get("old"), a.get("new")):
+            if w and len(w) == 2:
+                t.add(("wire", w[0], w[1]))
+                t.add(("node", w[0]))
+    return t
+
+
+def _append_op(room: dict, actor: str, op: str, args: dict) -> int:
+    """在锁内把一次编辑写进 op-log 并推进 rev。返回新 rev。"""
+    with _lock:
+        room["rev"] = int(room.get("rev", 0)) + 1
+        room["ops"].append({
+            "rev": room["rev"], "ts": time.time(), "actor": actor,
+            "op": op, "args": {k: v for k, v in (args or {}).items() if v is not None},
+        })
+        if len(room["ops"]) > 2000:      # 防无界增长；重放只需最近窗口
+            room["ops"] = room["ops"][-1000:]
+        return room["rev"]
+
+
+def _detect_conflict(room: dict, base_rev: Optional[int], op: str, args: dict):
+    """乐观并发控制：返回 (需拒绝?, 冲突详情dict)。base_rev=None 视为不参与并发控制。"""
+    if base_rev is None:
+        return False, None
+    cur = int(room.get("rev", 0))
+    if base_rev >= cur:
+        return False, None                      # 客户端是最新的，无并发
+    mine = _op_targets(op, args)
+    if not mine:
+        return False, None                      # 无法定位目标的操作不做拦截
+    clashes = []
+    for o in room.get("ops", []):
+        if o["rev"] <= base_rev:
+            continue
+        inter = _op_targets(o["op"], o.get("args")) & mine
+        if inter:
+            clashes.append({"rev": o["rev"], "actor": o["actor"], "op": o["op"],
+                            "targets": ["/".join(map(str, x)) for x in sorted(inter)]})
+    if not clashes:
+        return False, {"rebased": True, "behind": cur - base_rev}   # 自动 rebase
+    return True, {"conflict": True, "base_rev": base_rev, "current_rev": cur,
+                  "clashes": clashes,
+                  "hint": "他人已改动同一目标；刷新（/rooms/{rid}/ops?since=base_rev）后重试，或 force=true 强推"}
 
 
 def _topo_session(sid: str):
@@ -1419,22 +1503,48 @@ def topology_edit(sid: str, req: TopologyEditRequest,
                   user_id: Optional[str] = Query(None)):
     room = _room_ctx(room_id, user_id, "edit")
     rec = _topo_session(sid)
-    try:
-        out = rec["executor"].edit(
-            req.op, u=req.u, v=req.v, cid=req.cid,
-            new_cid=req.new_cid, comp=req.comp, threshold=req.threshold,
-            old=req.old, new=req.new)
-    except Exception as e:
-        raise HTTPException(400, f"编辑失败: {e}")
-    if room:
-        _record_activity(room, user_id, "edit", sid, detail=req.op)
+    _args = req.model_dump(exclude_none=True)
+    _merge = None
+
+    def _apply():
+        try:
+            return rec["executor"].edit(
+                req.op, u=req.u, v=req.v, cid=req.cid,
+                new_cid=req.new_cid, comp=req.comp, threshold=req.threshold,
+                old=req.old, new=req.new)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"编辑失败: {e}")
+
+    if room is None:                      # 单人会话：无并发语义，直接改
+        out = _apply()
+        return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
+
+    # ── OT-lite：冲突检测 + 应用编辑 + 记账 必须在同一把锁内原子完成 ──
+    #    否则两人同时改同一节点会双双通过检测（TOCTOU 竞态），后写静默覆盖先写。
+    with _EDIT_LOCK:
+        rejected, info = _detect_conflict(room, req.base_rev, req.op, _args)
+        if rejected and not req.force:
+            raise HTTPException(409, detail=info)
+        if rejected and req.force:
+            _merge = {**info, "forced": True}
+        elif info:
+            _merge = info                      # 自动 rebase 成功（目标不相交）
+        out = _apply()
+        _rev = _append_op(room, user_id, req.op, _args)
         room["spec"] = rec["executor"].circuit.spec   # 改流向/编辑同步到房间共享拓扑
         room["memory"]["learnings"].append({
             "ts": time.time(), "actor": user_id, "op": req.op,
             "target": getattr(req, "cid", None) or getattr(req, "u", None),
-            "detail": req.model_dump(exclude_none=True),
+            "detail": _args,
         })
-    return {"session_id": sid, "edit": out, "state": rec["executor"].get_state()}
+    _record_activity(room, user_id, "edit", sid, detail=req.op)
+    resp = {"session_id": sid, "edit": out, "state": rec["executor"].get_state(),
+            "rev": _rev}
+    if _merge:
+        resp["merge"] = _merge
+    return resp
 
 
 @app.api_route("/topology/resume/{sid}", methods=["GET", "POST"])
@@ -1592,6 +1702,8 @@ def create_room(req: CreateRoomRequest):
         "spec": req.spec,
         "activity": [],
         "memory": {"published": [], "learnings": [], "templates": []},
+        "ops": [],       # OT op-log：房间共享拓扑的全部变更（可重放）
+        "rev": 0,        # 单调递增版本号；客户端据此判断"我落后了没有"
         "created_at": _tm.time(),
     }
     with _lock:
@@ -1645,7 +1757,26 @@ def room_info(rid: str, user_id: Optional[str] = None):
     return {"room_id": rid, "name": room["name"], "owner": room["owner"],
             "members": dict(room["members"]), "session_id": room["session_id"],
             "created_at": room["created_at"], "state": st, "spec": room.get("spec"),
-            "activity_count": len(room["activity"])}
+            "activity_count": len(room["activity"]),
+            "rev": int(room.get("rev", 0))}      # 客户端据此判断自己是否落后
+
+
+@app.get("/rooms/{rid}/ops")
+def room_ops(rid: str, user_id: Optional[str] = None, since: int = 0, limit: int = 200):
+    """拉取 since 之后的房间编辑 op-log（深化②）。
+
+    落后的客户端不必全量刷新，只要重放这些 op 即可追平到 rev；
+    新加入者传 since=0 可拿到房间自建立以来的全部编辑历史（受窗口限制）。
+    """
+    room = _rooms.get(rid)
+    if room is None:
+        raise HTTPException(404, f"room not found: {rid}")
+    if user_id and user_id not in room["members"]:
+        raise HTTPException(403, "not a member of this room")
+    ops = [o for o in room.get("ops", []) if o["rev"] > since][:limit]
+    return {"room_id": rid, "rev": int(room.get("rev", 0)), "since": since,
+            "ops": ops, "count": len(ops),
+            "truncated": bool(room.get("ops")) and room["ops"][0]["rev"] > since + 1}
 
 
 @app.get("/rooms/{rid}/activity")
@@ -2959,6 +3090,118 @@ def selftest():
             if _v is not None:
                 _os40.environ[_k] = _v
     print("✓ S40 深化①真实LLM接入: 逐角色开关/默认全mock不烧钱/无key优雅降级/降级可见/能力探测 全通过")
+
+    # S41: 深化② OT-lite 并发编辑 —— 版本号/op-log/语义冲突检测/自动rebase/重放追平
+    _spec41 = {"name": "s41_ot", "components": {
+        "src": {"type": "power", "label": "task", "task": "x"},
+        "a": {"type": "resistor", "label": "A", "model": "small", "produced_outputs": ["x"]},
+        "b": {"type": "resistor", "label": "B", "model": "small",
+              "required_inputs": ["x"], "produced_outputs": ["y"]},
+        "c": {"type": "resistor", "label": "C", "model": "small",
+              "required_inputs": ["y"], "produced_outputs": ["z"]},
+    }, "wires": [["src", "a"], ["a", "b"], ["b", "c"]]}
+    _rid7 = "collab_s41"
+    _c7 = create_room(CreateRoomRequest(spec=_spec41, owner_id="mia", name="ot", room_id=_rid7))
+    _s7 = _c7["session_id"]
+    room_join(_rid7, RoomJoinRequest(user_id="noah", desired_role="mentor"))
+    try: topology_pause(_s7)
+    except Exception: pass
+    assert room_info(_rid7, user_id="mia")["rev"] == 0, "S41: 新房间 rev 应为 0"
+    # ① 编辑推进 rev 并写 op-log
+    _e1 = topology_edit(_s7, TopologyEditRequest(op="replace", cid="a",
+                                                 comp={"model": "large"}, base_rev=0),
+                        room_id=_rid7, user_id="mia")
+    assert _e1["rev"] == 1, f"S41: 首次编辑 rev 应为 1，实际 {_e1.get('rev')}"
+    _ops = room_ops(_rid7, user_id="mia", since=0)
+    assert _ops["count"] == 1 and _ops["ops"][0]["actor"] == "mia", "S41: op-log 应记录编辑者"
+    # ② 落后但改**不同节点** → 自动 rebase 放行（常态：不该互相阻塞）
+    _e2 = topology_edit(_s7, TopologyEditRequest(op="replace", cid="c",
+                                                 comp={"model": "large"}, base_rev=0),
+                        room_id=_rid7, user_id="noah")
+    assert _e2["rev"] == 2, "S41: 第二次编辑应推进到 rev 2"
+    assert _e2.get("merge", {}).get("rebased") is True, "S41: 不同目标应自动 rebase"
+    # ③ 落后且改**同一节点** → 409 冲突（不静默覆盖）
+    _conflict = None
+    try:
+        topology_edit(_s7, TopologyEditRequest(op="replace", cid="a",
+                                               comp={"model": "tool"}, base_rev=0),
+                      room_id=_rid7, user_id="noah")
+    except Exception as e:
+        _conflict = e
+    assert getattr(_conflict, "status_code", None) == 409, "S41: 同目标并发编辑应 409"
+    _d = _conflict.detail
+    assert _d["clashes"] and _d["clashes"][0]["actor"] == "mia", "S41: 冲突详情应指出是谁改的"
+    assert any("node/a" in t for t in _d["clashes"][0]["targets"]), "S41: 冲突应定位到 node/a"
+    # ④ force=true 强推可覆盖（但会被标记）
+    _e4 = topology_edit(_s7, TopologyEditRequest(op="replace", cid="a",
+                                                 comp={"model": "tool"}, base_rev=0, force=True),
+                        room_id=_rid7, user_id="noah")
+    assert _e4["merge"]["forced"] is True, "S41: force 应被标记，便于事后追责"
+    assert _e4["rev"] == 3, "S41: 强推也要推进 rev"
+    # ⑤ 追平后再提交（base_rev=当前rev）→ 无冲突
+    _cur = room_info(_rid7, user_id="noah")["rev"]
+    _e5 = topology_edit(_s7, TopologyEditRequest(op="replace", cid="a",
+                                                 comp={"model": "large"}, base_rev=_cur),
+                        room_id=_rid7, user_id="noah")
+    assert "merge" not in _e5, "S41: 追平后提交不应有 rebase/冲突标记"
+    # ⑥ 增量重放：只取自己没见过的 op
+    _inc = room_ops(_rid7, user_id="noah", since=2)
+    assert _inc["count"] == 2 and all(o["rev"] > 2 for o in _inc["ops"]), "S41: since 应做增量过滤"
+    assert _inc["rev"] == 4, "S41: ops 应回传房间最新 rev"
+    # ⑦ 真并发压测：8 线程同时改 8 个不同节点，rev 必须无缝且无丢失
+    _spec41b = {"name": "s41_par", "components": {
+        "src": {"type": "power", "label": "t", "task": "x"},
+        **{f"n{i}": {"type": "resistor", "label": f"N{i}", "model": "small",
+                     "produced_outputs": [f"o{i}"]} for i in range(8)},
+    }, "wires": [["src", f"n{i}"] for i in range(8)]}
+    _rid8 = "collab_s41p"
+    _c8 = create_room(CreateRoomRequest(spec=_spec41b, owner_id="mia", name="par", room_id=_rid8))
+    _s8 = _c8["session_id"]
+    try: topology_pause(_s8)
+    except Exception: pass
+    import threading as _th41
+    _errs41 = []
+    def _worker41(i):
+        try:
+            topology_edit(_s8, TopologyEditRequest(op="replace", cid=f"n{i}",
+                                                   comp={"model": "large"}, base_rev=0),
+                          room_id=_rid8, user_id="mia")
+        except Exception as ex:
+            _errs41.append(ex)
+    _ths41 = [_th41.Thread(target=_worker41, args=(i,)) for i in range(8)]
+    for t in _ths41: t.start()
+    for t in _ths41: t.join()
+    assert not _errs41, f"S41: 改不同节点的并发编辑不应冲突，实际报错 {_errs41[:2]}"
+    _r8 = _rooms[_rid8]
+    assert _r8["rev"] == 8, f"S41: 8 次并发编辑 rev 应为 8，实际 {_r8['rev']}"
+    _revs = [o["rev"] for o in _r8["ops"]]
+    assert sorted(_revs) == list(range(1, 9)), f"S41: rev 应连续无重复/无丢失，实际 {_revs}"
+    # ⑧ 原子性（防 TOCTOU）：8 线程抢改**同一节点**且都基于同一 base_rev
+    #    → 必须恰好 1 个成功、其余全部 409，绝不能双双通过检测后静默覆盖
+    _base8 = _r8["rev"]
+    _ok8, _c409 = [], []
+    def _racer(i):
+        try:
+            r = topology_edit(_s8, TopologyEditRequest(op="replace", cid="n0",
+                                                       comp={"model": f"m{i}"},
+                                                       base_rev=_base8),
+                              room_id=_rid8, user_id=f"u{i}")
+            _ok8.append(r["rev"])
+        except Exception as ex:
+            if getattr(ex, "status_code", None) == 409:
+                _c409.append(i)
+            else:
+                _errs41.append(ex)
+    for i in range(8):
+        room_join(_rid8, RoomJoinRequest(user_id=f"u{i}", desired_role="mentor"))
+    _ths8 = [_th41.Thread(target=_racer, args=(i,)) for i in range(8)]
+    for t in _ths8: t.start()
+    for t in _ths8: t.join()
+    assert not _errs41, f"S41: 抢改不应产生非 409 错误 {_errs41[:2]}"
+    assert len(_ok8) == 1, f"S41: 抢改同一节点应恰好 1 个成功，实际 {len(_ok8)}（TOCTOU 竞态！）"
+    assert len(_c409) == 7, f"S41: 其余 7 个应被 409 拒绝，实际 {len(_c409)}"
+    print("✓ S41 深化②OT并发编辑: rev/op-log/同目标409/异目标自动rebase/force标记/增量重放/"
+          "8线程无丢失/抢改同节点原子(1成功7冲突) 全通过")
 
     print("\nserver.py 离线自检全部通过 ✓")
 

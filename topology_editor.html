@@ -219,7 +219,8 @@ let S = {
   pos:{}, selected:null, edited:new Set(),
   insertType:null, insertU:null, rerouteMode:false,
   pollTimer:null, done:false,
-  room:null, me:null, role:null, members:{}, lastAct:-1
+  room:null, me:null, role:null, members:{}, lastAct:-1,
+  rev:0        // 我看到的房间拓扑版本（OT 乐观并发控制用）
 };
 
 // ── 协同模式：解析 URL 参数 ?room=&me=&role= ──
@@ -416,7 +417,8 @@ async function doReroute(src,tgt){
   const newWire=[src,tgt];
   try{
     await ensurePaused();
-    const r=await api("/topology/edit/"+S.sid,{op:"reroute", old:oldWire, new:newWire});
+    const r=await editApi({op:"reroute", old:oldWire, new:newWire});
+    if(!r) return;   // 冲突已处理
     if(r.state&&r.state.wires){ S.spec.wires=r.state.wires; }
     else { // 乐观更新（与后端保持一致）
       const i=oldWire?S.spec.wires.findIndex(w=>w[0]===oldWire[0]&&w[1]===oldWire[1]):-1;
@@ -476,7 +478,8 @@ async function insertBetween(u,v,type){
   const cid="ins_"+(Object.keys(S.spec.components).length+1)+"_"+type;
   const comp=newComp(type);
   await ensurePaused();
-  const r=await api("/topology/edit/"+S.sid,{op:"insert",u,v,new_cid:cid,comp});
+  const r=await editApi({op:"insert",u,v,new_cid:cid,comp});
+  if(!r) return;
   // 本地镜像
   S.spec.components[cid]=comp;
   S.spec.wires=S.spec.wires.filter(w=>!(w[0]===u&&w[1]===v));
@@ -492,7 +495,8 @@ async function replaceNode(){
   if(S.spec.components[c].type==="adc"||S.spec.components[c].type==="verify")
     comp.threshold=parseFloat($("ins-gate").value);
   await ensurePaused();
-  const r=await api("/topology/edit/"+S.sid,{op:"replace",cid:c,comp});
+  const r=await editApi({op:"replace",cid:c,comp});
+  if(!r) return;
   Object.assign(S.spec.components[c],comp);
   S.edited.add(c); log(`替换节点 <b>${c}</b> → model=${comp.model||"?"} label=${comp.label}`);
   render(); showInspector(c); updateButtons(r);
@@ -503,7 +507,8 @@ async function appendParallel(){
   const cid="par_"+(Object.keys(S.spec.components).length+1);
   const comp=newComp(type); comp.label="并行支路";
   await ensurePaused();
-  const r=await api("/topology/edit/"+S.sid,{op:"append_parallel",cid:c,new_cid:cid,comp});
+  const r=await editApi({op:"append_parallel",cid:c,new_cid:cid,comp});
+  if(!r) return;
   S.spec.components[cid]=comp;
   S.spec.wires.push([c,cid]);
   for(const [a,b] of S.spec.wires.slice()) if(a===c&&b!==cid) S.spec.wires.push([cid,b]);
@@ -515,7 +520,8 @@ async function setGate(){
   const c=S.selected; if(!c) return;
   const th=parseFloat($("ins-gate").value);
   await ensurePaused();
-  const r=await api("/topology/edit/"+S.sid,{op:"set_gate",cid:c,threshold:th});
+  const r=await editApi({op:"set_gate",cid:c,threshold:th});
+  if(!r) return;
   S.spec.components[c].threshold=th; S.edited.add(c);
   log(`调整质量门 <b>${c}</b> → θ=${th}`);
   render(); updateButtons(r);
@@ -590,6 +596,51 @@ function renderCollab(acts){
 }
 
 // ── 轮询 ──
+// ── 深化②：OT 并发编辑客户端 ────────────────────────────────
+// 提交编辑时带上「我看到的版本」base_rev；服务端据此判断我是否落后、
+// 落后时改的目标是否与他人相撞：不撞自动 rebase，撞了回 409 让我先看别人改了什么。
+async function editApi(body,{force=false}={}){
+  const b=Object.assign({},body);
+  if(S.room){ b.base_rev=S.rev|0; if(force) b.force=true; }
+  try{
+    const r=await api("/topology/edit/"+S.sid,b);
+    if(typeof r.rev==="number") S.rev=r.rev;
+    if(r.merge&&r.merge.rebased) log("↪ 自动合并：你落后 "+r.merge.behind+" 个版本，但改的目标不冲突");
+    if(r.merge&&r.merge.forced) log("⚠ 已强制覆盖他人改动（rev "+r.rev+"）");
+    return r;
+  }catch(e){
+    const m=/^409 /.test(e.message)?_parseConflict(e.message):null;
+    if(m){ await onConflict(m,body); return null; }
+    throw e;
+  }
+}
+function _parseConflict(msg){
+  try{ const j=JSON.parse(msg.replace(/^409\s*/,"")); return j.detail||j; }catch(_){ return null; }
+}
+async function onConflict(info,body){
+  const who=(info.clashes||[]).map(c=>c.actor+" 改了 "+c.targets.join("/")).join("；");
+  log("⛔ 编辑冲突：" + who + "（你的版本 rev"+info.base_rev+"，房间已到 rev"+info.current_rev+"）");
+  await replayRemoteOps();            // 先把别人的改动同步过来
+  const go=confirm("检测到冲突：\n"+who+"\n\n已为你同步他人最新改动。\n\n点「确定」= 在最新版本上强推我的改动\n点「取消」= 放弃本次编辑");
+  if(go){ const r=await editApi(body,{force:true}); if(r) render(); }
+  else log("已放弃本次编辑（保留他人改动）");
+}
+// 落后时不全量刷新，只重放 since 之后的 op，并把共享 spec 同步过来
+async function replayRemoteOps(){
+  if(!S.room) return;
+  try{
+    const d=await api("/rooms/"+S.room+"/ops?since="+(S.rev|0));
+    (d.ops||[]).forEach(o=>{
+      if(o.actor===S.me) return;
+      const tgt=o.args&&(o.args.cid||(o.args.new&&o.args.new.join("→"))||o.args.u||"");
+      log("🔄 同步 "+o.actor+" 的改动：rev"+o.rev+" "+o.op+(tgt?" @"+tgt:""));
+    });
+    S.rev=d.rev|0;
+    const info=await api("/rooms/"+S.room);
+    if(info.spec){ S.spec=info.spec; render(); }
+  }catch(e){}
+}
+
 async function poll(){
   if(!S.sid) return;
   try{
@@ -611,6 +662,8 @@ async function poll(){
         const info=await api("/rooms/"+S.room);
         S.members=info.members||S.members; renderMembers();
         renderCollab(act.activities||[]);
+        // 有人改了共享拓扑（房间 rev 前进）→ 增量重放追平，不必全量刷新
+        if(typeof info.rev==="number" && info.rev>(S.rev|0)) await replayRemoteOps();
         loadMemory();
       }catch(e){}
     }
