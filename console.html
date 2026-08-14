@@ -345,6 +345,7 @@ body.simple-mode .adv { display: none !important; }
           <span class="r-value" id="rGate">--</span>
         </div>
         <div class="r-item" id="rStatus" style="flex-basis:100%;font-size:12px;line-height:1.5;"></div>
+        <div class="r-item" id="rLlm" style="flex-basis:100%;font-size:12px;line-height:1.5;padding-top:4px;border-top:1px dashed var(--border);"></div>
       </div>
     </div>
   </div>
@@ -681,6 +682,25 @@ function onResult(result) {
     color = 'var(--orange)';
   }
   document.getElementById('rStatus').innerHTML = `<span style="color:${color}">${html}</span>`;
+
+  // 「真推理」可见性：本次由哪个后端生成 + 耗时 + token 消耗
+  const llm = r.llm;
+  const llmLine = document.getElementById('rLlm');
+  if (llm && llm.real) {
+    const secs = ((r.elapsed_ms || 0) / 1000).toFixed(1);
+    const tk = (llm.tokens && llm.tokens.total) || 0;
+    const mdl = Object.entries(llm.models || {})
+      .map(([m, c]) => `${m}×${c}`).join(' · ') || llm.provider;
+    llmLine.innerHTML = `🧠 本次由 <b>${llm.provider}</b> 生成 · 耗时 <b>${secs}s</b> · 消耗 <b>${tk}</b> token`
+      + `<br><span style="font-size:10px;opacity:.7">模型调用：${mdl}</span>`;
+    llmLine.style.color = 'var(--teal)';
+    llmLine.style.opacity = '1';
+  } else {
+    llmLine.innerHTML = '🧪 本次为模拟演示，未调用真实大模型';
+    llmLine.style.color = 'var(--muted)';
+    llmLine.style.opacity = '0.8';
+  }
+
   document.getElementById('resultBar').style.opacity = '1';
 
   document.getElementById('btnRun').disabled = false;

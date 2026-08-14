@@ -447,11 +447,20 @@ def _compile_execute(goal_text, params, on_node_done=None):
     # 否则维持原 SimBackend 确定性模拟器（向后兼容、离线不崩）。
     _rng_seed = int(time.time() * 1000) % (2 ** 31)
     _llm_key = os.environ.get("DEEPSEEK_API_KEY")
+    _t0 = time.time()
     if _llm_key:
         from compiler.ollama_backend import OllamaBackend
         _llm_base = os.environ.get("CA_LLM_BASE", "https://api.deepseek.com").rstrip("/")
         _llm_model = os.environ.get("CA_LLM_MODEL", "deepseek-chat")
-        _mm = {t: _llm_model for t in ("small", "large", "tool", "code")}
+        _reasoner_model = os.environ.get("CA_LLM_REASONER_MODEL", "deepseek-reasoner")
+        # 档位 → 模型：large（更难任务档）与显式 reasoner 档走推理模型，其余走标准对话模型
+        _mm = {
+            "small": _llm_model,
+            "large": _reasoner_model,
+            "tool": _llm_model,
+            "code": _llm_model,
+            "reasoner": _reasoner_model,
+        }
         backend = OllamaBackend(
             rng=random.Random(_rng_seed),
             host=_llm_base,
@@ -463,6 +472,21 @@ def _compile_execute(goal_text, params, on_node_done=None):
         )
     else:
         backend = SimBackend(random.Random(_rng_seed))
+
+    # 推理档：真实推理后端可用时，把「推理/分析/综合/判断」类电阻节点升到 reasoner 档
+    # （deepseek-reasoner），让更难的任务用推理模型、质量更高；检索/格式化等轻节点保持 small。
+    if _llm_key:
+        _REASON_ROLES = ("reason", "analyze", "synthes", "compare", "plan",
+                         "judge", "decide", "评估", "分析", "推理", "综合",
+                         "对比", "决策", "总结", "论证", "推导", "insight", "critique")
+        for _c in spec.get("components", {}).values():
+            if _c.get("type") != "resistor":
+                continue
+            _lbl = str(_c.get("label", "")).lower()
+            _cap = str(_c.get("capability", "")).lower()
+            if any(k in _lbl or k in _cap for k in _REASON_ROLES):
+                _c["model"] = "reasoner"
+
     circuit = Circuit(spec, backend)
     events = []
     def _cb(cid, sig, info):
@@ -478,6 +502,33 @@ def _compile_execute(goal_text, params, on_node_done=None):
         auto_select_models=params.get("auto_select_models", False),
     )
     result = executor.run()
+    # 真推理可见性：把后端实际消耗（token / 模型 / 耗时）写进结果，供前端「本次由 DeepSeek 生成」展示
+    _elapsed_ms = round((time.time() - _t0) * 1000.0, 1)
+    result["elapsed_ms"] = _elapsed_ms
+    _stats = getattr(backend, "_stats", None)
+    if _stats is not None and _stats.get("successes", 0) > 0:
+        result["llm"] = {
+            "provider": "DeepSeek",
+            "base": os.environ.get("CA_LLM_BASE", "https://api.deepseek.com"),
+            "real": True,
+            "calls": _stats.get("successes", 0),
+            "models": _stats.get("models", {}),
+            "tokens": {
+                "total": _stats.get("total_tokens", 0),
+                "prompt": _stats.get("prompt_tokens", 0),
+                "completion": _stats.get("completion_tokens", 0),
+                "reasoning": _stats.get("reasoning_tokens", 0),
+            },
+        }
+    else:
+        result["llm"] = {
+            "provider": "SimBackend",
+            "base": None,
+            "real": False,
+            "calls": 0,
+            "models": {},
+            "tokens": {"total": 0, "prompt": 0, "completion": 0, "reasoning": 0},
+        }
     result["modality"] = getattr(goal, "attachment_type", "text")
     result["attachments"] = getattr(goal, "attachments", [])
     return result, spec, events

@@ -60,9 +60,12 @@ class OllamaBackend(SimBackend):
         self._http_post = http_post
         self.api_mode = api_mode
         self.api_key = api_key
-        # 运行时统计
+        # 运行时统计（token 累计仅来自真实大模型调用，降级到 SimBackend 不计入）
         self._stats = {"calls": 0, "successes": 0, "failures": 0,
-                       "fallbacks": 0, "total_latency_ms": 0.0}
+                       "fallbacks": 0, "total_latency_ms": 0.0,
+                       "total_tokens": 0, "prompt_tokens": 0,
+                       "completion_tokens": 0, "reasoning_tokens": 0,
+                       "models": {}}
 
     # ---- 工具 ----
     def _resolve_model(self, tier):
@@ -175,6 +178,15 @@ class OllamaBackend(SimBackend):
             cost = 0.0
             self._stats["successes"] += 1
             self._stats["total_latency_ms"] += dt
+            # 累计真实大模型 token 消耗（仅真实调用计入；降级不计入）
+            u = usage or {}
+            self._stats["total_tokens"] += int(u.get("total_tokens", 0) or 0)
+            self._stats["prompt_tokens"] += int(u.get("prompt_tokens", 0) or 0)
+            self._stats["completion_tokens"] += int(u.get("completion_tokens", 0) or 0)
+            _rd = (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            if _rd:
+                self._stats["reasoning_tokens"] += int(_rd)
+            self._stats["models"][model] = self._stats["models"].get(model, 0) + 1
             return Signal(value=content, quality=quality, ok=ok,
                           cost=cost, latency_ms=round(dt, 1),
                           meta={"model": model, "tier": tier,

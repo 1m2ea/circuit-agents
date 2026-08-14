@@ -177,6 +177,8 @@ class SimBackend(Backend):
         "small": dict(cost=0.001, latency=200,  accuracy=0.70, yld=0.95),
         "large": dict(cost=0.020, latency=1500, accuracy=0.92, yld=0.90),
         "tool":  dict(cost=0.005, latency=800,  accuracy=0.99, yld=0.98),
+        # 推理档：更深推理（如 deepseek-reasoner），用于更难/高质诉求任务
+        "reasoner": dict(cost=0.040, latency=3000, accuracy=0.95, yld=0.88),
     }
 
     def __init__(self, rng):
