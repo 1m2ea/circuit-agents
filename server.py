@@ -443,7 +443,26 @@ def _compile_execute(goal_text, params, on_node_done=None):
         for comp in spec.get("components", {}).values():
             if comp.get("type") in ("adc", "verify"):
                 comp["threshold"] = float(qt)
-    backend = SimBackend(random.Random(int(time.time() * 1000) % (2**31)))
+    # 真实模型后端：检测到 DEEPSEEK_API_KEY 则走 DeepSeek（OpenAI 兼容接口）；
+    # 否则维持原 SimBackend 确定性模拟器（向后兼容、离线不崩）。
+    _rng_seed = int(time.time() * 1000) % (2 ** 31)
+    _llm_key = os.environ.get("DEEPSEEK_API_KEY")
+    if _llm_key:
+        from compiler.ollama_backend import OllamaBackend
+        _llm_base = os.environ.get("CA_LLM_BASE", "https://api.deepseek.com").rstrip("/")
+        _llm_model = os.environ.get("CA_LLM_MODEL", "deepseek-chat")
+        _mm = {t: _llm_model for t in ("small", "large", "tool", "code")}
+        backend = OllamaBackend(
+            rng=random.Random(_rng_seed),
+            host=_llm_base,
+            api_key=_llm_key,
+            model_map=_mm,
+            api_mode="openai",
+            timeout=180.0,
+            fallback=SimBackend(random.Random(_rng_seed)),
+        )
+    else:
+        backend = SimBackend(random.Random(_rng_seed))
     circuit = Circuit(spec, backend)
     events = []
     def _cb(cid, sig, info):

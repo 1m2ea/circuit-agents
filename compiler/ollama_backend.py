@@ -50,7 +50,7 @@ class OllamaBackend(SimBackend):
     """
 
     def __init__(self, rng=None, host=None, model_map=None, timeout=120.0,
-                 fallback=None, http_post=None, api_mode="native"):
+                 fallback=None, http_post=None, api_key=None, api_mode="native"):
         super().__init__(rng if rng is not None else random.Random(0))
         self.host = (host or os.environ.get("OLLAMA_HOST")
                      or DEFAULT_OLLAMA_HOST).rstrip("/")
@@ -59,6 +59,7 @@ class OllamaBackend(SimBackend):
         self.fallback = fallback  # None → 用自身 SimBackend 逻辑降级
         self._http_post = http_post
         self.api_mode = api_mode
+        self.api_key = api_key
         # 运行时统计
         self._stats = {"calls": 0, "successes": 0, "failures": 0,
                        "fallbacks": 0, "total_latency_ms": 0.0}
@@ -158,6 +159,8 @@ class OllamaBackend(SimBackend):
         messages = self._build_messages(comp, inputs)
         url, body = self._build_request(model, messages)
         headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         self._stats["calls"] += 1
         t0 = time.time()
