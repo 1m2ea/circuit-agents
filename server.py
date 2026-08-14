@@ -1003,6 +1003,21 @@ def select_models(req: GoalRequest):
     return ms.select(spec)
 
 
+@app.get("/models/active")
+def models_active():
+    """返回当前 /run 主路径实际使用的模型后端（供前端展示「当前模型」标识）。
+    不暴露 key 值，仅读环境变量判断。"""
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if key:
+        base = os.environ.get("CA_LLM_BASE", "https://api.deepseek.com").rstrip("/")
+        model = os.environ.get("CA_LLM_MODEL", "deepseek-chat")
+        return {"backend": "deepseek", "live": True,
+                "provider": "DeepSeek", "model": model, "base": base}
+    return {"backend": "sim", "live": False,
+            "provider": "SimBackend", "model": "deterministic-simulator",
+            "base": None}
+
+
 class TranscribeRequest(BaseModel):
     images: Optional[list] = None
     audio: Optional[list] = None

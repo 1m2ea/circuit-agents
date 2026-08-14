@@ -33,6 +33,12 @@ header {
 header h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
 header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); }
 header .stat { font-size: 12px; color: var(--muted); margin-left: auto; }
+header .model-badge { font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
+  display: inline-flex; align-items: center; }
+header .model-badge.live { color: var(--teal); border-color: var(--teal); }
+header .model-badge.pulsing { animation: badgePulse 1.2s ease-in-out infinite; }
+@keyframes badgePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* ── Layout ── */
 main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidden; }
@@ -225,6 +231,7 @@ body.simple-mode .adv { display: none !important; }
   <div class="dot" id="statusDot"></div>
   <h1>circuit-agents · Live Console</h1>
   <button id="modeToggle" class="btn btn-sm btn-ghost" onclick="toggleMode()" title="切换简易 / 完整模式">模式: 简易</button>
+  <span class="model-badge" id="modelBadge">🧠 模型：检测中…</span>
   <span class="stat" id="connStat">已连接</span>
 </header>
 
@@ -795,10 +802,41 @@ function onError(err) {
 function setConnStatus(s) {
   const dot = document.getElementById('statusDot');
   const cs = document.getElementById('connStat');
-  if (s === 'running') { dot.style.background = 'var(--blue)'; cs.textContent = '执行中'; }
-  else if (s === 'done') { dot.style.background = 'var(--teal)'; cs.textContent = '就绪'; }
-  else if (s === 'error') { dot.style.background = 'var(--red)'; cs.textContent = '错误'; }
-  else { dot.style.background = 'var(--teal)'; cs.textContent = '已连接'; }
+  const mb = document.getElementById('modelBadge');
+  if (s === 'running') { dot.style.background = 'var(--blue)'; cs.textContent = '执行中';
+    if (mb) mb.classList.add('pulsing'); }
+  else if (s === 'done') { dot.style.background = 'var(--teal)'; cs.textContent = '就绪';
+    if (mb) mb.classList.remove('pulsing'); }
+  else if (s === 'error') { dot.style.background = 'var(--red)'; cs.textContent = '错误';
+    if (mb) mb.classList.remove('pulsing'); }
+  else { dot.style.background = 'var(--teal)'; cs.textContent = '已连接';
+    if (mb) mb.classList.remove('pulsing'); }
+}
+
+function refreshModelBadge() {
+  const el = document.getElementById('modelBadge');
+  if (!el) return;
+  fetch('/models/active').then(r => r.json()).then(d => {
+    if (d.live) {
+      el.className = 'model-badge live';
+      el.dataset.live = '1';
+      el.textContent = '';
+      el.appendChild(document.createTextNode('🧠 当前模型：'));
+      const b = document.createElement('b');
+      b.textContent = d.provider + ' · ' + d.model;
+      el.appendChild(b);
+      el.title = '真实推理后端（' + d.base + '）— 你说的话正在被大模型思考';
+    } else {
+      el.className = 'model-badge sim';
+      el.dataset.live = '0';
+      el.textContent = '🧪 演示模式（模拟器）';
+      el.title = '未检测到 DEEPSEEK_API_KEY，当前为确定性模拟，不调用真实大模型';
+    }
+  }).catch(() => {
+    el.className = 'model-badge sim';
+    el.dataset.live = '0';
+    el.textContent = '🧪 模型状态未知';
+  });
 }
 
 // ────────────────────────────────────────────────────
@@ -1006,6 +1044,7 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 // ────────────────────────────────────────────────────
 refreshHistory();
 initMode();   // 应用简易/完整模式（默认简易，新手友好；功能不变）
+refreshModelBadge();   // 拉取并展示当前模型后端（DeepSeek / 模拟器）
 setInterval(refreshHistory, 10000); // auto-refresh history every 10s
 </script>
 </body>
