@@ -18,8 +18,9 @@
   ROI 升级（用户设计，2026-08-14）：心跳从「按 π 贪」升级为「按 ROI 贪」。
   投入产出比 = 投入 ÷ 产出，越小越好。开启 roi_guided 后，每拍用 _roi_scores()
   给四个动作算「预期 产出/投入」（越大越贪），默认选最高分动作；π 数字仅作探索
-  扰动（探索档内不走纯贪）以保持多样性。系统连续良态时 idle_pressure 累积到上限
-  → 心跳自我节流（idle），即「心跳自身 ROI 趋零则不贪」的纪律。server 在每次 /run
+  扰动（探索档内不走纯贪）以保持多样性。系统连续良态（真实质量无提升空间）时心跳自我
+  节流（idle），即「心跳自身 ROI 趋零则不贪」的纪律——节流由真实回灌信号驱动（#1：真实
+  tick 算力成本闸门，非固定计数；#2：评分读真实 final_quality 分布）。server 在每次 /run
   后回灌真实信号（record_task_roi），让评分器读到真实 token/质量，闭环更准。
 
 π 数字源：无界十进制 spigot 算法（Rabinowitz & Wagon, 1995），
@@ -64,8 +65,9 @@ ROI_TEMPLATES_SAT = 10.0     # 模板数饱和点（超过后 explore 边际产�
 ROI_RETRY_COST = 1.0         # 升档重试相对投入（更大模型 → 更贵）
 ROI_LIGHT_COST = 0.2         # 探索/化简相对投入（离线、零调用）
 ROI_MENTOR_COST = 0.5        # 导师训练相对投入（一步闭环，离线安全）
-ROI_IDLE_CAP = 5             # 连续良态累积到该值 → 心跳自我节流（不贪）
-ROI_THROTTLE_FLOOR = 0.05    # 仅兜底：所有动作 score 低于此也节流
+ROI_IDLE_CAP = 5             # 连续 idle 计数上限（仅观测；节流改由真实信号判定，见 _should_self_throttle）
+ROI_IDLE_HEADROOM = 0.05     # 真实提升空间阈值：mean_q≥0.95 且无失败 → 无提升空间
+ROI_TICK_COST_FLOOR = 0.05   # 真实 tick 成本底线：所有动作 ROI 低于此 → 心跳自身不划算
 ROI_EXPLORE_DIGIT_BAND = 3   # π digit 落入 0-3 → 保留探索多样性（不纯贪）
 
 
@@ -390,11 +392,13 @@ class PiHeartbeat:
 
     def record_task_roi(self, tokens=0, seconds=0.0, quality=0.0,
                         failed_nodes=None, low_quality=False, solidified=False):
-        """server 在每次 /run 后回灌真实 ROI 信号，供心跳「按 ROI 贪」。
+        """server 在每次 /run 后回灌真实 ROI 信号，供心跳「按 ROI 贪」（#2 的数据源）。
 
         tokens/seconds/quality 来自 result.llm + elapsed_ms + final_quality；
         low_quality/failed_nodes 来自质量门；solidified 来自导师固化。
-        连续良态（高质无失败）累积 idle_pressure → 触发自我节流。
+        这些真实信号写入 task_roi_history / task_quality_mean / low_quality_count /
+        failed_node_count，_roi_scores 据此算「提升空间」，_should_self_throttle 据此
+        做真实成本闸门（#1）——不再用固定计数。
         """
         with self._lock:
             s = self.state
@@ -414,36 +418,38 @@ class PiHeartbeat:
             s["failed_node_count"] = int(sum(len(e["failed_nodes"]) for e in hist))
             if solidified:
                 s["mentor_solidified"] = s.get("mentor_solidified", 0) + 1
-            # idle_pressure：连续良态压力 → 心跳自身 ROI 趋零则不贪
-            if low_quality or (failed_nodes and len(failed_nodes) > 0) or quality < 0.75:
-                s["idle_pressure"] = 0
-            elif quality >= 0.9:
-                s["idle_pressure"] = min(self.idle_cap, s.get("idle_pressure", 0) + 1)
 
     def _roi_scores(self, state):
         """给四个动作算「预期 产出 / 投入」（越大越值得贪）。
 
-        投入 = 该动作消耗的算力/时间/注意力；产出 = 它换来的质量/复用/可溯源提升。
-        ROI = 投入 ÷ 产出（越小越好）；这里用 score = 产出/投入（越大越贪）。
-        信号优先取真实回灌（task_* / low_quality_count），无信号时给离线默认，
-        保证离线也能跑出有意义、且不崩的选择。
+        投入 = 该动作消耗的算力/时间/注意力（ROI_*_COST 代理）；产出 = 它换来的
+        质量/复用/可溯源提升。**#2 升级**：产出不再用写死的 contrib 占位值，而是读
+        record_task_roi 回灌的「真实 final_quality 分布」——task_quality_mean（真实均值）
+        + low_quality_count/failed_node_count（是否有已知失败），由此推出「提升空间」
+        improvement = 1 - mean_q（有失败则满值，因不修=持续失血）。无真实信号时 mean_q=0
+        → improvement=1.0（系统状况未知，保守地保持活跃探索）。
         """
         s = state
         templates = s.get("template_count", 0)
         deltas = s.get("simplify_deltas", []) or []
         recent_delta = deltas[-1] if deltas else 0
-        lowq = s.get("low_quality_count", 0)
         mentor_avail = bool(self.mentor_store)
+        # ── 真实信号（来自每次 /run 回灌）──
+        mean_q = float(s.get("task_quality_mean", 0.0) or 0.0)
+        fail = (int(s.get("low_quality_count", 0) or 0)
+                + int(s.get("failed_node_count", 0) or 0)) > 0
+        # 提升空间：有失败=亟需修复(满值)；否则看真实质量离满分还差多少
+        improvement = 1.0 if fail else max(0.0, 1.0 - mean_q)
 
-        # explore：模板数越接近饱和，边际产出越低（奥卡姆式边际递减）
-        out_explore = max(0.0, 1.0 - templates / ROI_TEMPLATES_SAT)
-        # simplify：化简的产出是「未来省算力」，基线温和；最近化简有过正 delta → 仍有冗余可剃
-        out_simplify = 0.3 + 0.4 * (1.0 if (recent_delta and recent_delta > 0) else 0.0)
-        # retry：存在低质量失败 → 修回它是最值钱的产出（不修=失败持续失血）；
-        #   无失败则纯烧钱（产出=0）。投入被更大模型放大，故需失败在才有 ROI。
-        out_retry = min(2.5, 1.0 + lowq) if lowq > 0 else 0.0
-        # mentor：有失败案例源 + 失败在 → 高认知产出；否则跳过（产出=0）
-        out_mentor = min(2.5, 1.2 + lowq) if (mentor_avail and lowq > 0) else 0.0
+        # explore（复用性）：模板越饱和边际越低；系统越良态(无提升空间)复用价值越低
+        out_explore = max(0.0, 1.0 - templates / ROI_TEMPLATES_SAT) * (0.2 + 0.8 * improvement)
+        # simplify（未来省算力）：有冗余可剃→有值；否则只在有提升空间时温和产出
+        out_simplify = (0.3 if (recent_delta and recent_delta > 0) else 0.1 * improvement)
+        # retry（修回失败）：有失败→满值(不修=持续失血)；无失败→按提升空间小额
+        out_retry = 1.2 if fail else (0.5 * improvement)
+        # mentor（导师训练）：失败+有库→最高认知产出；否则跳过
+        out_mentor = (1.4 if (mentor_avail and fail)
+                      else (0.6 * improvement if mentor_avail else 0.0))
 
         return {
             "explore":  (out_explore,  ROI_LIGHT_COST,  out_explore / ROI_LIGHT_COST),
@@ -453,8 +459,22 @@ class PiHeartbeat:
         }
 
     def _should_self_throttle(self, state):
-        """心跳自身 ROI 趋零 → 不贪：连续良态（idle_pressure 到顶）即节流。"""
-        return state.get("idle_pressure", 0) >= self.idle_cap
+        """心跳自身 ROI 趋零 → 不贪（#1 升级：真实 tick 算力成本闸门，非固定计数）。
+
+        有失败 → 绝不节流（必须去修回，否则失败持续失血）。
+        无失败时，系统已良态才节流：真实质量已无提升空间（improvement≤ROI_IDLE_HEADROOM）
+        → 任何动作边际产出≈0，心跳这一拍的算力纯属浪费；或所有动作 ROI 都低于
+        真实 tick 成本底线 ROI_TICK_COST_FLOOR。完全基于真实回灌信号，不再用固定计数。
+        """
+        scores = self._roi_scores(state)
+        best = max((v[2] for v in scores.values()), default=0.0)
+        fail = (int(state.get("low_quality_count", 0) or 0)
+                + int(state.get("failed_node_count", 0) or 0)) > 0
+        if fail:
+            return False  # 有失败必须修回，绝不节流
+        mean_q = float(state.get("task_quality_mean", 0.0) or 0.0)
+        improvement = max(0.0, 1.0 - mean_q)
+        return (improvement <= ROI_IDLE_HEADROOM or best <= ROI_TICK_COST_FLOOR)
 
     def f_roi(self, pi_digit, state):
         """按 ROI 贪：默认选 score 最高的动作；π 数字仅作探索扰动/兜底。
@@ -504,8 +524,11 @@ class PiHeartbeat:
         # 自我节流（idle）：系统已良态，本拍不产生价值 → 不计质量逼近、只计节流
         if action_result.get("action") == "idle":
             new_state["throttle_count"] = state.get("throttle_count", 0) + 1
+            new_state["idle_pressure"] = state.get("idle_pressure", 0) + 1  # 连续 idle 计数
             new_state["n"] = state.get("n", 0) + 1
             return new_state
+        # 非 idle：重置连续 idle 计数（真实成本闸门靠 _should_self_throttle 实时判定）
+        new_state["idle_pressure"] = 0
         # 质量均值：滑动估计（仅示意"系统状态在变"，非真实模型质量）
         try:
             contrib = {"explore": 0.91, "simplify": 0.90, "retry": 0.88,
@@ -655,21 +678,21 @@ def _selftest_roi_mode():
     print(f"✓ ROI 贪选择：digit=7（非探索档）→ {ar['action']} "
           f"（跳过纯贪探索，直击失败；评分={ns['last_roi_scores']}）")
 
-    # 3) 连续良态 → idle_pressure 到顶 → 自我节流 idle（心跳自身 ROI 趋零·不贪）
+    # 3) 真实成本节流（#1）：连续良态(真实质量无提升空间)→ idle 节流；新失败(真实信号)→恢复贪
     hb2 = PiHeartbeat(tm=None, interval=0.01, roi_guided=True)
-    for _ in range(ROI_IDLE_CAP):
-        hb2.record_task_roi(tokens=300, seconds=0.5, quality=0.98)
-    assert hb2.state.get("idle_pressure", 0) >= ROI_IDLE_CAP, \
-        "连续良态应累积 idle_pressure 到上限"
+    for _ in range(5):
+        hb2.record_task_roi(tokens=300, seconds=0.5, quality=0.98)  # 真实 mean_q≈0.98 → 无提升空间
     out2 = hb2.run_once(n=6)
     idle = [o for o in out2 if o["action"] == "idle"]
-    assert idle, f"连续良态下 ROI 应自我节流(idle)，实际 {[o['action'] for o in out2]}"
-    # 新失败信号清零压力 → 恢复贪（不节流）
+    assert idle, f"连续良态(真实质量≥0.95、无失败)下 ROI 应自我节流(idle)，实际 {[o['action'] for o in out2]}"
+    # 新失败(真实信号) → 必须恢复贪：下一拍不应 idle，且连续 idle 计数清零
     hb2.record_task_roi(tokens=2000, seconds=3.0, quality=0.4,
                         failed_nodes=["r1"], low_quality=True)
-    assert hb2.state["idle_pressure"] == 0, "新失败应清零 idle_pressure，恢复贪"
-    print(f"✓ ROI 自我节流：连续良态→idle×{len(idle)}；新失败→压力清零、恢复贪"
-          f"（心跳自身 ROI 趋零则不贪·省算力）")
+    o3 = hb2.run_once(n=1)[0]
+    assert o3["action"] != "idle", f"新失败应恢复贪，实际 {o3['action']}"
+    assert hb2.state["idle_pressure"] == 0, "恢复贪后连续 idle 计数应清零"
+    print(f"✓ ROI 真实成本节流：连续良态(真实质量无提升空间)→idle×{len(idle)}；"
+          f"新失败→恢复贪(action={o3['action']})（心跳自身 ROI 趋零则不贪·省算力）")
 
 
 def _selftest_mentor_trigger():
