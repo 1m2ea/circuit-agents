@@ -346,6 +346,7 @@ body.simple-mode .adv { display: none !important; }
         </div>
         <div class="r-item" id="rStatus" style="flex-basis:100%;font-size:12px;line-height:1.5;"></div>
         <div class="r-item" id="rLlm" style="flex-basis:100%;font-size:12px;line-height:1.5;padding-top:4px;border-top:1px dashed var(--border);"></div>
+        <div class="r-item" id="rRoi" style="flex-basis:100%;font-size:12px;line-height:1.5;padding-top:4px;"></div>
       </div>
     </div>
   </div>
@@ -699,6 +700,33 @@ function onResult(result) {
     llmLine.innerHTML = '🧪 本次为模拟演示，未调用真实大模型';
     llmLine.style.color = 'var(--muted)';
     llmLine.style.opacity = '0.8';
+  }
+
+  // 「投入产出比」读数（用户确立的核心评估标尺：投入÷产出，越小越好）
+  // 投入代理 = 本次真实 token 消耗（算力成本）+ 耗时（时间投入）；产出代理 = 最终质量（可靠度/可追溯产出的代理）
+  const roiLine = document.getElementById('rRoi');
+  const _q = r.final_quality || 0;
+  const _tk = (r.llm && r.llm.tokens && r.llm.tokens.total) || 0;
+  const _secs = ((r.elapsed_ms || 0) / 1000).toFixed(1);
+  if (r.llm && r.llm.real && _tk > 0 && _q > 0) {
+    // 每 1.0 质量分消耗的 token 数（= 投入÷产出，越小越好）
+    const perQ = _tk / (_q * 100);
+    let verdict, vcolor;
+    if (perQ < 15)      { verdict = '高性价比'; vcolor = 'var(--teal)'; }
+    else if (perQ < 60) { verdict = '中等';     vcolor = 'var(--orange)'; }
+    else                { verdict = '投入偏大·待优化'; vcolor = '#e5484d'; }
+    roiLine.innerHTML = `📊 投入产出比 ≈ 每 1.0 质量分耗 <b>${perQ.toFixed(1)}</b> token`
+      + `（投入 ${_tk} token + ${_secs}s · 产出 质量 ${_q.toFixed(2)}）· <b style="color:${vcolor}">${verdict}</b>`
+      + `<br><span style="font-size:10px;opacity:.7">标尺：投入产出比 = 投入÷产出，越小越好（少投入换多产出）</span>`;
+    roiLine.style.opacity = '1';
+  } else if (r.llm && r.llm.real) {
+    roiLine.innerHTML = '📊 投入产出比：本次产出为 0（质量门未通过），比率无意义——投入未换来产出';
+    roiLine.style.color = '#e5484d';
+    roiLine.style.opacity = '1';
+  } else {
+    roiLine.innerHTML = '📊 投入产出比：模拟演示，未计量真实投入（真实运行时显示 token/质量比）';
+    roiLine.style.color = 'var(--muted)';
+    roiLine.style.opacity = '0.8';
   }
 
   document.getElementById('resultBar').style.opacity = '1';
