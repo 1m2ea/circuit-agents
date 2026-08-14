@@ -65,6 +65,8 @@ PI_HEARTBEAT = PiHeartbeat(
     interval=60.0,
     mentor_store=_mentor_store(),
     mentor_registry=MENTOR_REGISTRY,
+    # 升级：心跳可从「按 π 贪」切换为「按 ROI 贪」（env CA_PI_ROI=1 开启）
+    roi_guided=os.environ.get("CA_PI_ROI", "0") == "1",
 ) if PiHeartbeat else None
 
 # ──────────────────────────────────────────────────────────
@@ -545,6 +547,20 @@ def _run_goal(goal_text: str, params: dict, run_id: str):
             with _lock:
                 _runs[run_id]["_events"].append(info)
         result, spec, _ = _compile_execute(goal_text, params, on_node_done=on_done)
+        # ROI 回灌：把本次 /run 的真实「投入产出」信号喂给心跳，使其「按 ROI 贪」
+        if PI_HEARTBEAT is not None:
+            try:
+                _llm = result.get("llm") or {}
+                _tk = (_llm.get("tokens") or {}).get("total", 0) or 0
+                _secs = (result.get("elapsed_ms") or 0) / 1000.0
+                _q = result.get("final_quality") or 0.0
+                _failed = result.get("failed_nodes") or []
+                _low = (isinstance(_q, (int, float)) and _q > 0 and _q < 0.75) or bool(_failed)
+                PI_HEARTBEAT.record_task_roi(
+                    tokens=_tk, seconds=_secs, quality=_q,
+                    failed_nodes=_failed, low_quality=_low)
+            except Exception:
+                pass  # 回灌失败绝不影响主流程
         with _lock:
             _runs[run_id]["status"] = "done"
             _runs[run_id]["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -2793,26 +2809,40 @@ if PI_HEARTBEAT is not None:
             "n": PI_HEARTBEAT.state["n"],
             "running": PI_HEARTBEAT.is_running(),
             "interval": PI_HEARTBEAT.interval,
+            "roi_guided": PI_HEARTBEAT.roi_guided,
+            "idle_pressure": PI_HEARTBEAT.state.get("idle_pressure", 0),
+            "throttle_count": PI_HEARTBEAT.state.get("throttle_count", 0),
             "spigot_next_digits": PI_HEARTBEAT.spigot.first_digits(6),
+            "last_roi_scores": PI_HEARTBEAT.state.get("last_roi_scores"),
+            "last_roi_choice": PI_HEARTBEAT.state.get("last_roi_choice"),
             "state": PI_HEARTBEAT._public_state(),
+            "abacus": "ROI = 投入 ÷ 产出（越小越好）；roi_guided 时每拍选最高 产出/投入 的动作",
             "last": PI_HEARTBEAT.state.get("last"),
         }
 
     @app.post("/pi/heartbeat/start")
-    def pi_heartbeat_start(interval: float = Query(60.0, ge=1.0, le=3600)):
-        ok = PI_HEARTBEAT.start(interval=interval)
+    def pi_heartbeat_start(interval: float = Query(60.0, ge=1.0, le=3600),
+                           roi: int = Query(0, description="1=按ROI贪 0=按π贪")):
+        ok = PI_HEARTBEAT.start(interval=interval, roi=bool(roi))
         return {"started": ok, "running": PI_HEARTBEAT.is_running(),
-                "interval": PI_HEARTBEAT.interval}
+                "interval": PI_HEARTBEAT.interval, "roi_guided": PI_HEARTBEAT.roi_guided}
 
     @app.post("/pi/heartbeat/stop")
     def pi_heartbeat_stop():
         PI_HEARTBEAT.stop()
         return {"running": PI_HEARTBEAT.is_running()}
 
+    @app.post("/pi/heartbeat/roi")
+    def pi_heartbeat_set_roi(enabled: int = Query(1, description="1=按ROI贪 0=按π贪")):
+        """运行时切换 ROI 导向（不影响正在跑的永动循环，下一拍生效）。"""
+        on = PI_HEARTBEAT.set_roi_guided(bool(enabled))
+        return {"roi_guided": on}
+
     @app.post("/pi/heartbeat/tick")
-    def pi_heartbeat_tick(n: int = Query(1, ge=1, le=50)):
-        """手动推进 n 拍（演示/调试用）。"""
-        return {"ticks": PI_HEARTBEAT.run_once(n=n)}
+    def pi_heartbeat_tick(n: int = Query(1, ge=1, le=50),
+                          mode: str = Query(None, description="pi | roi | None(取当前)")):
+        """手动推进 n 拍（演示/调试用）。mode 可强制 pi/roi。"""
+        return {"ticks": PI_HEARTBEAT.run_once(n=n, mode=mode)}
 
 
 # ──────────────────────────────────────────────────────────
@@ -3172,7 +3202,7 @@ def selftest():
     assert "再平衡" in _r15["reason"]["reason"], "reason 应标注再平衡"
     # 端点层面：/models 列表 + /models/select 编译目标并选档
     _md = list_models()
-    assert set(_md["tiers"].keys()) == {"small", "large", "tool"}, "/models 应列三档"
+    assert set(_md["tiers"].keys()) == {"small", "large", "tool", "reasoner"}, "/models 应列四档（含 reasoner 推理档）"
     assert "weights" in _md and set(_md["weights"].keys()) == {"quality", "latency", "cost"}, \
         "/models 应返回再平衡权重"
     _sel = select_models(GoalRequest(goal="分析GDP并预测趋势"))
@@ -4427,7 +4457,8 @@ if __name__ == "__main__":
     else:
         load_rooms()   # 深化③：启动即恢复落盘房间（重启不丢房间/记忆）
         if PI_HEARTBEAT is not None:
-            PI_HEARTBEAT.start(interval=60.0)  # 永动心跳：开机即启动
+            PI_HEARTBEAT.start(interval=60.0,
+                               roi=os.environ.get("CA_PI_ROI", "0") == "1")  # 永动心跳：开机即启动（ROI 模式由 env 决定）
         print(f"circuit-agents API Server → http://{args.host}:{args.port}")
         print("端点: POST /run | GET /run/{id} | GET /run/{id}/stream | GET /health")
         print("π 永动心跳: GET /pi/heartbeat | POST /pi/heartbeat/start|stop|tick")
