@@ -247,9 +247,39 @@ class _RealtimeHub:
 _realtime_hub = _RealtimeHub()
 
 
+def _json_default(o):
+    """json.dumps 兜底：把非标准 JSON 类型转成可序列化结构。
+    关键修复：节点事件 value 字段常含 runtime.Signal（dataclass）/ numpy 标量 /
+    set，直接 json.dumps 会抛 TypeError 导致 SSE 生成器在首个含此类字段的事件处崩溃、
+    流提前关闭（Live Console 看不到后续事件与最终结果）。"""
+    import dataclasses
+    if dataclasses.is_dataclass(o) and not isinstance(o, type):
+        return dataclasses.asdict(o)
+    if hasattr(o, "model_dump"):           # pydantic v2
+        try:
+            return o.model_dump()
+        except Exception:
+            pass
+    if hasattr(o, "__dict__"):
+        return {k: v for k, v in vars(o).items() if not k.startswith("_")}
+    try:
+        import numpy as np
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+    if isinstance(o, (set, frozenset)):
+        return list(o)
+    return str(o)
+
+
 def _sse(data: dict) -> str:
-    """把事件 dict 序列化为 SSE `data:` 帧（UTF-8 安全）。"""
-    return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+    """把事件 dict 序列化为 SSE `data:` 帧（UTF-8 安全，非标准类型自动兜底）。"""
+    return "data: " + json.dumps(data, default=_json_default, ensure_ascii=False) + "\n\n"
 
 # ── 深化③：房间持久化（重启不丢房间/记忆） ──────────────────
 class RoomStore:
@@ -1509,16 +1539,16 @@ async def stream_run(run_id: str, request: Request):
             # 推送新事件
             while idx < len(events):
                 ev = events[idx]
-                yield f"data: {json.dumps({'type': 'node_done', 'event': ev})}\n\n"
+                yield _sse({"type": "node_done", "event": ev})
                 idx += 1
 
             # 完成态：推送结果
             if status in ("done", "error") and result is not None:
-                yield f"data: {json.dumps({'type': 'result', 'result': result})}\n\n"
+                yield _sse({"type": "result", "result": result})
                 return
 
             if status == "error" and error:
-                yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
+                yield _sse({"type": "error", "error": error})
                 return
 
             # 等待
