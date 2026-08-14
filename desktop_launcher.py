@@ -5,7 +5,7 @@ circuit-agents 桌面壳 (PyWebView)
 =================================
 把「FastAPI 后端 + 拓扑编辑器网页」打包成一个原生桌面程序：
   · 程序内启动 server.py (uvicorn, 127.0.0.1:8765)
-  · 等端口就绪后，用系统 WebView2 原生窗口加载 /topology/editor
+  · 等端口就绪后，用系统 WebView2 原生窗口加载最简的 Live Console（/，输入任务即可用）
   · 关闭窗口即停后端，单实例、零浏览器标签、无黑框控制台
 
 用法：
@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CA_PORT", "8765"))
 BASE = f"http://{HOST}:{PORT}"
-EDITOR_URL = f"{BASE}/topology/editor"
+EDITOR_URL = f"{BASE}/"  # 默认开最简 Live Console（新手友好；高级用户在页面内切「完整」模式或访问 /topology/editor）
 
 _uv = None  # uvicorn.Server 实例
 
@@ -143,7 +143,7 @@ def _selftest() -> int:
 def _open_window():
     import webview
     webview.create_window(
-        "Circuit Agents · 电路拓扑工作台",
+        "Circuit Agents · 智能任务台",
         EDITOR_URL,
         width=1440,
         height=900,

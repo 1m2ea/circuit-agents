@@ -185,6 +185,9 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* 简易/完整模式：简易模式隐藏高级控件（.adv） */
+body.simple-mode .adv { display: none !important; }
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -221,6 +224,7 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
 <header>
   <div class="dot" id="statusDot"></div>
   <h1>circuit-agents · Live Console</h1>
+  <button id="modeToggle" class="btn btn-sm btn-ghost" onclick="toggleMode()" title="切换简易 / 完整模式">模式: 简易</button>
   <span class="stat" id="connStat">已连接</span>
 </header>
 
@@ -228,16 +232,16 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
   <!-- ── Left Panel ── -->
   <div class="left">
     <div class="left-section">
-      <h2>✦ 新任务</h2>
-      <textarea id="goalInput" placeholder="输入自然语言任务描述...
-例: 查中国2025年GDP总量和人均GDP，然后对比分析"></textarea>
-      <div class="opt-row">
+      <h2>✦ 想让我帮你做什么？</h2>
+      <textarea id="goalInput" placeholder="用大白话告诉我你想做什么，例如：
+把这份销售表按地区汇总，算出每个地区的环比增长，挑出下滑最多的三个"></textarea>
+      <div class="opt-row adv">
         <label class="opt-label" for="qThreshold">质量门阈值</label>
         <input id="qThreshold" class="opt-input" type="number" min="0" max="1" step="0.05" value="0.8"
                title="ADC/verify 节点的达标阈值，默认 0.8。越低越易通过。" />
         <span class="opt-hint">0~1，越低越易通过</span>
       </div>
-      <div class="opt-row">
+      <div class="opt-row adv">
         <label class="opt-label" for="attInput">附件路径</label>
         <input id="attInput" class="opt-input" type="text" style="flex:1;min-width:0;"
                placeholder="图片/语音路径，逗号分隔（如 a.png,b.wav）" />
@@ -245,14 +249,14 @@ main { flex: 1; display: grid; grid-template-columns: 380px 1fr; overflow: hidde
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="btnRun" onclick="submitGoal()">
-          <span id="btnRunLabel">运行</span>
+          <span id="btnRunLabel">开始</span>
         </button>
         <button class="btn btn-ghost" onclick="clearAll()">清空</button>
       </div>
     </div>
 
     <!-- ⑥ 多任务并行 -->
-    <div class="left-section">
+    <div class="left-section adv">
       <h2>⚡ 批量执行 <span class="opt-hint">⑥ 多任务并行</span></h2>
       <textarea id="batchInput" placeholder="每行一个任务，并发执行并统一汇聚：
 分析第一季度销售额
@@ -673,7 +677,7 @@ function onResult(result) {
   document.getElementById('resultBar').style.opacity = '1';
 
   document.getElementById('btnRun').disabled = false;
-  document.getElementById('btnRunLabel').textContent = '运行';
+  document.getElementById('btnRunLabel').textContent = '开始';
   setConnStatus('done');
   refreshHistory();
 }
@@ -756,6 +760,25 @@ function copyOutput() {
   } catch (e) { /* clipboard 不可用时静默 */ }
 }
 
+// ────────────────────────────────────────────────────
+// 简易 / 完整 模式切换（新手友好：默认简易，隐藏高级旋钮；功能不受影响）
+// ────────────────────────────────────────────────────
+function applyMode(simple) {
+  if (simple) document.body.classList.add('simple-mode');
+  else document.body.classList.remove('simple-mode');
+  const btn = document.getElementById('modeToggle');
+  if (btn) btn.textContent = '模式: ' + (simple ? '简易' : '完整');
+  try { localStorage.setItem('ca_console_mode', simple ? 'simple' : 'full'); } catch (e) {}
+}
+function toggleMode() {
+  applyMode(!document.body.classList.contains('simple-mode'));
+}
+function initMode() {
+  let m = 'simple';  // 默认简易，零门槛
+  try { m = localStorage.getItem('ca_console_mode') || 'simple'; } catch (e) {}
+  applyMode(m === 'simple');
+}
+
 function onError(err) {
   const tl = document.getElementById('timeline');
   if (tl.querySelector('.empty-state')) tl.innerHTML = '';
@@ -819,7 +842,7 @@ function clearAll() {
   document.getElementById('outputBody').innerHTML =
     '<div class="empty-state"><div class="icon" style="font-size:32px;">📭</div><div style="font-size:13px;">节点产出将在此显示</div></div>';
   document.getElementById('btnRun').disabled = false;
-  document.getElementById('btnRunLabel').textContent = '运行';
+  document.getElementById('btnRunLabel').textContent = '开始';
   setConnStatus('ok');
 }
 
@@ -982,6 +1005,7 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 // Init
 // ────────────────────────────────────────────────────
 refreshHistory();
+initMode();   // 应用简易/完整模式（默认简易，新手友好；功能不变）
 setInterval(refreshHistory, 10000); // auto-refresh history every 10s
 </script>
 </body>
