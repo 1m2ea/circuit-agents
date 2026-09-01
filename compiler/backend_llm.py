@@ -185,13 +185,15 @@ class RealLLMBackend(SimBackend):
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _post_with_retry(self, url, headers, body):
+    def _post_with_retry(self, url, headers, body, on_throttle=None, on_success=None):
         """带 429/5xx 退避重试的 POST —— 对治"瞬时并发打满 RPM 被锁接口冷却"。
 
         实现委托 compiler.http_retry.post_with_retry —— 与 OllamaBackend 共用同一份
         退避语义，避免两个并列的后端各自实现、逐渐分叉成两套限流行为。
+        on_throttle / on_success 透传，供自适应限流实时读真后端反馈。
         """
-        return post_with_retry(self._post, url, headers, body)
+        return post_with_retry(self._post, url, headers, body,
+                               on_throttle=on_throttle, on_success=on_success)
 
     # ---- 主入口 ----
     def run(self, comp, inputs):
@@ -226,7 +228,11 @@ class RealLLMBackend(SimBackend):
         t0 = time.time()
         RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
         try:
-            resp = self._post_with_retry(url, headers, body)
+            resp = self._post_with_retry(
+                url, headers, body,
+                on_throttle=RATE_LIMITER.report_throttle,
+                on_success=RATE_LIMITER.report_success,
+            )
             dt = (time.time() - t0) * 1000.0
             choice = (resp.get("choices") or [{}])[0]
             content = (choice.get("message") or {}).get("content", "") or ""

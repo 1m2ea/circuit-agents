@@ -114,9 +114,13 @@ class OllamaBackend(SimBackend):
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _post_with_retry(self, url, headers, body):
-        """带 429/5xx 退避重试的 POST（与 RealLLMBackend 共用 http_retry 的同一份实现）。"""
-        return post_with_retry(self._post, url, headers, body)
+    def _post_with_retry(self, url, headers, body, on_throttle=None, on_success=None):
+        """带 429/5xx 退避重试的 POST（与 RealLLMBackend 共用 http_retry 的同一份实现）。
+
+        on_throttle / on_success 透传，供自适应限流实时读真后端反馈。
+        """
+        return post_with_retry(self._post, url, headers, body,
+                               on_throttle=on_throttle, on_success=on_success)
 
     def _build_request(self, model, messages):
         """根据 api_mode 构建请求 URL + body。"""
@@ -174,7 +178,11 @@ class OllamaBackend(SimBackend):
         t0 = time.time()
         RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
         try:
-            resp = self._post_with_retry(url, headers, body)
+            resp = self._post_with_retry(
+                url, headers, body,
+                on_throttle=RATE_LIMITER.report_throttle,
+                on_success=RATE_LIMITER.report_success,
+            )
             dt = (time.time() - t0) * 1000.0
             content, finish, usage = self._parse_response(resp)
             ok = bool(content) and finish != "error"

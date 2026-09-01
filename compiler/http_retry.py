@@ -21,13 +21,16 @@ from runtime import retry_wait, RL_MAX_RETRIES
 
 
 def post_with_retry(post_fn, url, headers, body,
-                    max_retries=None, sleep_fn=None):
+                    max_retries=None, sleep_fn=None,
+                    on_throttle=None, on_success=None):
     """带 429/5xx 退避重试的 POST 包装。
 
     · 429（限流）与 5xx（服务端抖动）才重试；其他 4xx 属请求本身有问题，重试无益。
     · 优先尊重服务端 Retry-After（封顶，防超大值拖死）；缺失或非法则指数退避。
     · URLError（网络层：掉线 / DNS / 拒绝连接）快速失败不重试 —— 把断网当限流
       去空等是纯粹浪费，应尽快开路让上层质量门 / 反馈环接管。
+    · 反馈回调（自适应限流用）：每次 429/5xx 调 on_throttle(retry_after)；成功时计时调
+      on_success(latency_ms)。回调可选，不传则纯退避（向后兼容）。
 
     post_fn : (url, headers, body) -> dict，由调用方注入（兼容测试用 _http_post 注入）。
     sleep_fn: 可注入的睡眠函数，默认 time.sleep（自检注入以断言退避时长、不真等待）。
@@ -37,14 +40,21 @@ def post_with_retry(post_fn, url, headers, body,
     last = None
     for attempt in range(tries + 1):
         try:
-            return post_fn(url, headers, body)
+            t0 = time.time()
+            out = post_fn(url, headers, body)
+            if on_success is not None:
+                on_success((time.time() - t0) * 1000.0)
+            return out
         except urllib.error.HTTPError as e:
             last = e
             if e.code != 429 and e.code < 500:
                 raise
             if attempt >= tries:
                 raise
-            _sleep(retry_wait(attempt, (e.headers or {}).get("Retry-After")))
+            ra = (e.headers or {}).get("Retry-After")
+            if on_throttle is not None:
+                on_throttle(ra)
+            _sleep(retry_wait(attempt, ra))
         except urllib.error.URLError:
             # HTTPError 是 URLError 的子类，已在上一分支处理，此处仅剩真网络错误
             raise
@@ -120,6 +130,27 @@ def http_retry_selftest():
     assert calls["n"] == RL_MAX_RETRIES + 1, \
         f"应共调用 1+{RL_MAX_RETRIES}={RL_MAX_RETRIES + 1} 次，实际 {calls['n']}"
     print(f"✓ 退避重试：重试 {RL_MAX_RETRIES} 次耗尽后抛出（共 {calls['n']} 次调用）")
+
+    # ⑤ 回调：每次 429 触发 on_throttle(retry_after)；成功触发 on_success(latency_ms)
+    thr: list = []
+    succ: list = []
+    calls["n"] = 0
+    slept.clear()
+
+    def post_cb(url, headers, body):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _http_error(429, {"Retry-After": "0"})
+        return {"ok": True}
+
+    out = post_with_retry(post_cb, "http://x", {}, {},
+                          on_throttle=lambda ra: thr.append(ra),
+                          on_success=lambda ms: succ.append(ms),
+                          sleep_fn=slept.append)
+    assert out == {"ok": True}, "回调版也应返回成功"
+    assert thr == ["0", "0"], f"on_throttle 应收到 2 次 Retry-After='0'，实际 {thr}"
+    assert len(succ) == 1 and succ[0] >= 0.0, f"on_success 应收到 1 次延迟(ms)，实际 {succ}"
+    print("✓ 退避重试：on_throttle/on_success 回调在 429 与成功时正确触发")
 
 
 if __name__ == "__main__":

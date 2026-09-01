@@ -52,6 +52,15 @@ RL_BACKOFF_BASE = 0.5               # 429 退避基数（秒）
 RL_BACKOFF_CAP = 8.0                # 单次退避上限（秒），防 Retry-After 超大值拖死
 RL_MAX_RETRIES = 3                  # 429/5xx 最大重试次数（超出则开路失败）
 
+# 自适应拥塞控制（AIMD）：检测真后端反馈（429/Retry-After/延迟）实时调并发，
+# 保证不撞限制又做到限制下最大并行。CA_ADAPTIVE=0 则退回纯静态闸门。
+CA_ADAPTIVE_DEFAULT = 1             # 1=开自适应；0=纯静态（用 CA_MAX_CONCURRENCY/CA_RPM 原样）
+CA_ADAPTIVE_CEIL_DEFAULT = 16       # AIMD 硬上限（并发永不超此值，防失控）
+RL_SUCCESS_WINDOW = 3               # 连续成功多少次才加性 +1 上探
+RL_LATENCY_THRESH = 1.5             # 单次延迟 > 基线×此值 → 领先指标，温和 −1
+RL_THROTTLE_COOLDOWN = 2.0          # 无 Retry-After 时的串行冷却窗口（秒）
+RL_EMA_ALPHA = 0.3                  # 延迟基线 EMA 系数
+
 
 class RateLimiter:
     """全局双闸门限流器：并发闸门(Semaphore) + RPM 令牌桶(滑窗)。线程安全。
@@ -67,6 +76,16 @@ class RateLimiter:
             "CA_MAX_CONCURRENCY", max_concurrency, CA_MAX_CONCURRENCY_DEFAULT)
         self.rpm = self._env_int("CA_RPM", rpm, CA_RPM_DEFAULT)
         self.window = float(window if window is not None else RL_WINDOW_DEFAULT)
+        # 自适应 AIMD 状态
+        self.adaptive = self._env_bool("CA_ADAPTIVE", CA_ADAPTIVE_DEFAULT)
+        self.ceil = max(self._env_int("CA_ADAPTIVE_CEIL", None,
+                                      CA_ADAPTIVE_CEIL_DEFAULT), self.max_concurrency)
+        self._latency_base = 0.0       # 延迟基线（EMA），领先指标参照
+        self._success_streak = 0       # 连续成功计数（攒够窗口才上探）
+        self._last_throttle_ts = 0.0   # 上次撞限时刻（冷却窗内只收一次，防 3 连重试收成 /8）
+        self._serial_until = 0.0       # 串行冷却截止时刻（真 429 期间强制 1 路）
+        self._rpm_clamp = 0            # 撞限后临时 RPM 钳制（0=不钳）；自愈成功后清 0
+        self._throttle_count = 0       # 累计撞限次数（统计/可观测）
         self._sem = threading.Semaphore(max(1, self.max_concurrency))
         self._slots = deque()          # RPM 滑窗：[时间戳...]，只记请求时刻不记在飞数
         self._inflight = 0             # 真实在飞数（与 _slots 语义不同，勿混用）
@@ -79,6 +98,13 @@ class RateLimiter:
             return int(explicit)
         raw = os.environ.get(name)
         return int(raw) if raw else int(default)
+
+    @staticmethod
+    def _env_bool(name, default):
+        raw = os.environ.get(name)
+        if raw is None:
+            return bool(default)
+        return raw.strip().lower() in ("1", "true", "yes", "on")
 
     # ---- 运行时热调整（不重启、不惊扰在飞请求）----
     def configure(self, max_concurrency=None, rpm=None):
@@ -105,18 +131,26 @@ class RateLimiter:
         with self._lock:
             return {"max_concurrency": self.max_concurrency, "rpm": self.rpm,
                     "window": self.window, "inflight": self._inflight,
+                    "adaptive": self.adaptive, "ceil": self.ceil,
+                    "latency_base": round(self._latency_base, 1),
+                    "success_streak": self._success_streak,
+                    "throttle_count": self._throttle_count,
+                    "serial_until": self._serial_until,
+                    "rpm_clamp": self._rpm_clamp,
                     "stats": dict(self.stats)}
 
     # ---- RPM 令牌桶：滑窗内限流（sleep 一律在锁外，守非重入锁纪律）----
     def _wait_rpm_slot(self):
-        if self.rpm <= 0:
+        # 撞限后可能临时钳制 RPM（_rpm_clamp），自愈成功后清 0
+        eff_rpm = self._rpm_clamp if self._rpm_clamp > 0 else self.rpm
+        if eff_rpm <= 0:
             return
         while True:
             with self._lock:
                 now = time.time()
                 while self._slots and (now - self._slots[0]) >= self.window:
                     self._slots.popleft()
-                if len(self._slots) < self.rpm:
+                if len(self._slots) < eff_rpm:
                     self._slots.append(now)
                     return
                 wait = self.window - (now - self._slots[0]) + 0.01
@@ -143,6 +177,79 @@ class RateLimiter:
             if self._inflight > 0:
                 self._inflight -= 1
         self._sem.release()
+
+    # ---- 自适应拥塞控制（AIMD）：检测真后端反馈 → 实时调并发 ----
+    def report_throttle(self, retry_after=None):
+        """撞限信号（429 带/不带 Retry-After、5xx）。立即收并发 + 进冷却串行。
+
+        · 真 429（带 retry_after）→ 直接降到 1 路，串行直到 Retry-After 过期。
+        · 软撞限（无 retry_after）→ 乘性减半（×0.5）。
+        · 冷却窗内只收一次：避免 429 重试 3 次连收成 /8。
+        · 同时把 RPM 令牌桶临时钳到实测速率×0.8（双保险，自愈成功后清 0）。
+        锁纪律：在锁内只算 new_eff，configure() 在锁外调（其内部会再取 _lock）。
+        """
+        if not self.adaptive:
+            return
+        now = time.time()
+        with self._lock:
+            if now - self._last_throttle_ts < RL_THROTTLE_COOLDOWN:
+                return
+            self._last_throttle_ts = now
+            self._throttle_count += 1
+            self._success_streak = 0
+            ra = None
+            if retry_after is not None:
+                try:
+                    ra = float(retry_after)
+                except (TypeError, ValueError):
+                    ra = None
+            if ra is not None and ra > 0:
+                new_eff = 1
+                self._serial_until = now + ra
+            else:
+                new_eff = max(1, self.max_concurrency // 2)
+                self._serial_until = now + RL_THROTTLE_COOLDOWN
+            # 临时 RPM 钳制：当前滑窗内请求数 ×0.8（仅在 rpm 不限频时启用）
+            if self.rpm <= 0 and self._rpm_clamp <= 0:
+                self._rpm_clamp = max(1, int(len(self._slots) * 0.8))
+        self.configure(max_concurrency=new_eff)
+
+    def report_success(self, latency_ms=None):
+        """成功信号：更新延迟基线；攒够成功窗口则加性 +1 上探到硬上限 ceil；
+        延迟领先（>基线×阈值）则温和 −1 提前退避（预测式防撞限）。
+        真 429 串行冷却窗内不急着上探；自愈稳定后解除临时 RPM 钳制。
+        """
+        if not self.adaptive:
+            return
+        now = time.time()
+        with self._lock:
+            # 真 429 串行冷却窗内：先消化，不往上探
+            if now < self._serial_until:
+                if latency_ms is not None and self._latency_base > 0:
+                    self._latency_base = (self._latency_base
+                                          + RL_EMA_ALPHA * (latency_ms - self._latency_base))
+                return
+            if self._rpm_clamp > 0:
+                self._rpm_clamp = 0          # 自愈：稳定成功 → 解除 RPM 钳制
+            if latency_ms is not None:
+                if self._latency_base <= 0:
+                    self._latency_base = float(latency_ms)
+                else:
+                    self._latency_base = (self._latency_base
+                                          + RL_EMA_ALPHA * (latency_ms - self._latency_base))
+            new_eff = None
+            if (latency_ms is not None and self._latency_base > 0
+                    and latency_ms > self._latency_base * RL_LATENCY_THRESH):
+                # 领先指标：还没撞限但快了，提前温和退一步
+                self._success_streak = 0
+                new_eff = max(1, self.max_concurrency - 1)
+            else:
+                self._success_streak += 1
+                if self._success_streak >= RL_SUCCESS_WINDOW:
+                    self._success_streak = 0
+                    new_eff = min(self.ceil, self.max_concurrency + 1)
+        if new_eff is not None:
+            self.configure(max_concurrency=new_eff)
 
 
 # 进程内全局单例：runtime 层内并行 与 backend 真实 HTTP 共用同一道闸门
@@ -5245,6 +5352,64 @@ def rate_limit_selftest():
     print("✓ 限流·热调整：configure(max_concurrency=1) 即时生效")
 
 
+def rate_limit_adaptive_selftest():
+    """自适应拥塞控制（AIMD）离线自检：检测→实时调，保证不撞限又探到上限。
+
+    覆盖四件事：① 真 429→降到 1 路并串行冷却 ② 软撞限→乘性减半
+    ③ 持续成功→加性 +1 上探到硬上限 ④ 延迟领先→提前温和 −1 ⑤ 关自适应则 report 空操作。
+    """
+    # ① 真 429（带 Retry-After）→ 直接 1 路 + 串行冷却
+    rl = RateLimiter(max_concurrency=8, rpm=0)
+    rl.adaptive = True
+    rl.ceil = 16
+    rl._last_throttle_ts = -1e9
+    rl.report_throttle(retry_after=1.0)
+    assert rl.max_concurrency == 1, f"真 429 应降到 1 路，实际 {rl.max_concurrency}"
+    assert rl._serial_until > 0, "应进入串行冷却窗口"
+    print("✓ 自适应·撞限：真 429 带 Retry-After → 并发降到 1 路并串行冷却")
+
+    # ② 软撞限（无 Retry-After）→ 乘性减半
+    rl2 = RateLimiter(max_concurrency=8, rpm=0)
+    rl2.adaptive = True
+    rl2.ceil = 16
+    rl2._last_throttle_ts = -1e9
+    rl2.report_throttle()
+    assert rl2.max_concurrency == 4, f"软撞限应减半到 4，实际 {rl2.max_concurrency}"
+    print("✓ 自适应·撞限：软撞限（无 Retry-After）→ 并发乘性减半到 4")
+
+    # ③ 持续成功 → 加性 +1 一路上探到硬上限 ceil
+    rl3 = RateLimiter(max_concurrency=1, rpm=0)
+    rl3.adaptive = True
+    rl3.ceil = 4
+    rl3._serial_until = 0.0
+    rl3._latency_base = 0.0
+    for _ in range(RL_SUCCESS_WINDOW * 3):   # 9 次成功 → 1→2→3→4（夹在 ceil=4）
+        rl3._last_throttle_ts = -1e9
+        rl3.report_success(100.0)
+    assert rl3.max_concurrency == 4, f"应上探到 ceil=4，实际 {rl3.max_concurrency}"
+    print("✓ 自适应·上探：连续成功 → 并发加性 +1 涨到硬上限 4")
+
+    # ④ 延迟领先 → 提前温和退避（不撞限也收一步）
+    rl4 = RateLimiter(max_concurrency=4, rpm=0)
+    rl4.adaptive = True
+    rl4.ceil = 16
+    rl4._serial_until = 0.0
+    rl4._latency_base = 100.0     # 已建立基线 100ms
+    rl4._last_throttle_ts = -1e9
+    rl4.report_success(300.0)     # 300 > 100×1.5
+    assert rl4.max_concurrency == 3, f"延迟领先应 −1 到 3，实际 {rl4.max_concurrency}"
+    print("✓ 自适应·领先指标：延迟 300ms > 基线 100ms×1.5 → 提前降到 3 路")
+
+    # ⑤ 关自适应 → report 全是空操作（纯静态闸门）
+    rl5 = RateLimiter(max_concurrency=4, rpm=0)
+    rl5.adaptive = False
+    rl5._last_throttle_ts = -1e9
+    rl5.report_throttle(retry_after=1.0)
+    rl5.report_success(100.0)
+    assert rl5.max_concurrency == 4, "关自适应后并发不应被 AIMD 改动"
+    print("✓ 自适应·开关：CA_ADAPTIVE=0 时 report 为空操作（纯静态）")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -5268,6 +5433,7 @@ if __name__ == "__main__":
     topology_crdt_selftest()
     collaboration_selftest()
     rate_limit_selftest()
+    rate_limit_adaptive_selftest()
 
 
 def load(path):
