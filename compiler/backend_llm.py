@@ -27,7 +27,8 @@ import urllib.request
 import urllib.error
 import random
 
-from runtime import Signal, SimBackend, Backend
+from runtime import Signal, SimBackend, Backend, RATE_LIMITER
+from compiler.http_retry import post_with_retry
 
 
 # tier → 真实模型（OpenAI-compatible；可自行覆盖，也覆盖自托管 endpoint 的模型名）
@@ -184,6 +185,14 @@ class RealLLMBackend(SimBackend):
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _post_with_retry(self, url, headers, body):
+        """带 429/5xx 退避重试的 POST —— 对治"瞬时并发打满 RPM 被锁接口冷却"。
+
+        实现委托 compiler.http_retry.post_with_retry —— 与 OllamaBackend 共用同一份
+        退避语义，避免两个并列的后端各自实现、逐渐分叉成两套限流行为。
+        """
+        return post_with_retry(self._post, url, headers, body)
+
     # ---- 主入口 ----
     def run(self, comp, inputs):
         if comp.get("type") != "resistor":
@@ -215,8 +224,9 @@ class RealLLMBackend(SimBackend):
                                 "request": body, "messages": messages})
 
         t0 = time.time()
+        RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
         try:
-            resp = self._post(url, headers, body)
+            resp = self._post_with_retry(url, headers, body)
             dt = (time.time() - t0) * 1000.0
             choice = (resp.get("choices") or [{}])[0]
             content = (choice.get("message") or {}).get("content", "") or ""
@@ -235,6 +245,8 @@ class RealLLMBackend(SimBackend):
             return Signal(value=None, quality=0.0, ok=False,
                           cost=0.0, latency_ms=round(dt, 1),
                           meta={"open": "http_error", "error": str(e)})
+        finally:
+            RATE_LIMITER.release()   # 成败都放行许可，绝不泄漏闸门
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +254,8 @@ class RealLLMBackend(SimBackend):
 # ---------------------------------------------------------------------------
 def selftest():
     import runtime as rt
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
     sim = rt.SimBackend(random.Random(7))
     real = RealLLMBackend(rng=random.Random(7))
 
@@ -330,6 +344,38 @@ def selftest():
     assert s4.ok is False and s4.meta.get("open") == "no_input"
     assert calls["n"] == 0, "上游全死时不应发起真调用"
     print("✓ 开路语义: 上游全死 → 直接开路，未发起真 LLM 调用")
+
+    # 6) 并发闸门（端到端）：多线程真调，瞬时并发峰值不得超过全局上限。
+    #    这是"层内并行 × 批量并行"放大瞬时请求数、进而打满 RPM 的核心防线，
+    #    必须端到端验证（只验单元闸门不足以证明真调路径确实守住了）。
+    prev_cap = rt.RATE_LIMITER.max_concurrency
+    rt.RATE_LIMITER.configure(max_concurrency=2)     # 收紧到 2 便于观察峰值
+    live = {"n": 0, "peak": 0}
+    glock = threading.Lock()
+
+    def slow_post(url, headers, body):
+        with glock:
+            live["n"] += 1
+            live["peak"] = max(live["peak"], live["n"])
+        try:
+            time.sleep(0.05)
+            return fake_resp
+        finally:
+            with glock:
+                live["n"] -= 1
+
+    llm3 = RealLLMBackend(rng=random.Random(0), http_post=slow_post)
+    comp3 = {"type": "resistor", "label": "x", "model": "small"}
+    good = [rt.Signal(value="ctx", quality=1.0, ok=True)]
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            res3 = list(ex.map(lambda _i: llm3.run(comp3, good), range(8)))
+    finally:
+        rt.RATE_LIMITER.configure(max_concurrency=prev_cap)   # 还原，不污染后续自检
+    assert all(r.ok for r in res3), "并发闸门下所有请求都应成功返回"
+    assert live["peak"] <= 2, f"并发闸门失效：瞬时峰值 {live['peak']} > 上限 2"
+    print(f"✓ 并发闸门(端到端): 8 线程真调 / 上限 2 → 瞬时峰值 {live['peak']}"
+          f"（RPM 打满防线生效）")
 
     print("\n全部离线自检通过 ✓（无需 API key）")
 

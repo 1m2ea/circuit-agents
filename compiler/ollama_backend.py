@@ -21,7 +21,8 @@ import urllib.request
 import urllib.error
 import random
 
-from runtime import Signal, SimBackend, Backend
+from runtime import Signal, SimBackend, Backend, RATE_LIMITER
+from compiler.http_retry import post_with_retry
 
 
 # tier → Ollama 模型名默认映射（用户可通过 model_map 覆盖）
@@ -113,6 +114,10 @@ class OllamaBackend(SimBackend):
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _post_with_retry(self, url, headers, body):
+        """带 429/5xx 退避重试的 POST（与 RealLLMBackend 共用 http_retry 的同一份实现）。"""
+        return post_with_retry(self._post, url, headers, body)
+
     def _build_request(self, model, messages):
         """根据 api_mode 构建请求 URL + body。"""
         if self.api_mode == "openai":
@@ -167,8 +172,9 @@ class OllamaBackend(SimBackend):
 
         self._stats["calls"] += 1
         t0 = time.time()
+        RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
         try:
-            resp = self._post(url, headers, body)
+            resp = self._post_with_retry(url, headers, body)
             dt = (time.time() - t0) * 1000.0
             content, finish, usage = self._parse_response(resp)
             ok = bool(content) and finish != "error"
@@ -210,6 +216,8 @@ class OllamaBackend(SimBackend):
                           cost=0.0, latency_ms=round(dt, 1),
                           meta={"open": "ollama_error", "error": str(e),
                                 "backend": "ollama", "host": self.host})
+        finally:
+            RATE_LIMITER.release()   # 成败都放行许可，绝不泄漏闸门
 
     def stats(self):
         """返回运行时统计快照。"""

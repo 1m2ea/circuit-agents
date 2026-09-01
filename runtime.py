@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -37,6 +37,131 @@ WATCHDOG_STATE_PATH = os.path.join(
 DEGRADED_BAND = (0.55, 0.85)
 DEGRADED_CONSEC = 3
 _WD_SAMPLES_CAP = 20
+
+
+# ---- 限流（RPM 频率 + 瞬时并发 双闸门）----
+# 背景（真实缺陷，非假想）：层内并行 max_workers=len(layer) 与 BatchExecutor(≤8 路)
+# 会把瞬时请求数放大成「8 × 层内节点数」；真 LLM 链路（DeepSeek 等）撞 RPM 上限会被
+# 整体锁接口冷却——瓶颈在「频率」不在「token 总量」，余额充足也照样被锁。
+# 因此加进程内全局双闸门：① 并发闸门压瞬时峰值 ② RPM 令牌桶压每分钟请求数。
+# 默认保守（并发 4、RPM 不限），可用环境变量或 configure() 热调整；上限设 1 即退化串行。
+CA_MAX_CONCURRENCY_DEFAULT = 4      # 全局同时飞行的 LLM 请求上限
+CA_RPM_DEFAULT = 0                  # 每分钟请求数上限；0 = 只开并发闸门、不限频率
+RL_WINDOW_DEFAULT = 60.0            # RPM 滑窗长度（秒）；自检注入小窗加速验证
+RL_BACKOFF_BASE = 0.5               # 429 退避基数（秒）
+RL_BACKOFF_CAP = 8.0                # 单次退避上限（秒），防 Retry-After 超大值拖死
+RL_MAX_RETRIES = 3                  # 429/5xx 最大重试次数（超出则开路失败）
+
+
+class RateLimiter:
+    """全局双闸门限流器：并发闸门(Semaphore) + RPM 令牌桶(滑窗)。线程安全。
+
+    · 并发闸门：压"同时在飞"的请求数，直接对治瞬时并发打满 RPM。
+    · RPM 令牌桶：滑窗内限每分钟请求数；rpm<=0 时关闭频率限制（仅并发闸门生效）。
+    · 零开销原则：不调 acquire() 则完全无成本，模拟器/离线路径不受任何影响。
+    · 锁纪律：_lock 非重入 —— 锁内绝不 sleep、也绝不调会再取同锁的函数（见 _wait_rpm_slot）。
+    """
+
+    def __init__(self, max_concurrency=None, rpm=None, window=None):
+        self.max_concurrency = self._env_int(
+            "CA_MAX_CONCURRENCY", max_concurrency, CA_MAX_CONCURRENCY_DEFAULT)
+        self.rpm = self._env_int("CA_RPM", rpm, CA_RPM_DEFAULT)
+        self.window = float(window if window is not None else RL_WINDOW_DEFAULT)
+        self._sem = threading.Semaphore(max(1, self.max_concurrency))
+        self._slots = deque()          # RPM 滑窗：[时间戳...]，只记请求时刻不记在飞数
+        self._inflight = 0             # 真实在飞数（与 _slots 语义不同，勿混用）
+        self._lock = threading.Lock()
+        self.stats = {"acquired": 0, "waited_ms": 0.0, "peak_inflight": 0}
+
+    @staticmethod
+    def _env_int(name, explicit, default):
+        if explicit is not None:
+            return int(explicit)
+        raw = os.environ.get(name)
+        return int(raw) if raw else int(default)
+
+    # ---- 运行时热调整（不重启、不惊扰在飞请求）----
+    def configure(self, max_concurrency=None, rpm=None):
+        """调整闸门宽度。并发闸门按"差额"增减许可，避免重建 semaphore 丢失在飞计数。"""
+        if max_concurrency is not None:
+            new = int(max_concurrency)
+            with self._lock:
+                delta = new - self.max_concurrency
+                self.max_concurrency = new
+            if delta > 0:
+                for _ in range(delta):
+                    self._sem.release()
+            elif delta < 0:
+                for _ in range(-delta):
+                    # 收缩：等许可回流，最多等 5s 防永久阻塞
+                    if not self._sem.acquire(timeout=5.0):
+                        break
+        if rpm is not None:
+            with self._lock:
+                self.rpm = int(rpm)
+        return self.snapshot()
+
+    def snapshot(self):
+        with self._lock:
+            return {"max_concurrency": self.max_concurrency, "rpm": self.rpm,
+                    "window": self.window, "inflight": self._inflight,
+                    "stats": dict(self.stats)}
+
+    # ---- RPM 令牌桶：滑窗内限流（sleep 一律在锁外，守非重入锁纪律）----
+    def _wait_rpm_slot(self):
+        if self.rpm <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.time()
+                while self._slots and (now - self._slots[0]) >= self.window:
+                    self._slots.popleft()
+                if len(self._slots) < self.rpm:
+                    self._slots.append(now)
+                    return
+                wait = self.window - (now - self._slots[0]) + 0.01
+            time.sleep(wait)
+
+    # ---- 主入口：先过并发闸门，再过 RPM 令牌桶 ----
+    def acquire(self):
+        t0 = time.time()
+        self._sem.acquire()
+        try:
+            self._wait_rpm_slot()
+        except BaseException:
+            self._sem.release()        # 令牌桶失败也不吞许可，避免泄漏
+            raise
+        with self._lock:
+            self._inflight += 1
+            if self._inflight > self.stats["peak_inflight"]:
+                self.stats["peak_inflight"] = self._inflight
+            self.stats["acquired"] += 1
+            self.stats["waited_ms"] += (time.time() - t0) * 1000.0
+
+    def release(self):
+        with self._lock:
+            if self._inflight > 0:
+                self._inflight -= 1
+        self._sem.release()
+
+
+# 进程内全局单例：runtime 层内并行 与 backend 真实 HTTP 共用同一道闸门
+RATE_LIMITER = RateLimiter()
+
+
+def retry_wait(attempt, retry_after=None, base=RL_BACKOFF_BASE, cap=RL_BACKOFF_CAP):
+    """纯函数：第 attempt 次重试前应等待的秒数（供 429 退避与离线自检共用）。
+
+    优先尊重服务端 Retry-After；缺失或非法则指数退避 base*2^attempt，且一律不超过 cap。
+    """
+    if retry_after is not None:
+        try:
+            v = float(retry_after)
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and v >= 0:
+            return min(cap, v)
+    return min(cap, base * (2 ** attempt))
 
 
 # ──────────────────────────────────────────────────────────
@@ -532,7 +657,11 @@ class Circuit:
                 # 安全前提：DAG 分层保证同层节点互不依赖（pred 皆在前层、已算完），
                 # 本层内只向 out 写各自独立的 key，无竞态；_run_one 仅读前层 out、
                 # 写本节点独立 key，无共享写竞争。
-                with ThreadPoolExecutor(max_workers=len(layer)) as ex:
+                # 并发上限：按全局闸门宽度开线程，不创建注定阻塞在闸门上的线程。
+                # （真正的并发约束由 backend 侧 RATE_LIMITER 全局闸门兜底；此处只避免线程浪费。
+                #   上限设 1 即退化串行——牺牲时间、保护频率额度，与并行换速度互为取舍。）
+                workers = max(1, min(len(layer), RATE_LIMITER.max_concurrency))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
                     fut = {cid: ex.submit(self._run_one, cid, out) for cid in layer}
                     for cid, f in fut.items():
                         sig = f.result()
@@ -5062,6 +5191,60 @@ def collaboration_selftest():
     print("✓ 人机协同·极致 离线自检通过")
 
 
+def rate_limit_selftest():
+    """限流双闸门离线自检（无网络 / 无 key / 不碰真实后端）。
+
+    覆盖四件事：① 并发闸门真压住在飞峰值 ② RPM 令牌桶在窗口内挡住超额请求
+    ③ 429 退避等待计算正确 ④ configure() 热调整即时生效。
+    """
+    # ① 并发闸门：上限 2、6 个任务各占 40ms → 在飞峰值必须 ≤ 2
+    rl = RateLimiter(max_concurrency=2, rpm=0)
+    cur = {"n": 0, "peak": 0}
+    gate = threading.Lock()
+
+    def hold(_i):
+        rl.acquire()
+        try:
+            with gate:
+                cur["n"] += 1
+                cur["peak"] = max(cur["peak"], cur["n"])
+            time.sleep(0.04)
+            with gate:
+                cur["n"] -= 1
+        finally:
+            rl.release()
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(hold, range(6)))
+    assert cur["peak"] <= 2, f"并发闸门失效：在飞峰值 {cur['peak']} > 2"
+    assert rl.stats["acquired"] == 6, f"许可计数异常：{rl.stats['acquired']} != 6"
+    print(f"✓ 限流·并发闸门：6 任务 / 上限 2 → 在飞峰值 {cur['peak']}（应 ≤2）")
+
+    # ② RPM 令牌桶：窗口 0.5s 内限 2 次，连发 4 次 → 总耗时须 ≥ 0.5s（小窗加速自检）
+    rl2 = RateLimiter(max_concurrency=8, rpm=2, window=0.5)
+    t0 = time.time()
+    for _ in range(4):
+        rl2.acquire()
+        rl2.release()
+    dt = time.time() - t0
+    assert dt >= 0.5, f"RPM 令牌桶未生效：4 次仅耗时 {dt:.3f}s（窗口 0.5s / 限 2 次）"
+    print(f"✓ 限流·RPM 令牌桶：窗口 0.5s 限 2 次，发 4 次耗时 {dt:.2f}s（应 ≥0.5s）")
+
+    # ③ 429 退避：指数退避 + Retry-After 优先 + 上限封顶 + 非法值回退
+    assert (retry_wait(0), retry_wait(1), retry_wait(2)) == (0.5, 1.0, 2.0), \
+        "指数退避序列应为 0.5 / 1.0 / 2.0"
+    assert retry_wait(0, "7") == 7.0, "应优先尊重服务端 Retry-After"
+    assert retry_wait(0, "100") == RL_BACKOFF_CAP, f"超大 Retry-After 应封顶 {RL_BACKOFF_CAP}"
+    assert retry_wait(0, "abc") == 0.5, "非法 Retry-After 应回退指数退避"
+    print(f"✓ 限流·退避计算：指数 0.5/1/2s + Retry-After 优先 + 封顶 {RL_BACKOFF_CAP}s")
+
+    # ④ 热调整：收紧并发上限后快照同步（不重启即生效）
+    rl3 = RateLimiter(max_concurrency=4, rpm=0)
+    rl3.configure(max_concurrency=1)
+    assert rl3.snapshot()["max_concurrency"] == 1, "热调整失效：max_concurrency 未同步"
+    print("✓ 限流·热调整：configure(max_concurrency=1) 即时生效")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -5084,6 +5267,7 @@ if __name__ == "__main__":
     skill_registry_selftest()
     topology_crdt_selftest()
     collaboration_selftest()
+    rate_limit_selftest()
 
 
 def load(path):
