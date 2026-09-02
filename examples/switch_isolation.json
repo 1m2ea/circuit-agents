@@ -1,0 +1,22 @@
+{
+  "name": "主备双支路·开关自动换路（switch 演示）",
+  "task": "主处理器异常时，开关自动隔离故障支路并合闸备用支路，电路继续成功",
+  "components": {
+    "src":    {"type": "power", "label": "任务源"},
+    "sched":  {"type": "opamp", "label": "调度器"},
+    "r_main": {"type": "resistor", "label": "主处理器", "model": "small", "yield": 0.0},
+    "s1":     {"type": "switch", "label": "主支路开关", "state": "on"},
+    "r_alt":  {"type": "resistor", "label": "备用处理器", "model": "large", "yield": 1.0},
+    "s2":     {"type": "switch", "label": "备用支路开关", "state": "off"},
+    "merge":  {"type": "capacitor", "label": "汇合", "mode": "any"},
+    "adc":    {"type": "adc", "label": "质量评估", "threshold": 0.7}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "r_main"], ["sched", "r_alt"],
+    ["r_main", "s1"], ["r_alt", "s2"],
+    ["s1", "merge"], ["s2", "merge"],
+    ["merge", "adc"]
+  ],
+  "feedback": {"from": "adc", "to": "sched", "max_iter": 2}
+}

@@ -24,14 +24,14 @@ TYPE_COLOR = {
     "capacitor": "#8e44ad", "diode": "#d35400", "adc": "#16a085",
     "watchdog": "#7f8c8d", "bridge_rectifier": "#2c3e50",
     "source": "#e67e22", "logic_gate": "#34495e",
-    "format_adapter": "#f39c12",
+    "format_adapter": "#f39c12", "switch": "#95a5a6",
 }
 TYPE_LABEL = {
     "power": "POWER", "opamp": "OP-AMP", "resistor": "RESISTOR",
     "capacitor": "CAPACITOR", "diode": "DIODE", "adc": "ADC",
     "watchdog": "WATCHDOG", "bridge_rectifier": "BRIDGE",
     "source": "SOURCE", "logic_gate": "LOGIC GATE",
-    "format_adapter": "ADAPT",
+    "format_adapter": "ADAPT", "switch": "SWITCH",
 }
 
 
@@ -88,6 +88,17 @@ def glyph(t, cx, cy, comp=None):
         return (f'<rect x="{cx-26}" y="{cy-14}" width="52" height="28" rx="5" fill="none" stroke="{g}" stroke-width="2.5"/>'
                 f'<text x="{cx}" y="{cy+5}" font-size="11" fill="{g}" text-anchor="middle" '
                 f'font-weight="bold">{kind or "ADAPT"}</text>')
+    if t == "switch":                          # 开关：触点 + 拨杆（on=接通 / off=断开）
+        state = (comp or {}).get("state", "on")
+        if state == "off":
+            return (f'<line x1="{cx-24}" y1="{cy}" x2="{cx-3}" y2="{cy}" stroke="{g}" stroke-width="2.5"/>'
+                    f'<line x1="{cx+3}" y1="{cy}" x2="{cx+24}" y2="{cy}" stroke="{g}" stroke-width="2.5"/>'
+                    f'<line x1="{cx-3}" y1="{cy}" x2="{cx+8}" y2="{cy-10}" stroke="{g}" stroke-width="2.5"/>'
+                    f'<circle cx="{cx-3}" cy="{cy}" r="3" fill="{g}"/>'
+                    f'<circle cx="{cx+3}" cy="{cy}" r="3" fill="{g}"/>')
+        return (f'<line x1="{cx-24}" y1="{cy}" x2="{cx+24}" y2="{cy}" stroke="{g}" stroke-width="2.5"/>'
+                f'<circle cx="{cx-3}" cy="{cy}" r="3" fill="{g}"/>'
+                f'<circle cx="{cx+3}" cy="{cy}" r="3" fill="{g}"/>')
     return ""
 
 
@@ -103,6 +114,8 @@ def param_text(comp):
         return "clarify" if comp.get("spec_clarify") else "pass"
     if t == "format_adapter":
         return f'{comp.get("from_fmt","?")}→{comp.get("to_fmt","?")}'
+    if t == "switch":
+        return "ON" if comp.get("state", "on") != "off" else "OFF"
     return ""
 
 

@@ -505,6 +505,20 @@ class SimBackend(Backend):
         if t == "watchdog":                     # loop bound marker
             return Signal(value=agg.value, quality=agg.quality, ok=agg.ok,
                           cost=0.0, latency_ms=1.0)
+        if t == "switch":                       # 开关：受控通断（on=合闸透传 / off=跳闸开路）
+            state = comp.get("state", "on")
+            if state == "off":                  # 跳闸：本支路断开，信号不得通过（不调后端，零成本）
+                return Signal(value=None, quality=0.0, ok=False,
+                              cost=0.0, latency_ms=1.0,
+                              meta={"sw": "off", "open": "switch_off"})
+            ok_in = [s for s in inputs if s.ok]
+            if ok_in:                           # 合闸：透传质量最高的活输入（隔离质量差的）
+                s = max(ok_in, key=lambda x: x.quality)
+                return Signal(value=s.value, quality=s.quality, ok=True,
+                              cost=0.0, latency_ms=1.0, meta={"sw": "on"})
+            return Signal(value=None, quality=0.0, ok=False,   # 合闸但上游无活信号 → 支路仍不通
+                          cost=0.0, latency_ms=1.0,
+                          meta={"sw": "on", "open": "no_ok_input"})
         if t == "bridge_rectifier":             # multimodal unify
             q = min((s.quality for s in inputs), default=0.0)
             ok = all(s.ok for s in inputs)
@@ -779,6 +793,32 @@ class Circuit:
             total_lat += layer_lat
         return out, total_lat, total_cost
 
+    def _flip_switches(self, out):
+        """反馈未达标时的自动『跳闸换路』：像电工一样扳开关，把故障支路隔离、健康支路接通。
+
+        规则（只动有明确信号的开关，绝不瞎扳）：
+          - 合闸中(state≠off)但其直接上游全失败 → 扳断(off)：故障支路隔离，不再拖累汇合/下游
+          - 跳闸中(state=off)但直接上游已有活信号 → 合闸(on)：备用/修复后的支路接通，信号改道
+        返回 [(cid, "on"|"off"), …]（曾发生扳动的开关，供结果/观察窗展示）。
+        """
+        flipped = []
+        for cid, comp in self.components.items():
+            if comp.get("type") != "switch":
+                continue
+            preds = self.pred.get(cid) or []
+            if not preds:
+                continue
+            sigs = [s for p in preds if (s := out.get(p)) is not None]
+            alive = any(s.ok for s in sigs)
+            state = comp.get("state", "on")
+            if state != "off" and not alive:      # 合闸却无活信号 → 扳断（隔离故障支路）
+                comp["state"] = "off"
+                flipped.append((cid, "off"))
+            elif state == "off" and alive:        # 跳闸却上游复活 → 合闸（备用支路投入使用）
+                comp["state"] = "on"
+                flipped.append((cid, "on"))
+        return flipped
+
     def execute(self, self_heal=None, watchdog=None):
         # self_heal: None→读 spec 标志（默认 False，向后兼容）；显式 bool 可覆盖。
         # watchdog: 可选 Watchdog 实例，用于跨轮健康自检（记录每节点质量采样、识别劣化节点）。
@@ -809,6 +849,7 @@ class Circuit:
         success = False
         final = None
         healed = {}  # cid -> 升级后的档位（仅 self_heal 且确有升级时非空）
+        switch_flips = []  # (cid, state) 自动跳闸换路的开关轨迹（观察窗/复盘用）
         for _ in range(max_iter):
             out, lat, cost = self.propagate()
             total_cost += cost
@@ -829,6 +870,10 @@ class Circuit:
             # 下一轮用升级后的拓扑续跑（运行时拓扑热更新，不重启整链）。
             if self_heal and _ < max_iter - 1:
                 self._escalate_failed(out, healed)
+            # 开关跳闸换路（默认开，不依赖 self_heal）：仍有预算时自动隔离失败支路、
+            # 合闸备用支路 —— 信号改道，让电路从故障支路自愈到健康支路（电工换路）。
+            if _ < max_iter - 1:
+                switch_flips.extend(self._flip_switches(out))
         if adc_id and final.get(adc_id):
             fq = final[adc_id].quality
         else:
@@ -851,6 +896,8 @@ class Circuit:
         }
         if healed:
             res["self_healed"] = healed
+        if switch_flips:
+            res["switch_flips"] = switch_flips
         if pre_escalated:
             res["watchdog_pre_escalated"] = pre_escalated
         if watchdog:
@@ -5410,6 +5457,76 @@ def rate_limit_adaptive_selftest():
     print("✓ 自适应·开关：CA_ADAPTIVE=0 时 report 为空操作（纯静态）")
 
 
+def switch_selftest():
+    """开关元件（switch · S1/S2）离线自检：受控通断 + 反馈未达标自动跳闸换路。
+
+    覆盖：① 合闸透传 / 跳闸开路 ② 手动预设隔离 ③ 端到端自动换路
+    （主支路必败 → s1 扳断隔离 + s2 合闸备用 → 电路从备用支路成功）。
+    """
+    import random as _rnd
+    from runtime import Circuit, SimBackend, Signal
+
+    # ① 开关通断语义（直接走后端 run）
+    be = SimBackend(_rnd.Random(0))
+    up = Signal(value="x", quality=0.8, ok=True)
+    on = be.run({"type": "switch", "state": "on"}, [up])
+    assert on.ok and on.value == "x", f"合闸应透传活输入，实际 {on}"
+    off = be.run({"type": "switch", "state": "off"}, [up])
+    assert not off.ok and off.meta.get("sw") == "off", "跳闸应开路（switch_off）"
+    dead = be.run({"type": "switch", "state": "on"}, [Signal(value=None, quality=0.0, ok=False)])
+    assert not dead.ok and dead.meta.get("open") == "no_ok_input", "合闸但上游无活信号应仍开路"
+    print("✓ 开关·通断：合闸透传活输入 / 跳闸开路(switch_off) / 合闸无活信号仍不通")
+
+    def _build(state_main="on", state_alt="off"):
+        return {
+            "name": "switch_iso",
+            "components": {
+                "src":    {"type": "power", "label": "任务源"},
+                "sched":  {"type": "opamp", "label": "调度器"},
+                "r_main": {"type": "resistor", "label": "主处理器", "model": "small", "yield": 0.0},
+                "s1":     {"type": "switch", "label": "主支路开关", "state": state_main},
+                "r_alt":  {"type": "resistor", "label": "备用处理器", "model": "large", "yield": 1.0},
+                "s2":     {"type": "switch", "label": "备用支路开关", "state": state_alt},
+                "merge":  {"type": "capacitor", "label": "汇合", "mode": "any"},
+                "adc":    {"type": "adc", "label": "质量评估", "threshold": 0.7},
+            },
+            "wires": [
+                ["src", "sched"], ["sched", "r_main"], ["sched", "r_alt"],
+                ["r_main", "s1"], ["r_alt", "s2"],
+                ["s1", "merge"], ["s2", "merge"], ["merge", "adc"],
+            ],
+            "feedback": {"from": "adc", "to": "sched", "max_iter": 2},
+        }
+
+    # ② 手动全切（纯手动开关）：人直接扳 s1=off 隔离坏支路、s2=on 合闸备用 → 一轮即成功、零自动扳动
+    circ2 = Circuit(_build(state_main="off", state_alt="on"), SimBackend(_rnd.Random(0)))
+    res2 = circ2.execute()
+    assert res2["success"] and res2["iterations"] == 1, f"手动全切应一轮成功，实际 {res2['iterations']}"
+    assert not res2.get("switch_flips"), f"手动全切不应触发自动换路，实际 {res2.get('switch_flips')}"
+    print("✓ 开关·手动全切：人扳 s1=off+s2=on → 主支路隔离、备用直达，一轮成功零自动扳动")
+
+    # ③ 半自动（手动隔离 + 系统启用备用）：s1 预设 off，s2 默认断开 → 反馈预算内 s2 被自动合闸
+    circ3 = Circuit(_build(state_main="off"), SimBackend(_rnd.Random(0)))
+    res3 = circ3.execute()
+    assert res3["success"], "半自动隔离后应成功"
+    flips3 = res3.get("switch_flips") or []
+    assert ("s1", "off") not in flips3 and ("s1", "on") not in flips3, \
+        f"s1 已手动隔离不应被自动扳动: {flips3}"
+    assert ("s2", "on") in flips3, f"s2 应被自动合闸启用备用支路: {flips3}"
+    print("✓ 开关·半自动：s1 手动隔离 + s2 自动合闸 → 备用支路被系统启用")
+
+    # ④ 全自动跳闸换路：主支路(必败)拖垮第一轮 → 预算内 s1 扳断 + s2 合闸 → 备用救活
+    circ4 = Circuit(_build(), SimBackend(_rnd.Random(0)))
+    res4 = circ4.execute()
+    assert res4["success"], "自动换路后应成功"
+    assert res4["iterations"] >= 2, f"应至少两轮（先败后换路），实际 {res4['iterations']}"
+    assert ("s1", "off") in (res4.get("switch_flips") or []), "s1 应被扳断（隔离故障主支路）"
+    assert ("s2", "on") in (res4.get("switch_flips") or []), "s2 应合闸（接通备用支路）"
+    assert circ4.components["s1"]["state"] == "off" and circ4.components["s2"]["state"] == "on"
+    print(f"✓ 开关·全自动换路：主支路必败 → s1 扳断 + s2 合闸 → 第 {res4['iterations']} 轮从备用支路成功"
+          f"（q={res4['final_quality']}）")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -5434,6 +5551,7 @@ if __name__ == "__main__":
     collaboration_selftest()
     rate_limit_selftest()
     rate_limit_adaptive_selftest()
+    switch_selftest()
 
 
 def load(path):

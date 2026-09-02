@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="980" viewBox="0 0 500 980" font-family="Helvetica, Arial, sans-serif">
+<defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+      <marker id="arrowF" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#c0392b"/></marker>
+    </defs>
+<rect width="500" height="980" fill="#fdfdfd"/>
+<path d="M155.0,140.0 C155.0,175.0 155.0,175.0 155.0,210.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,290.0 C155.0,325.0 155.0,325.0 155.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,290.0 C155.0,325.0 345.0,325.0 345.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,440.0 C155.0,475.0 155.0,475.0 155.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M345.0,440.0 C345.0,475.0 345.0,475.0 345.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,590.0 C155.0,625.0 155.0,625.0 155.0,660.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M345.0,590.0 C345.0,625.0 155.0,625.0 155.0,660.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M155.0,740.0 C155.0,775.0 155.0,775.0 155.0,810.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M80.0,850.0 C10.0,850.0 10.0,250.0 80.0,250.0" fill="none" stroke="#c0392b" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowF)"/>
+<text x="4.0" y="550.0" font-size="12" fill="#c0392b" text-anchor="middle" transform="rotate(-90 4.0 550.0)">retry &#215;2</text>
+<rect x="80.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#c0392b" stroke-width="2.5"/>
+<text x="155.0" y="76.0" font-size="10" fill="#c0392b" text-anchor="middle" font-weight="bold" letter-spacing="1">POWER</text>
+<line x1="142.0" y1="83.0" x2="168.0" y2="83.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="92.0" x2="162.0" y2="92.0" stroke="#c0392b" stroke-width="3"/><line x1="142.0" y1="101.0" x2="168.0" y2="101.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="110.0" x2="162.0" y2="110.0" stroke="#c0392b" stroke-width="3"/>
+<text x="155.0" y="126.0" font-size="13" fill="#c0392b" text-anchor="middle"><tspan font-weight="bold" fill="#c0392b">P1</tspan><tspan fill="#222" dx="6">任务源</tspan></text>
+<rect x="80.0" y="210.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#2980b9" stroke-width="2.5"/>
+<text x="155.0" y="226.0" font-size="10" fill="#2980b9" text-anchor="middle" font-weight="bold" letter-spacing="1">OP-AMP</text>
+<polygon points="139.0,230.0 139.0,262.0 173.0,246.0" fill="none" stroke="#2980b9" stroke-width="2.5"/><text x="142.0" y="242.0" font-size="11" fill="#2980b9">+</text><text x="142.0" y="260.0" font-size="11" fill="#2980b9">&#8722;</text>
+<text x="155.0" y="276.0" font-size="13" fill="#2980b9" text-anchor="middle"><tspan font-weight="bold" fill="#2980b9">U1</tspan><tspan fill="#222" dx="6">调度器</tspan></text>
+<text x="155.0" y="288.0" font-size="9" fill="#888" text-anchor="middle">pass</text>
+<rect x="80.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="155.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="133.0,404.0 140.3,388.0 147.7,404.0 155.0,388.0 162.3,404.0 169.7,388.0 177.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="155.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R1</tspan><tspan fill="#222" dx="6">主处理器</tspan></text>
+<text x="155.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=small</text>
+<rect x="270.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="345.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="323.0,404.0 330.3,388.0 337.7,404.0 345.0,388.0 352.3,404.0 359.7,388.0 367.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="345.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R2</tspan><tspan fill="#222" dx="6">备用处理器</tspan></text>
+<text x="345.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=large</text>
+<rect x="80.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#95a5a6" stroke-width="2.5"/>
+<text x="155.0" y="526.0" font-size="10" fill="#95a5a6" text-anchor="middle" font-weight="bold" letter-spacing="1">SWITCH</text>
+<line x1="131.0" y1="546.0" x2="179.0" y2="546.0" stroke="#95a5a6" stroke-width="2.5"/><circle cx="152.0" cy="546.0" r="3" fill="#95a5a6"/><circle cx="158.0" cy="546.0" r="3" fill="#95a5a6"/>
+<text x="155.0" y="576.0" font-size="13" fill="#95a5a6" text-anchor="middle"><tspan font-weight="bold" fill="#95a5a6">S1</tspan><tspan fill="#222" dx="6">主支路开关</tspan></text>
+<text x="155.0" y="588.0" font-size="9" fill="#888" text-anchor="middle">ON</text>
+<rect x="270.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#95a5a6" stroke-width="2.5"/>
+<text x="345.0" y="526.0" font-size="10" fill="#95a5a6" text-anchor="middle" font-weight="bold" letter-spacing="1">SWITCH</text>
+<line x1="321.0" y1="546.0" x2="342.0" y2="546.0" stroke="#95a5a6" stroke-width="2.5"/><line x1="348.0" y1="546.0" x2="369.0" y2="546.0" stroke="#95a5a6" stroke-width="2.5"/><line x1="342.0" y1="546.0" x2="353.0" y2="536.0" stroke="#95a5a6" stroke-width="2.5"/><circle cx="342.0" cy="546.0" r="3" fill="#95a5a6"/><circle cx="348.0" cy="546.0" r="3" fill="#95a5a6"/>
+<text x="345.0" y="576.0" font-size="13" fill="#95a5a6" text-anchor="middle"><tspan font-weight="bold" fill="#95a5a6">S2</tspan><tspan fill="#222" dx="6">备用支路开关</tspan></text>
+<text x="345.0" y="588.0" font-size="9" fill="#888" text-anchor="middle">OFF</text>
+<rect x="80.0" y="660.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="155.0" y="676.0" font-size="10" fill="#8e44ad" text-anchor="middle" font-weight="bold" letter-spacing="1">CAPACITOR</text>
+<line x1="155.0" y1="680.0" x2="155.0" y2="693.0" stroke="#8e44ad" stroke-width="2.5"/><line x1="137.0" y1="693.0" x2="173.0" y2="693.0" stroke="#8e44ad" stroke-width="3"/><line x1="137.0" y1="699.0" x2="173.0" y2="699.0" stroke="#8e44ad" stroke-width="3"/><line x1="155.0" y1="699.0" x2="155.0" y2="712.0" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="155.0" y="726.0" font-size="13" fill="#8e44ad" text-anchor="middle"><tspan font-weight="bold" fill="#8e44ad">C1</tspan><tspan fill="#222" dx="6">汇合</tspan></text>
+<rect x="80.0" y="810.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#16a085" stroke-width="2.5"/>
+<text x="155.0" y="826.0" font-size="10" fill="#16a085" text-anchor="middle" font-weight="bold" letter-spacing="1">ADC</text>
+<rect x="133.0" y="830.0" width="44" height="32" rx="4" fill="none" stroke="#16a085" stroke-width="2.5"/><text x="155.0" y="851.0" font-size="13" fill="#16a085" text-anchor="middle" font-weight="bold">ADC</text>
+<text x="155.0" y="876.0" font-size="13" fill="#16a085" text-anchor="middle"><tspan font-weight="bold" fill="#16a085">ADC1</tspan><tspan fill="#222" dx="6">质量评估</tspan></text>
+<text x="155.0" y="888.0" font-size="9" fill="#888" text-anchor="middle">thr=0.7</text>
+<text x="250.0" y="24" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">主备双支路·开关自动换路（switch 演示）</text>
+</svg>
