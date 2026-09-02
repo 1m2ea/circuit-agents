@@ -24,14 +24,14 @@ TYPE_COLOR = {
     "capacitor": "#8e44ad", "diode": "#d35400", "adc": "#16a085",
     "watchdog": "#7f8c8d", "bridge_rectifier": "#2c3e50",
     "source": "#e67e22", "logic_gate": "#34495e",
-    "format_adapter": "#f39c12", "switch": "#95a5a6",
+    "format_adapter": "#f39c12", "switch": "#95a5a6", "fuse": "#a93226",
 }
 TYPE_LABEL = {
     "power": "POWER", "opamp": "OP-AMP", "resistor": "RESISTOR",
     "capacitor": "CAPACITOR", "diode": "DIODE", "adc": "ADC",
     "watchdog": "WATCHDOG", "bridge_rectifier": "BRIDGE",
     "source": "SOURCE", "logic_gate": "LOGIC GATE",
-    "format_adapter": "ADAPT", "switch": "SWITCH",
+    "format_adapter": "ADAPT", "switch": "SWITCH", "fuse": "FUSE",
 }
 
 
@@ -99,6 +99,15 @@ def glyph(t, cx, cy, comp=None):
         return (f'<line x1="{cx-24}" y1="{cy}" x2="{cx+24}" y2="{cy}" stroke="{g}" stroke-width="2.5"/>'
                 f'<circle cx="{cx-3}" cy="{cy}" r="3" fill="{g}"/>'
                 f'<circle cx="{cx+3}" cy="{cy}" r="3" fill="{g}"/>')
+    if t == "fuse":                          # 熔断器：矩形壳 + 内部熔丝（blown 则断开）
+        state = (comp or {}).get("state", "ok")
+        body = (f'<rect x="{cx-20}" y="{cy-10}" width="40" height="20" rx="3" '
+                f'fill="none" stroke="{g}" stroke-width="2"/>')
+        if state == "blown":
+            return body + (f'<line x1="{cx-14}" y1="{cy}" x2="{cx-3}" y2="{cy}" stroke="{g}" stroke-width="2"/>'
+                           f'<line x1="{cx+3}" y1="{cy}" x2="{cx+14}" y2="{cy}" stroke="{g}" stroke-width="2"/>'
+                           f'<line x1="{cx-3}" y1="{cy-6}" x2="{cx+3}" y2="{cy+6}" stroke="{g}" stroke-width="2"/>')
+        return body + f'<line x1="{cx-14}" y1="{cy}" x2="{cx+14}" y2="{cy}" stroke="{g}" stroke-width="2"/>'
     return ""
 
 
@@ -116,6 +125,8 @@ def param_text(comp):
         return f'{comp.get("from_fmt","?")}→{comp.get("to_fmt","?")}'
     if t == "switch":
         return "ON" if comp.get("state", "on") != "off" else "OFF"
+    if t == "fuse":
+        return "BLOWN" if comp.get("state", "ok") == "blown" else "OK"
     return ""
 
 

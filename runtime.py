@@ -519,6 +519,21 @@ class SimBackend(Backend):
             return Signal(value=None, quality=0.0, ok=False,   # 合闸但上游无活信号 → 支路仍不通
                           cost=0.0, latency_ms=1.0,
                           meta={"sw": "on", "open": "no_ok_input"})
+        if t == "fuse":                         # 熔断器：一次性保护（ok 透传 / blown 永久开路）
+            # 与开关(可复位)的区别：熔断=一次性烧断，自动换路机制绝不碰它，直到人工重置为 ok。
+            # 上游被 fuse 挡住的电阻将无输入 → 真 LLM 后端直接短路零调用（防反复失败烧钱）。
+            if comp.get("state", "ok") == "blown":
+                return Signal(value=None, quality=0.0, ok=False,
+                              cost=0.0, latency_ms=1.0,
+                              meta={"fuse": "blown", "open": "fuse_blown"})
+            ok_in = [s for s in inputs if s.ok]
+            if ok_in:
+                s = max(ok_in, key=lambda x: x.quality)
+                return Signal(value=s.value, quality=s.quality, ok=True,
+                              cost=0.0, latency_ms=1.0, meta={"fuse": "ok"})
+            return Signal(value=None, quality=0.0, ok=False,
+                          cost=0.0, latency_ms=1.0,
+                          meta={"fuse": "ok", "open": "no_ok_input"})
         if t == "bridge_rectifier":             # multimodal unify
             q = min((s.quality for s in inputs), default=0.0)
             ok = all(s.ok for s in inputs)
@@ -574,7 +589,7 @@ class Watchdog:
         """记录一次质量采样，返回该节点当前累计的『连续落带次数』。"""
         k = self._key(circuit_id, node)
         rec = self.data.setdefault(
-            k, {"samples": [], "band_consec": 0, "degraded": False})
+            k, {"samples": [], "band_consec": 0, "degraded": False, "blown": False})
         lo, hi = DEGRADED_BAND
         rec["samples"].append(round(quality, 3))
         if len(rec["samples"]) > _WD_SAMPLES_CAP:
@@ -592,6 +607,21 @@ class Watchdog:
         k = self._key(circuit_id, node)
         return self.data.get(k, {}).get("degraded", False)
 
+    def mark_blown(self, circuit_id, node):
+        """熔断一支保险丝（熔断器 fuse）：粘滞记录——一次性烧断，不可自动复位。
+
+        语义：该节点（通常是被熔断支路入口的 fuse）已『信誉破产』，后续任务直接跳过，
+        不再给反复失败的处理器烧钱。人工确认修复后由外部重置 fuse 的 state 为 ok。
+        """
+        k = self._key(circuit_id, node)
+        rec = self.data.setdefault(
+            k, {"samples": [], "band_consec": 0, "degraded": False, "blown": False})
+        rec["blown"] = True
+
+    def is_blown(self, circuit_id, node):
+        k = self._key(circuit_id, node)
+        return self.data.get(k, {}).get("blown", False)
+
     def snapshot(self, circuit_id):
         """返回某电路下各节点的看门狗摘要（供 execute 返回 / 打印）。"""
         out = {}
@@ -602,6 +632,7 @@ class Watchdog:
                     "samples": rec["samples"],
                     "band_consec": rec["band_consec"],
                     "degraded": rec["degraded"],
+                    "blown": rec.get("blown", False),
                 }
         return out
 
@@ -841,6 +872,12 @@ class Circuit:
                     nxt = order[rank[cur] + 1]
                     comp["model"] = nxt
                     pre_escalated[cid] = nxt
+        # 熔断器跨任务持久化：上一任务把某 fuse 烧断（watchdog.mark_blown）→ 本任务开局即 blown，
+        # 该支路从源头隔离——不再给反复失败的处理器烧钱，直到人工把 fuse state 重置为 ok。
+        if watchdog:
+            for cid, comp in self.components.items():
+                if comp.get("type") == "fuse" and watchdog.is_blown(circuit_id, cid):
+                    comp["state"] = "blown"
         max_iter = (self.feedback or {}).get("max_iter", 1)
         adc_id = (self.feedback or {}).get("from")
         total_cost = 0.0
@@ -874,6 +911,12 @@ class Circuit:
             # 合闸备用支路 —— 信号改道，让电路从故障支路自愈到健康支路（电工换路）。
             if _ < max_iter - 1:
                 switch_flips.extend(self._flip_switches(out))
+        # 熔断器触发：反馈预算耗尽仍未达标 → 把『下游(被保护支路)失败』的熔断器一次性烧断。
+        # 与换路(可复位)互补：换路在预算内救活；熔断在预算耗尽后宣告该支路信誉破产——
+        # 烧断状态交给 watchdog 持久化，后续任务直接跳过，不再给反复失败的处理器烧钱。
+        fuse_blown = []
+        if not success:
+            fuse_blown = self._blow_fuses(out, watchdog)
         if adc_id and final.get(adc_id):
             fq = final[adc_id].quality
         else:
@@ -898,12 +941,39 @@ class Circuit:
             res["self_healed"] = healed
         if switch_flips:
             res["switch_flips"] = switch_flips
+        if fuse_blown:
+            res["fuse_blown"] = fuse_blown
         if pre_escalated:
             res["watchdog_pre_escalated"] = pre_escalated
         if watchdog:
             res["watchdog"] = watchdog.snapshot(circuit_id)
             watchdog.save()
         return res
+
+    def _blow_fuses(self, out, watchdog=None):
+        """反馈预算耗尽仍失败 → 熔断『被保护支路失败』的熔断器（一次性，区别于可复位开关）。
+
+        判定依据：fuse 的**下游**（succ，即它保护的支路）在末轮 failed → 烧断。
+        与 _flip_switches 只看上游失败不同：fuse 挡在支路入口，保护的是它后面的执行件。
+        烧断后：本任务立即隔离该支路；若传 watchdog 则粘滞持久化（mark_blown），
+        后续任务开局即 blown，被保护处理器拿不到输入 → 真 LLM 后端短路零调用（省钱）。
+        返回被熔断的 fuse 列表。
+        """
+        blown = []
+        circuit_id = self.spec.get("name") or "unnamed"
+        for cid, comp in self.components.items():
+            if comp.get("type") != "fuse":
+                continue
+            if comp.get("state", "ok") == "blown":
+                continue
+            succs = self.succ.get(cid) or []
+            failed = any(sid in out and not out[sid].ok for sid in succs)
+            if failed:
+                comp["state"] = "blown"
+                if watchdog is not None:
+                    watchdog.mark_blown(circuit_id, cid)
+                blown.append(cid)
+        return blown
 
     def _escalate_failed(self, out, healed):
         """对当前轮 yield 失败(ok=False)的电阻，档位逐级升一档（small→large→tool）。
@@ -5527,6 +5597,61 @@ def switch_selftest():
           f"（q={res4['final_quality']}）")
 
 
+def fuse_selftest():
+    """熔断器元件（fuse · FU1）离线自检：一次性熔断 + 跨任务持久隔离（防反复烧钱）。
+
+    覆盖：① 通断语义（ok 透传 / blown 永久开路，自动换路不碰它）
+    ② 双任务：任务1 反馈预算耗尽仍失败 → 熔断并持久化；
+    任务2 开局即 blown → 被保护处理器拿不到输入（真 LLM 后端短路零调用），不重复熔断。
+    """
+    import os as _os
+    import tempfile as _tmp
+    import random as _rnd
+    from runtime import Circuit, SimBackend, Watchdog, Signal
+
+    # ① fuse 通断语义
+    be = SimBackend(_rnd.Random(0))
+    up = Signal(value="x", quality=0.8, ok=True)
+    ok = be.run({"type": "fuse", "state": "ok"}, [up])
+    assert ok.ok and ok.value == "x", "熔断器未烧时应透传"
+    blown = be.run({"type": "fuse", "state": "blown"}, [up])
+    assert not blown.ok and blown.meta.get("open") == "fuse_blown", "烧断后应永久开路"
+    print("✓ 熔断器·通断：未烧透传 / 烧断(fuse_blown)永久开路")
+
+    spec = {
+        "name": "fuse_selftest",
+        "components": {
+            "src":    {"type": "power", "label": "任务源"},
+            "sched":  {"type": "opamp", "label": "调度器"},
+            "fuse1":  {"type": "fuse", "label": "主处理器保险丝"},
+            "r_main": {"type": "resistor", "label": "主处理器", "model": "small", "yield": 0.0},
+            "adc":    {"type": "adc", "label": "质量评估", "threshold": 0.7},
+        },
+        "wires": [["src", "sched"], ["sched", "fuse1"], ["fuse1", "r_main"], ["r_main", "adc"]],
+        "feedback": {"from": "adc", "to": "sched", "max_iter": 2},
+    }
+    wd_path = _os.path.join(_tmp.mkdtemp(), "wd.json")
+
+    # ② 任务1：预算耗尽仍失败 → 熔断 + 持久化
+    wd1 = Watchdog(state_path=wd_path)
+    c1 = Circuit(spec, SimBackend(_rnd.Random(0)))
+    r1 = c1.execute(watchdog=wd1)
+    assert not r1["success"] and r1.get("fuse_blown") == ["fuse1"], \
+        f"任务1 预算耗尽应熔断 fuse1，实际 {r1.get('fuse_blown')}"
+    assert wd1.is_blown("fuse_selftest", "fuse1"), "熔断状态应写入 watchdog（粘滞持久化）"
+    assert c1.components["fuse1"]["state"] == "blown"
+    print(f"✓ 熔断器·任务1：反馈预算耗尽 → fuse1 熔断并持久化（{r1['iterations']} 轮失败后保护性停手）")
+
+    # ③ 任务2：同一 spec + 同一 watchdog → 开局即 blown，主处理器被挡不干活、不重复熔断
+    c2 = Circuit(spec, SimBackend(_rnd.Random(0)))
+    r2 = c2.execute(watchdog=Watchdog(state_path=wd_path))
+    assert c2.components["fuse1"]["state"] == "blown", "任务2 开局应恢复 blown（跨任务记忆）"
+    assert not (r2.get("fuse_blown") or []), f"已烧断的 fuse 不应重复熔断，实际 {r2.get('fuse_blown')}"
+    rm = r2["components"].get("r_main") or {}
+    assert rm.get("ok") is False, "被保险丝挡住的处理器应拿不到信号（真 LLM 后端短路零调用）"
+    print("✓ 熔断器·任务2：开局 blown → 主处理器被隔离不干活、不重复熔断（防反复烧钱）")
+
+
 if __name__ == "__main__":
     selftest()
     circuit_executor_selftest()
@@ -5552,6 +5677,7 @@ if __name__ == "__main__":
     rate_limit_selftest()
     rate_limit_adaptive_selftest()
     switch_selftest()
+    fuse_selftest()
 
 
 def load(path):

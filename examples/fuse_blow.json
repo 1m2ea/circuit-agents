@@ -1,0 +1,18 @@
+{
+  "name": "熔断器保护·防反复烧钱（fuse 演示）",
+  "task": "主处理器反复失败时，保险丝熔断一次性隔离，后续任务不再给它烧钱",
+  "components": {
+    "src":    {"type": "power", "label": "任务源"},
+    "sched":  {"type": "opamp", "label": "调度器"},
+    "fuse1":  {"type": "fuse", "label": "主处理器保险丝", "state": "ok"},
+    "r_main": {"type": "resistor", "label": "主处理器", "model": "small", "yield": 0.0},
+    "adc":    {"type": "adc", "label": "质量评估", "threshold": 0.7}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "fuse1"],
+    ["fuse1", "r_main"],
+    ["r_main", "adc"]
+  ],
+  "feedback": {"from": "adc", "to": "sched", "max_iter": 2}
+}

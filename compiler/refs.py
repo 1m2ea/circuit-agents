@@ -40,6 +40,7 @@ TYPE_PREFIX = {
     "diode": "D",            # 二极管 / 单向校验
     "adc": "ADC",            # 模数转换 / 质量门（沿用项目命名，直观）
     "watchdog": "W",         # 看门狗
+    "fuse": "FU",            # 熔断器（F 已被 format_adapter 占用，取 FU）
     "format_adapter": "F",   # 格式适配
     "switch": "S",           # 开关
     "lamp": "L",             # 灯泡 / 输出指示
