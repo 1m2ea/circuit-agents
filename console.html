@@ -612,6 +612,7 @@ function resetDisplay() {
 
 function onNodeDone(info, isReplay) {
   const node = info.node || '?';
+  const disp = info.ref || node;      // 图纸编号优先：R1/C1/U1…（无则退回内部 id）
   const ok = info.ok !== false;
   const quality = typeof info.quality === 'number' ? info.quality.toFixed(3) : '--';
   const retried = info.retried;
@@ -626,7 +627,7 @@ function onNodeDone(info, isReplay) {
   div.style.setProperty('--i', tl.children.length);
   div.innerHTML =
     `<span class="tml-time">${ms}ms</span> ` +
-    `<span class="tml-node">${node}</span> ` +
+    `<span class="tml-node">${esc(disp)}</span> ` +
     (ok ? `<span class="tml-ok">✓</span>` : `<span class="tml-fail">✗</span>`) +
     ` Q=${quality}` +
     (retried ? ' <span style="color:var(--orange)">[补数]</span>' : '');
@@ -789,11 +790,13 @@ function renderOutputPanel() {
     const comp = currentSpec && currentSpec.components ? currentSpec.components[node] : null;
     const type = comp ? comp.type : '';
     const label = comp ? (comp.label || node) : node;
+    const ref = comp ? comp.ref : null;
+    const dispName = ref ? ref + ' · ' + label : label;   // R1 · calculate（图纸编号+功能）
     const isFinal = (node === sink);
     const rendered = fmtVal(val);
     html += '<div class="out-node' + (isFinal ? ' out-final' : '') + '">'
       + '<div class="out-head">'
-      + '<span class="out-name">' + esc(label) + '</span>'
+      + '<span class="out-name">' + esc(dispName) + '</span>'
       + '<span class="out-type">' + esc(type) + '</span>'
       + (isFinal ? '<span class="out-badge">最终输出</span>' : '')
       + '</div>'

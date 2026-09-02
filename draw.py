@@ -9,6 +9,7 @@ import random
 import sys
 
 from runtime import load, Circuit, SimBackend
+from compiler.refs import build_ref_index
 
 NODE_W, NODE_H = 150, 80
 VX, VY = 190, 150
@@ -165,7 +166,8 @@ def draw(spec, out_path, exec_result=None):
         p.append(f'<text x="{left-6}" y="{(sy+ey)/2}" font-size="12" fill="#c0392b" '
                  f'text-anchor="middle" transform="rotate(-90 {left-6} {(sy+ey)/2})">retry &#215;{fb["max_iter"]}</text>')
 
-    # nodes
+    # nodes —— 图纸式标注：每元件标「编号 R1/C1 + 功能名」，同类型多实例一目了然
+    refs = build_ref_index(comps)
     for cid, (x, y) in pos.items():
         comp = comps[cid]
         t = comp.get("type")
@@ -176,8 +178,16 @@ def draw(spec, out_path, exec_result=None):
         p.append(f'<text x="{x}" y="{by+16}" font-size="10" fill="{col}" text-anchor="middle" '
                  f'font-weight="bold" letter-spacing="1">{TYPE_LABEL.get(t, t.upper())}</text>')
         p.append(glyph(t, x, y - 4, comp))
-        p.append(f'<text x="{x}" y="{by+NODE_H-14}" font-size="12" fill="#222" '
-                 f'text-anchor="middle">{esc(comp.get("label", cid))}</text>')
+        ref = refs.get(cid, "")
+        label = esc(comp.get("label", ""))[:12]
+        if ref:
+            p.append(f'<text x="{x}" y="{by+NODE_H-14}" font-size="13" fill="{col}" '
+                     f'text-anchor="middle">'
+                     f'<tspan font-weight="bold" fill="{col}">{ref}</tspan>'
+                     f'<tspan fill="#222" dx="6">{label}</tspan></text>')
+        else:
+            p.append(f'<text x="{x}" y="{by+NODE_H-14}" font-size="12" fill="#222" '
+                     f'text-anchor="middle">{label or esc(cid)}</text>')
         pt = param_text(comp)
         if pt:
             p.append(f'<text x="{x}" y="{by+NODE_H-2}" font-size="9" fill="#888" '

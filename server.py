@@ -445,6 +445,14 @@ def _compile_execute(goal_text, params, on_node_done=None):
         for comp in spec.get("components", {}).values():
             if comp.get("type") in ("adc", "verify"):
                 comp["threshold"] = float(qt)
+    # 图纸式元件编号（R1/C1/U1/ADC1…）：compile 后就地给元件补 ref 字段——
+    # 同类型多实例可识别可寻址（cap_0/cap_1 → R1/R2），展示/事件/编辑器全受益。
+    # 附加字段，Circuit 构造与执行语义零影响。
+    from compiler.refs import build_ref_index
+    _refs = build_ref_index(spec.get("components") or {})
+    for _cid, _comp in spec.get("components", {}).items():
+        if isinstance(_comp, dict):
+            _comp.setdefault("ref", _refs.get(_cid, ""))
     # 真实模型后端：检测到 DEEPSEEK_API_KEY 则走 DeepSeek（OpenAI 兼容接口）；
     # 否则维持原 SimBackend 确定性模拟器（向后兼容、离线不崩）。
     _rng_seed = int(time.time() * 1000) % (2 ** 31)
@@ -492,6 +500,9 @@ def _compile_execute(goal_text, params, on_node_done=None):
     circuit = Circuit(spec, backend)
     events = []
     def _cb(cid, sig, info):
+        if isinstance(info, dict):
+            info = dict(info)                       # 复制后增强，不污染执行器内部对象
+            info["ref"] = _refs.get(cid, "")        # 图纸编号：R1/C1/U1…（前端寻址显示）
         events.append(info)
         if on_node_done is not None:
             on_node_done(cid, sig, info)

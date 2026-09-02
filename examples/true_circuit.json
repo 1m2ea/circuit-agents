@@ -1,0 +1,31 @@
+{
+  "name": "多源并行分析电路（真电路感）",
+  "task": "调研 A/B 两地市场数据，分析差异，计算增长率并给出投资建议",
+  "components": {
+    "src":    {"type": "power", "label": "任务源"},
+    "sched":  {"type": "opamp", "label": "调度器"},
+    "r_a":    {"type": "resistor", "label": "调研A地", "capability": "retrieve"},
+    "r_b":    {"type": "resistor", "label": "调研B地", "capability": "retrieve"},
+    "r_c":    {"type": "resistor", "label": "对比差异", "capability": "compare"},
+    "r_d":    {"type": "resistor", "label": "算增长率", "capability": "calculate"},
+    "r_e":    {"type": "resistor", "label": "投资建议", "capability": "reason", "model": "reasoner"},
+    "c_l":    {"type": "capacitor", "mode": "any", "label": "左汇合"},
+    "c_r":    {"type": "capacitor", "mode": "any", "label": "右汇合"},
+    "c_m":    {"type": "capacitor", "label": "总汇合"},
+    "d_chk":  {"type": "diode", "label": "方向校验"},
+    "adc":    {"type": "adc", "label": "质量评估", "threshold": 0.7},
+    "wg":     {"type": "watchdog", "label": "看门狗"}
+  },
+  "wires": [
+    ["src", "sched"],
+    ["sched", "r_a"], ["sched", "r_b"], ["sched", "r_c"],
+    ["sched", "r_d"], ["sched", "r_e"],
+    ["r_a", "c_l"], ["r_b", "c_l"],
+    ["r_c", "c_r"], ["r_d", "c_r"], ["r_e", "c_r"],
+    ["c_l", "c_m"], ["c_r", "c_m"],
+    ["c_m", "d_chk"],
+    ["d_chk", "adc"],
+    ["adc", "wg"]
+  ],
+  "feedback": {"from": "adc", "to": "sched", "max_iter": 2}
+}

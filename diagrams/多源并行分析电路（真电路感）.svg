@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1122" height="1280" viewBox="0 0 1122 1280" font-family="Helvetica, Arial, sans-serif">
+<defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+      <marker id="arrowF" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#c0392b"/></marker>
+    </defs>
+<rect width="1122" height="1280" fill="#fdfdfd"/>
+<path d="M233.0,140.0 C233.0,175.0 233.0,175.0 233.0,210.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,290.0 C233.0,325.0 233.0,325.0 233.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,290.0 C233.0,325.0 423.0,325.0 423.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,290.0 C233.0,325.0 613.0,325.0 613.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,290.0 C233.0,325.0 803.0,325.0 803.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,290.0 C233.0,325.0 993.0,325.0 993.0,360.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,440.0 C233.0,475.0 233.0,475.0 233.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M423.0,440.0 C423.0,475.0 233.0,475.0 233.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M613.0,440.0 C613.0,475.0 423.0,475.0 423.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M803.0,440.0 C803.0,475.0 423.0,475.0 423.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M993.0,440.0 C993.0,475.0 423.0,475.0 423.0,510.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,590.0 C233.0,625.0 233.0,625.0 233.0,660.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M423.0,590.0 C423.0,625.0 233.0,625.0 233.0,660.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,740.0 C233.0,775.0 233.0,775.0 233.0,810.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,890.0 C233.0,925.0 233.0,925.0 233.0,960.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M233.0,1040.0 C233.0,1075.0 233.0,1075.0 233.0,1110.0" fill="none" stroke="#444" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M158.0,1000.0 C88.0,1000.0 88.0,250.0 158.0,250.0" fill="none" stroke="#c0392b" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowF)"/>
+<text x="82.0" y="625.0" font-size="12" fill="#c0392b" text-anchor="middle" transform="rotate(-90 82.0 625.0)">retry &#215;2</text>
+<rect x="158.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#c0392b" stroke-width="2.5"/>
+<text x="233.0" y="76.0" font-size="10" fill="#c0392b" text-anchor="middle" font-weight="bold" letter-spacing="1">POWER</text>
+<line x1="220.0" y1="83.0" x2="246.0" y2="83.0" stroke="#c0392b" stroke-width="3"/><line x1="226.0" y1="92.0" x2="240.0" y2="92.0" stroke="#c0392b" stroke-width="3"/><line x1="220.0" y1="101.0" x2="246.0" y2="101.0" stroke="#c0392b" stroke-width="3"/><line x1="226.0" y1="110.0" x2="240.0" y2="110.0" stroke="#c0392b" stroke-width="3"/>
+<text x="233.0" y="126.0" font-size="13" fill="#c0392b" text-anchor="middle"><tspan font-weight="bold" fill="#c0392b">P1</tspan><tspan fill="#222" dx="6">任务源</tspan></text>
+<rect x="158.0" y="210.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#2980b9" stroke-width="2.5"/>
+<text x="233.0" y="226.0" font-size="10" fill="#2980b9" text-anchor="middle" font-weight="bold" letter-spacing="1">OP-AMP</text>
+<polygon points="217.0,230.0 217.0,262.0 251.0,246.0" fill="none" stroke="#2980b9" stroke-width="2.5"/><text x="220.0" y="242.0" font-size="11" fill="#2980b9">+</text><text x="220.0" y="260.0" font-size="11" fill="#2980b9">&#8722;</text>
+<text x="233.0" y="276.0" font-size="13" fill="#2980b9" text-anchor="middle"><tspan font-weight="bold" fill="#2980b9">U1</tspan><tspan fill="#222" dx="6">调度器</tspan></text>
+<text x="233.0" y="288.0" font-size="9" fill="#888" text-anchor="middle">pass</text>
+<rect x="158.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="233.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="211.0,404.0 218.3,388.0 225.7,404.0 233.0,388.0 240.3,404.0 247.7,388.0 255.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="233.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R1</tspan><tspan fill="#222" dx="6">调研A地</tspan></text>
+<text x="233.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=?</text>
+<rect x="348.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="423.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="401.0,404.0 408.3,388.0 415.7,404.0 423.0,388.0 430.3,404.0 437.7,388.0 445.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="423.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R2</tspan><tspan fill="#222" dx="6">调研B地</tspan></text>
+<text x="423.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=?</text>
+<rect x="538.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="613.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="591.0,404.0 598.3,388.0 605.7,404.0 613.0,388.0 620.3,404.0 627.7,388.0 635.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="613.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R3</tspan><tspan fill="#222" dx="6">对比差异</tspan></text>
+<text x="613.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=?</text>
+<rect x="728.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="803.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="781.0,404.0 788.3,388.0 795.7,404.0 803.0,388.0 810.3,404.0 817.7,388.0 825.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="803.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R4</tspan><tspan fill="#222" dx="6">算增长率</tspan></text>
+<text x="803.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=?</text>
+<rect x="918.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
+<text x="993.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
+<polyline points="971.0,404.0 978.3,388.0 985.7,404.0 993.0,388.0 1000.3,404.0 1007.7,388.0 1015.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<text x="993.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R5</tspan><tspan fill="#222" dx="6">投资建议</tspan></text>
+<text x="993.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=reasoner</text>
+<rect x="158.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="233.0" y="526.0" font-size="10" fill="#8e44ad" text-anchor="middle" font-weight="bold" letter-spacing="1">CAPACITOR</text>
+<line x1="233.0" y1="530.0" x2="233.0" y2="543.0" stroke="#8e44ad" stroke-width="2.5"/><line x1="215.0" y1="543.0" x2="251.0" y2="543.0" stroke="#8e44ad" stroke-width="3"/><line x1="215.0" y1="549.0" x2="251.0" y2="549.0" stroke="#8e44ad" stroke-width="3"/><line x1="233.0" y1="549.0" x2="233.0" y2="562.0" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="233.0" y="576.0" font-size="13" fill="#8e44ad" text-anchor="middle"><tspan font-weight="bold" fill="#8e44ad">C1</tspan><tspan fill="#222" dx="6">左汇合</tspan></text>
+<rect x="348.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="423.0" y="526.0" font-size="10" fill="#8e44ad" text-anchor="middle" font-weight="bold" letter-spacing="1">CAPACITOR</text>
+<line x1="423.0" y1="530.0" x2="423.0" y2="543.0" stroke="#8e44ad" stroke-width="2.5"/><line x1="405.0" y1="543.0" x2="441.0" y2="543.0" stroke="#8e44ad" stroke-width="3"/><line x1="405.0" y1="549.0" x2="441.0" y2="549.0" stroke="#8e44ad" stroke-width="3"/><line x1="423.0" y1="549.0" x2="423.0" y2="562.0" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="423.0" y="576.0" font-size="13" fill="#8e44ad" text-anchor="middle"><tspan font-weight="bold" fill="#8e44ad">C2</tspan><tspan fill="#222" dx="6">右汇合</tspan></text>
+<rect x="158.0" y="660.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="233.0" y="676.0" font-size="10" fill="#8e44ad" text-anchor="middle" font-weight="bold" letter-spacing="1">CAPACITOR</text>
+<line x1="233.0" y1="680.0" x2="233.0" y2="693.0" stroke="#8e44ad" stroke-width="2.5"/><line x1="215.0" y1="693.0" x2="251.0" y2="693.0" stroke="#8e44ad" stroke-width="3"/><line x1="215.0" y1="699.0" x2="251.0" y2="699.0" stroke="#8e44ad" stroke-width="3"/><line x1="233.0" y1="699.0" x2="233.0" y2="712.0" stroke="#8e44ad" stroke-width="2.5"/>
+<text x="233.0" y="726.0" font-size="13" fill="#8e44ad" text-anchor="middle"><tspan font-weight="bold" fill="#8e44ad">C3</tspan><tspan fill="#222" dx="6">总汇合</tspan></text>
+<rect x="158.0" y="810.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#d35400" stroke-width="2.5"/>
+<text x="233.0" y="826.0" font-size="10" fill="#d35400" text-anchor="middle" font-weight="bold" letter-spacing="1">DIODE</text>
+<polygon points="217.0,832.0 217.0,860.0 247.0,846.0" fill="none" stroke="#d35400" stroke-width="2.5"/><line x1="247.0" y1="832.0" x2="247.0" y2="860.0" stroke="#d35400" stroke-width="3"/>
+<text x="233.0" y="876.0" font-size="13" fill="#d35400" text-anchor="middle"><tspan font-weight="bold" fill="#d35400">D1</tspan><tspan fill="#222" dx="6">方向校验</tspan></text>
+<rect x="158.0" y="960.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#16a085" stroke-width="2.5"/>
+<text x="233.0" y="976.0" font-size="10" fill="#16a085" text-anchor="middle" font-weight="bold" letter-spacing="1">ADC</text>
+<rect x="211.0" y="980.0" width="44" height="32" rx="4" fill="none" stroke="#16a085" stroke-width="2.5"/><text x="233.0" y="1001.0" font-size="13" fill="#16a085" text-anchor="middle" font-weight="bold">ADC</text>
+<text x="233.0" y="1026.0" font-size="13" fill="#16a085" text-anchor="middle"><tspan font-weight="bold" fill="#16a085">ADC1</tspan><tspan fill="#222" dx="6">质量评估</tspan></text>
+<text x="233.0" y="1038.0" font-size="9" fill="#888" text-anchor="middle">thr=0.7</text>
+<rect x="158.0" y="1110.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#7f8c8d" stroke-width="2.5"/>
+<text x="233.0" y="1126.0" font-size="10" fill="#7f8c8d" text-anchor="middle" font-weight="bold" letter-spacing="1">WATCHDOG</text>
+<rect x="211.0" y="1130.0" width="44" height="32" rx="4" fill="none" stroke="#7f8c8d" stroke-width="2.5"/><text x="233.0" y="1151.0" font-size="12" fill="#7f8c8d" text-anchor="middle" font-weight="bold">WD</text>
+<text x="233.0" y="1176.0" font-size="13" fill="#7f8c8d" text-anchor="middle"><tspan font-weight="bold" fill="#7f8c8d">W1</tspan><tspan fill="#222" dx="6">看门狗</tspan></text>
+<text x="561.0" y="24" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">多源并行分析电路（真电路感）</text>
+<line x1="28" y1="100.0" x2="28" y2="1150.0" stroke="#8e44ad" stroke-width="4" stroke-linecap="round"/>
+<line x1="28" y1="100.0" x2="158.0" y2="100.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="250.0" x2="158.0" y2="250.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="400.0" x2="158.0" y2="400.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="400.0" x2="348.0" y2="400.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="400.0" x2="538.0" y2="400.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="400.0" x2="728.0" y2="400.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="400.0" x2="918.0" y2="400.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="550.0" x2="158.0" y2="550.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="700.0" x2="158.0" y2="700.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="850.0" x2="158.0" y2="850.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="1000.0" x2="158.0" y2="1000.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<line x1="28" y1="1150.0" x2="158.0" y2="1150.0" stroke="#8e44ad" stroke-width="1.6" stroke-dasharray="3 3"/>
+<text x="28" y="86.0" font-size="11" fill="#8e44ad" text-anchor="middle" transform="rotate(-90 28 86.0)">共享上下文总线</text>
+</svg>

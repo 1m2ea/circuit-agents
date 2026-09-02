@@ -15,35 +15,35 @@
 <rect x="80.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#c0392b" stroke-width="2.5"/>
 <text x="155.0" y="76.0" font-size="10" fill="#c0392b" text-anchor="middle" font-weight="bold" letter-spacing="1">POWER</text>
 <line x1="142.0" y1="83.0" x2="168.0" y2="83.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="92.0" x2="162.0" y2="92.0" stroke="#c0392b" stroke-width="3"/><line x1="142.0" y1="101.0" x2="168.0" y2="101.0" stroke="#c0392b" stroke-width="3"/><line x1="148.0" y1="110.0" x2="162.0" y2="110.0" stroke="#c0392b" stroke-width="3"/>
-<text x="155.0" y="126.0" font-size="12" fill="#222" text-anchor="middle">任务</text>
+<text x="155.0" y="126.0" font-size="13" fill="#c0392b" text-anchor="middle"><tspan font-weight="bold" fill="#c0392b">P1</tspan><tspan fill="#222" dx="6">任务</tspan></text>
 <rect x="270.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#e67e22" stroke-width="2.5"/>
 <text x="345.0" y="76.0" font-size="10" fill="#e67e22" text-anchor="middle" font-weight="bold" letter-spacing="1">SOURCE</text>
 <circle cx="345.0" cy="96.0" r="17" fill="none" stroke="#e67e22" stroke-width="2.5"/><text x="345.0" y="101.0" font-size="14" fill="#e67e22" text-anchor="middle" font-weight="bold">&#9673;</text>
-<text x="345.0" y="126.0" font-size="12" fill="#222" text-anchor="middle">文本输入</text>
+<text x="345.0" y="126.0" font-size="13" fill="#e67e22" text-anchor="middle"><tspan font-weight="bold" fill="#e67e22">SRC1</tspan><tspan fill="#222" dx="6">文本输入</tspan></text>
 <text x="345.0" y="138.0" font-size="9" fill="#888" text-anchor="middle">q=0.9</text>
 <rect x="460.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#e67e22" stroke-width="2.5"/>
 <text x="535.0" y="76.0" font-size="10" fill="#e67e22" text-anchor="middle" font-weight="bold" letter-spacing="1">SOURCE</text>
 <circle cx="535.0" cy="96.0" r="17" fill="none" stroke="#e67e22" stroke-width="2.5"/><text x="535.0" y="101.0" font-size="14" fill="#e67e22" text-anchor="middle" font-weight="bold">&#9673;</text>
-<text x="535.0" y="126.0" font-size="12" fill="#222" text-anchor="middle">图像输入</text>
+<text x="535.0" y="126.0" font-size="13" fill="#e67e22" text-anchor="middle"><tspan font-weight="bold" fill="#e67e22">SRC2</tspan><tspan fill="#222" dx="6">图像输入</tspan></text>
 <text x="535.0" y="138.0" font-size="9" fill="#888" text-anchor="middle">q=0.8</text>
 <rect x="650.0" y="60.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#e67e22" stroke-width="2.5"/>
 <text x="725.0" y="76.0" font-size="10" fill="#e67e22" text-anchor="middle" font-weight="bold" letter-spacing="1">SOURCE</text>
 <circle cx="725.0" cy="96.0" r="17" fill="none" stroke="#e67e22" stroke-width="2.5"/><text x="725.0" y="101.0" font-size="14" fill="#e67e22" text-anchor="middle" font-weight="bold">&#9673;</text>
-<text x="725.0" y="126.0" font-size="12" fill="#222" text-anchor="middle">表格输入</text>
+<text x="725.0" y="126.0" font-size="13" fill="#e67e22" text-anchor="middle"><tspan font-weight="bold" fill="#e67e22">SRC3</tspan><tspan fill="#222" dx="6">表格输入</tspan></text>
 <text x="725.0" y="138.0" font-size="9" fill="#888" text-anchor="middle">q=0.95</text>
 <rect x="80.0" y="210.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#2c3e50" stroke-width="2.5"/>
 <text x="155.0" y="226.0" font-size="10" fill="#2c3e50" text-anchor="middle" font-weight="bold" letter-spacing="1">BRIDGE</text>
 <rect x="129.0" y="230.0" width="52" height="32" rx="4" fill="none" stroke="#2c3e50" stroke-width="2.5"/><text x="155.0" y="251.0" font-size="10" fill="#2c3e50" text-anchor="middle" font-weight="bold">BRIDGE</text>
-<text x="155.0" y="276.0" font-size="12" fill="#222" text-anchor="middle">整流桥</text>
+<text x="155.0" y="276.0" font-size="13" fill="#2c3e50" text-anchor="middle"><tspan font-weight="bold" fill="#2c3e50">BR1</tspan><tspan fill="#222" dx="6">整流桥</tspan></text>
 <rect x="80.0" y="360.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#27ae60" stroke-width="2.5"/>
 <text x="155.0" y="376.0" font-size="10" fill="#27ae60" text-anchor="middle" font-weight="bold" letter-spacing="1">RESISTOR</text>
 <polyline points="133.0,404.0 140.3,388.0 147.7,404.0 155.0,388.0 162.3,404.0 169.7,388.0 177.0,404.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
-<text x="155.0" y="426.0" font-size="12" fill="#222" text-anchor="middle">统一理解</text>
+<text x="155.0" y="426.0" font-size="13" fill="#27ae60" text-anchor="middle"><tspan font-weight="bold" fill="#27ae60">R1</tspan><tspan fill="#222" dx="6">统一理解</tspan></text>
 <text x="155.0" y="438.0" font-size="9" fill="#888" text-anchor="middle">model=large</text>
 <rect x="80.0" y="510.0" width="150" height="80" rx="10" fill="#ffffff" stroke="#16a085" stroke-width="2.5"/>
 <text x="155.0" y="526.0" font-size="10" fill="#16a085" text-anchor="middle" font-weight="bold" letter-spacing="1">ADC</text>
 <rect x="133.0" y="530.0" width="44" height="32" rx="4" fill="none" stroke="#16a085" stroke-width="2.5"/><text x="155.0" y="551.0" font-size="13" fill="#16a085" text-anchor="middle" font-weight="bold">ADC</text>
-<text x="155.0" y="576.0" font-size="12" fill="#222" text-anchor="middle">评估</text>
+<text x="155.0" y="576.0" font-size="13" fill="#16a085" text-anchor="middle"><tspan font-weight="bold" fill="#16a085">ADC1</tspan><tspan fill="#222" dx="6">评估</tspan></text>
 <text x="155.0" y="588.0" font-size="9" fill="#888" text-anchor="middle">thr=0.8</text>
 <text x="440.0" y="24" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">bridge-rectifier-multimodal</text>
 </svg>
