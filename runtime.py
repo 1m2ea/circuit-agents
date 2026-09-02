@@ -45,7 +45,7 @@ _WD_SAMPLES_CAP = 20
 # 整体锁接口冷却——瓶颈在「频率」不在「token 总量」，余额充足也照样被锁。
 # 因此加进程内全局双闸门：① 并发闸门压瞬时峰值 ② RPM 令牌桶压每分钟请求数。
 # 默认保守（并发 4、RPM 不限），可用环境变量或 configure() 热调整；上限设 1 即退化串行。
-CA_MAX_CONCURRENCY_DEFAULT = 4      # 全局同时飞行的 LLM 请求上限
+CA_MAX_CONCURRENCY_DEFAULT = 8      # 全局同时飞行的 LLM 请求上限（默认 8 路并行）
 CA_RPM_DEFAULT = 0                  # 每分钟请求数上限；0 = 只开并发闸门、不限频率
 RL_WINDOW_DEFAULT = 60.0            # RPM 滑窗长度（秒）；自检注入小窗加速验证
 RL_BACKOFF_BASE = 0.5               # 429 退避基数（秒）
@@ -55,7 +55,7 @@ RL_MAX_RETRIES = 3                  # 429/5xx 最大重试次数（超出则开�
 # 自适应拥塞控制（AIMD）：检测真后端反馈（429/Retry-After/延迟）实时调并发，
 # 保证不撞限制又做到限制下最大并行。CA_ADAPTIVE=0 则退回纯静态闸门。
 CA_ADAPTIVE_DEFAULT = 1             # 1=开自适应；0=纯静态（用 CA_MAX_CONCURRENCY/CA_RPM 原样）
-CA_ADAPTIVE_CEIL_DEFAULT = 16       # AIMD 硬上限（并发永不超此值，防失控）
+CA_ADAPTIVE_CEIL_DEFAULT = 8        # AIMD 硬上限（默认 8=与默认并发一致，并发永不超此值，防失控）
 RL_SUCCESS_WINDOW = 3               # 连续成功多少次才加性 +1 上探
 RL_LATENCY_THRESH = 1.5             # 单次延迟 > 基线×此值 → 领先指标，温和 −1
 RL_THROTTLE_COOLDOWN = 2.0          # 无 Retry-After 时的串行冷却窗口（秒）
