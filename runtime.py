@@ -1468,13 +1468,14 @@ class CircuitExecutor:
             "quality_report": quality_report,
             "skills_used": _skill_used,
             "model_selection": _model_recs,
+            "memory_hit": self.circuit.spec.get("memory_hit"),
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
             try:
                 from compiler.topology_memory import TopologyMemory
                 mem = TopologyMemory()
-                goal_desc = self.circuit.spec.get("description", "")
+                goal_desc = self.circuit.spec.get("goal_desc") or self.circuit.spec.get("description", "")
                 mem.record(goal_desc, self.circuit.spec, result)
             except Exception:
                 pass

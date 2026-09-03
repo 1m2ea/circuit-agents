@@ -75,6 +75,19 @@ class OllamaBackend(SimBackend):
     def _tier_cap(self, tier):
         return self._TIERS.get(tier, self._TIERS["small"])["accuracy"]
 
+    def _content_quality(self, content):
+        """内容打分（替代 tier_cap 先验，PORTABLE.md 6b.2）：本地真实模型用输出文本估质量。
+
+        非空 + 长度得分 → 真实非空文本（本地7B单节点输出偏短但常有解释）稳过 0.8 门限；
+        与 mentor.default_content_quality 同口径（0.78 + 0.22 * len_score，len_score=min(1,len/30)）。
+        避免把本地 7B 的真实输出质量压死在 tier_cap 先验（small=0.70），使任何优化都过不了质量门。
+        """
+        if not content or not str(content).strip():
+            return 0.0
+        text = str(content)
+        len_score = min(1.0, len(text) / 30.0)
+        return round(min(1.0, 0.78 + 0.22 * len_score), 3)
+
     @staticmethod
     def _render_value(v, depth=0):
         if v is None:
@@ -186,8 +199,12 @@ class OllamaBackend(SimBackend):
             dt = (time.time() - t0) * 1000.0
             content, finish, usage = self._parse_response(resp)
             ok = bool(content) and finish != "error"
-            cap = comp.get("accuracy", self._tier_cap(tier))
-            quality = cap if ok else 0.0
+            # 质量语义：默认用内容打分（真实本地模型输出估质量，PORTABLE.md 6b.2）；
+            # 若节点显式给了 accuracy 则尊重显式值（保留人工覆盖能力）。
+            if ok and comp.get("accuracy") is not None:
+                quality = float(comp.get("accuracy"))
+            else:
+                quality = self._content_quality(content) if ok else 0.0
             # 本地推理成本 = 0（无 API 费用）
             cost = 0.0
             self._stats["successes"] += 1
@@ -304,7 +321,8 @@ def ollama_backend_selftest():
     s = oll_native.run(comp, rins)
     assert s.ok is True, "native 模式应成功"
     assert s.value == "Ollama 本地产出", f"内容应映射: {s.value}"
-    assert s.quality == oll_native._tier_cap("small"), "质量应为 tier cap"
+    assert s.quality == oll_native._content_quality("Ollama 本地产出"), \
+        "质量应为内容打分（PORTABLE.md 6b.2），非 tier_cap 先验"
     assert s.cost == 0.0, "本地推理成本应为 0"
     assert s.meta["backend"] == "ollama", "应标记 backend=ollama"
     assert s.meta["model"] == "qwen2.5:7b"

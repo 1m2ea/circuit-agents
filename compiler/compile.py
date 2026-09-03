@@ -79,6 +79,8 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
             hit = mem.recall(goal.description)
             if hit is not None:
                 spec = dict(hit["spec"])
+                # 让本次复用运行以「当前 goal」落库，便于后续相似任务召回
+                spec["goal_desc"] = goal.description
                 spec["memory_hit"] = {
                     "score": hit["score"],
                     "original_goal": hit["original_goal"],
@@ -118,6 +120,7 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
             ms.apply_to_spec(spec)
         except Exception:
             pass  # 选型失败 → 沿用 Binder 结果（零回归）
+    spec["goal_desc"] = goal.description
     return spec
 
 
