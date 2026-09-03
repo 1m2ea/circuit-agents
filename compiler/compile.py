@@ -59,65 +59,6 @@ def _infer_evolve_requests(spec):
     return out
 
 
-def _weave_lessons(spec: dict, les_texts: list) -> None:
-    """② 第二圈：把教训文本织进 spec 与每个电阻组件。
-
-    comp["memory_lessons"] 由后端 _lessons_block 转成提示词块——教训因此真正
-    进入模型上下文，而非只躺在 spec 里机器可读。最多取前 3 条。
-    """
-    texts = [str(t).strip() for t in (les_texts or []) if str(t).strip()][:3]
-    if not texts:
-        return
-    spec["memory_lessons"] = texts
-    for c in (spec.get("components") or {}).values():
-        if isinstance(c, dict) and c.get("type") == "resistor":
-            c["memory_lessons"] = texts
-
-
-def _ensure_hetero_verify(spec: dict) -> dict:
-    """③ VERIFY_* 已配置时，在终端 adc 前自动插 verify#quality 电阻节点。
-
-    质量门由此走独立后端（真异构）——runtime._backend_for 按 label 前缀
-    `verify` 路由到 verify_backend。幂等（已有 verify 节点则跳过）；
-    未配置 VERIFY_* / 无 adc / 异常 → 原样返回（零回归）。
-    """
-    try:
-        from .backend_llm import resolve_verify_backend
-        if resolve_verify_backend() is None:
-            return spec
-    except Exception:
-        return spec
-    try:
-        comps = spec.get("components") or {}
-        if any(isinstance(c, dict) and str(c.get("label", "")).split("#")[0] == "verify"
-               for c in comps.values()):
-            return spec  # 已有异构校验节点
-        if "adc" not in comps:
-            return spec
-        prevs = [w[0] for w in spec.get("wires", [])
-                 if len(w) == 2 and w[1] == "adc" and w[0] != "adc"]
-        if not prevs:
-            return spec
-        kept = [w for w in spec.get("wires", [])
-                if not (len(w) == 2 and w[1] == "adc" and w[0] != "adc")]
-        comps["vq"] = {"type": "resistor", "label": "verify#quality",
-                       "model": "tool", "recovery": 0.0,
-                       "required_inputs": [],
-                       "produced_outputs": ["verify_verdict"]}
-        # 教训织入发生在本函数之前（compile_goal 先 weave 后插节点），
-        # vq 是新节点须显式继承，否则校验节点反而看不到历史踩坑。
-        if spec.get("memory_lessons"):
-            comps["vq"]["memory_lessons"] = list(spec["memory_lessons"])
-        for p in prevs:
-            kept.append([p, "vq"])
-        kept.append(["vq", "adc"])
-        spec["wires"] = kept
-        spec["hetero_verify"] = True   # 观察窗/复盘可见
-    except Exception:
-        pass
-    return spec
-
-
 def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
                  no_adapters: bool = False, memory_enabled: bool = True,
                  auto_select_models: bool = False) -> dict:
@@ -145,11 +86,6 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
                     "original_goal": hit["original_goal"],
                     "quality": hit["quality"],
                 }
-                # ② 第二圈：教训随拓扑带出并织进电阻组件（提示词将携带）
-                _weave_lessons(spec, [l.get("text", "") for l in (hit.get("lessons") or [])
-                                      if isinstance(l, dict)])
-                # ③ VERIFY_* 已配置 → 自动插真异构校验节点（幂等）
-                _ensure_hetero_verify(spec)
                 spec["binder_report"] = None
                 # 仍重新推断 evolve_requests（记忆里的可能过时）
                 spec["evolve_requests"] = _infer_evolve_requests(spec)
@@ -169,17 +105,6 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
         spec = Netlister().compile(goal)
     spec["binder_report"] = report
     spec["evolve_requests"] = _infer_evolve_requests(spec)  # ① 规划器自动产出
-    # ② 第二圈：新编译同样召回教训、织进电阻组件（提示词将携带）
-    if memory_enabled:
-        try:
-            from .topology_memory import TopologyMemory
-            _les = [l.get("text", "")
-                    for l in TopologyMemory().recall_lessons(goal.description)]
-        except Exception:
-            _les = []
-        _weave_lessons(spec, _les)
-    # ③ VERIFY_* 已配置 → 自动插真异构校验节点（幂等、未配置零回归）
-    _ensure_hetero_verify(spec)
     # D 人机协同：目标含"人工/人审/需确认/需审核"→ spec 标 human_intervention=True
     import re as _re
     if _re.search(r"(人工|人审|需确认|需审核|人工介入|human.{0,4}review)", goal.description or ""):
