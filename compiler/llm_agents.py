@@ -474,6 +474,8 @@ class LLMAgentBackend(RealLLMBackend):
         user = f"Step[{cap or label}]: {label}\n"
         if ctx:
             user += "上游上下文:\n" + "\n".join(f"- {c}" for c in ctx) + "\n"
+        # ② 第二圈：历史教训随提示词注入（与父类 RealLLMBackend._lessons_block 同源）
+        user += self._lessons_block(comp)
         # 线性关系契约（用户核心诉求：每个电阻都要会判断自己的线性关系）：
         # 把该节点声明的『必要输入 / 产出产物』写进 user，让电阻 agent 也意识到自己的
         # 数据依赖契约——上游若没给齐，应显式说明「依赖输入缺失」而非硬凑（确定性闸在 runtime）。
