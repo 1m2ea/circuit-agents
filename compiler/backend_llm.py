@@ -104,14 +104,7 @@ def resolve_verify_backend():
     base = (os.environ.get("VERIFY_API_BASE")
             or os.environ.get("VERIFY_OPENAI_BASE_URL"))
     from compiler.llm_agents import LLMAgentBackend
-    backend = LLMAgentBackend(api_key=key.strip().lstrip("\ufeff"), base_url=base)
-    # verify 后端常见形态是本地/慢速模型：默认 60s 传输超时不够
-    # （实测本地 1.5B CPU 生成也会超）→ VERIFY_TIMEOUT 可调，默认 300s。
-    try:
-        backend.timeout = float(os.environ.get("VERIFY_TIMEOUT", "300"))
-    except (TypeError, ValueError):
-        backend.timeout = 300.0
-    return backend
+    return LLMAgentBackend(api_key=key.strip().lstrip("\ufeff"), base_url=base)
 
 # 每 1K token 的近似单价（USD）：仅用于成本估计，非账单级精确
 _PER_1K_COST = {
@@ -191,22 +184,6 @@ class RealLLMBackend(SimBackend):
                              for x in v if x is not None)
         return str(v)
 
-    @staticmethod
-    def _lessons_block(comp):
-        """② 第二圈：把编译期织入的历史教训转成提示词块（最多 3 条，每条截 120 字）。
-
-        教训来自 TopologyMemory.recall_lessons（跨 run 持久化），经 compile 织进
-        comp["memory_lessons"]——让每个电阻在生成前就知道"这类任务踩过什么坑"。
-        """
-        lessons = comp.get("memory_lessons") or []
-        if not lessons:
-            return ""
-        items = [str(x).strip()[:120] for x in lessons[:3] if str(x).strip()]
-        if not items:
-            return ""
-        return ("历史教训（此前实测踩坑，必须遵守，不得重蹈覆辙）:\n"
-                + "\n".join(f"- {t}" for t in items) + "\n")
-
     def _build_messages(self, comp, inputs):
         ctx = []
         for s in inputs:
@@ -221,7 +198,6 @@ class RealLLMBackend(SimBackend):
         user = f"Step: {label}\n"
         if ctx:
             user += "Upstream context:\n" + "\n".join(f"- {c}" for c in ctx) + "\n"
-        user += self._lessons_block(comp)
         user += "Deliver the result now."
         return [{"role": "system", "content": system},
                 {"role": "user", "content": user}]

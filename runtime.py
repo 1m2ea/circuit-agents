@@ -707,7 +707,7 @@ class Circuit:
             return self.verify_backend
         return self.backend
 
-    def _run_one(self, cid, out):
+    def _run_one(self, cid, out, extra_inputs=None):
         """跑单个组件：先做『线性关系自测』(若有声明输入)，再调后端，
         并给产出信号打 produced_outputs 标供下游核对。
 
@@ -719,6 +719,10 @@ class Circuit:
         """
         comp = self.components[cid]
         ins = [out[p] for p in self.pred[cid] if p in out]
+        if extra_inputs:
+            # ① 静态技能派发：节点声明 skills 时，执行器先把技能结果合成信号注入。
+            #    纯增量：现有 spec 无 skills 字段 → extra_inputs 恒为 None，零回归。
+            ins = list(ins) + [s for s in extra_inputs if s is not None]
         req = comp.get("required_inputs")
         if req:
             input_map = comp.get("input_map") or {}   # 命名漂移符号映射表（转接头）
@@ -1166,6 +1170,38 @@ class CircuitExecutor:
                    ok=True, length=len(str(result)))
         return result
 
+    # ---- ① 静态技能派发：节点声明 skills=[...] 时，执行前先跑技能并注入为额外输入 ----
+    def _dispatch_declared_skills(self, cid: str, comp: dict):
+        """修复『工具孤儿化』：此前 dispatch 仅在 _auto_fill（fail_linear 兜底）被调，
+        节点正常执行路径从不派发技能——即便节点声明了 skills 也无人执行。
+
+        现把节点声明的 skills（str 或 {skill, args}）在执行前逐个跑一遍，
+        结果合成 Signal（quality=0.6，meta.declared_skill=True）作为额外输入喂给该节点。
+        纯增量：现有 spec 无 skills 字段 → 不触发，零回归。
+        """
+        sk = comp.get("skills")
+        if not sk:
+            return None
+        if isinstance(sk, (str, dict)):
+            sk = [sk]
+        synth = []
+        for item in sk:
+            if isinstance(item, dict):
+                name = item.get("skill")
+                args = item.get("args") or {}
+            else:
+                name, args = item, {}
+            if not name:
+                continue
+            try:
+                result = self.dispatch(cid, {"skill": name, "args": args})
+            except Exception:
+                continue
+            synth.append(Signal(value=result, quality=0.6, ok=True,
+                                meta={"produced_outputs": [f"skill:{name}"],
+                                      "declared_skill": True}))
+        return synth or None
+
     # ---- 自动补数据：对 missing 逐个派发 filler，写回 state._fetched ----
     def _auto_fill(self, cid: str, missing: list):
         comp = self.circuit.components[cid]
@@ -1306,7 +1342,8 @@ class CircuitExecutor:
                         _skip = True
                     # "proceed" 或其它 → 正常执行该节点
                 if not _skip:
-                    sig = self.circuit._run_one(cid, out)   # 现有线性关系闸 + backend.run
+                    _extra = self._dispatch_declared_skills(cid, comp)
+                    sig = self.circuit._run_one(cid, out, extra_inputs=_extra)   # 线性关系闸 + ①技能注入 + backend.run
                 if sig.meta.get("gate") == "fail_linear":
                     self._emit("gate_fail", node=cid,
                                missing=sig.meta.get("missing", []))
