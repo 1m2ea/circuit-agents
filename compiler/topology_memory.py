@@ -24,9 +24,9 @@ import threading
 import time
 
 # ⑥ 多任务并行：record/recall 可能被多个线程同时调用（BatchExecutor 并发执行）。
-# 该锁保护「读 _store + 写文件」的临界区，避免并发 record 互相覆盖丢数据、
-# 以及 recall 读到半写的 _store。细粒度（仅临界区），不影响单线程性能。
-_MEM_LOCK = threading.Lock()
+# RLock（可重入）而非 Lock：recall() 持锁期间会再调 recall_lessons()（② 教训召回），
+# 普通 Lock 同线程重入会死锁。细粒度（仅临界区），不影响单线程性能。
+_MEM_LOCK = threading.RLock()
 
 
 class TopologyMemory:
@@ -49,7 +49,7 @@ class TopologyMemory:
                         return data
             except Exception:
                 pass
-        return {"entries": []}
+        return {"entries": [], "lessons": []}
 
     def _save(self):
         try:
@@ -145,8 +145,65 @@ class TopologyMemory:
                     "score": round(best_score, 3),
                     "original_goal": best.get("goal_desc", ""),
                     "quality": best.get("result", {}).get("final_quality", 0),
+                    # ② 第二圈：教训随拓扑一起召回——复用历史成功经验的同时
+                    #    提醒执行方"这类任务踩过什么坑"。
+                    "lessons": self.recall_lessons(goal_desc),
                 }
             return None
+
+    # ---- ② 第二圈：教训库（不只存拓扑，还存"踩过的坑"，让错误不随进程蒸发）----
+    def record_lesson(self, text: str, tags: list | None = None) -> dict | None:
+        """记录一条经验教训（跨 run 持久化）。
+
+        与拓扑记录（entries，FIFO 100）分开存放：教训价值不随时间衰减，
+        故独立 FIFO 上限 200 条。零回归：任何异常静默返回 None。
+        """
+        try:
+            if not (text or "").strip():
+                return None
+            with _MEM_LOCK:
+                self._store = self._load()
+                lesson = {
+                    "text": text.strip()[:500],
+                    "tags": [str(t) for t in (tags or [])][:8],
+                    "timestamp": time.time(),
+                }
+                self._store.setdefault("lessons", []).append(lesson)
+                if len(self._store["lessons"]) > 200:
+                    self._store["lessons"] = self._store["lessons"][-200:]
+                self._save()
+            return lesson
+        except Exception:
+            return None
+
+    def recall_lessons(self, query: str, min_score: float = 0.1,
+                       top_k: int = 3) -> list:
+        """按关键词召回相关教训（Jaccard over 正文+tags），最相关的在前。
+
+        返回 [{"text", "tags", "score"}]，无命中返回 []。零回归：异常静默 []。
+        """
+        try:
+            q_words = set(self._tokenize(query))
+            if not q_words:
+                return []
+            with _MEM_LOCK:
+                self._store = self._load()
+                scored = []
+                for les in self._store.get("lessons", []):
+                    les_words = set(self._tokenize(les.get("text", ""))
+                                    ) | set(self._tokenize(" ".join(les.get("tags", []))))
+                    if not les_words:
+                        continue
+                    union = len(q_words | les_words)
+                    score = (len(q_words & les_words) / union) if union else 0.0
+                    if score >= min_score:
+                        scored.append({"text": les.get("text", ""),
+                                       "tags": les.get("tags", []),
+                                       "score": round(score, 3)})
+            scored.sort(key=lambda x: -x["score"])
+            return scored[:top_k]
+        except Exception:
+            return []
 
     def stats(self) -> dict:
         """返回记忆表统计（条数、成功率、平均质量）。"""
@@ -271,6 +328,21 @@ def selftest():
     assert len(mem3._store["entries"]) == 100, \
         f"FIFO 上限 100，实际 {len(mem3._store['entries'])}"
     print("✓ FIFO: 超过 100 条自动淘汰旧记录")
+
+    # 11) ② 教训库：record_lesson + recall_lessons + recall 附带 lessons
+    les = mem.record_lesson("retrieve 节点必须先检索真实源码再写设计，"
+                            "否则会幻觉出不存在的组件如 Redis",
+                            tags=["hallucination", "grounding"])
+    assert les is not None, "record_lesson 应返回 lesson"
+    got = mem.recall_lessons("retrieve 节点会不会幻觉出组件")
+    assert got and got[0]["score"] > 0.1, f"应召回教训，got {got}"
+    assert "幻觉" in got[0]["text"]
+    print(f"✓ 教训库: record_lesson + recall_lessons 命中（score={got[0]['score']}）")
+
+    hit7 = mem.recall("检索GDP数据并分析趋势")
+    assert hit7 is not None and isinstance(hit7.get("lessons"), list), \
+        "recall 结果应附带 lessons 字段（可为空列表）"
+    print(f"✓ 教训随召回: recall() 结果携带 lessons 字段（本次 {len(hit7['lessons'])} 条）")
 
     # 清理
     for p in (tmp,):

@@ -86,6 +86,10 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
                     "original_goal": hit["original_goal"],
                     "quality": hit["quality"],
                 }
+                # ② 第二圈：召回时随拓扑带出相关教训（历史踩坑），
+                #    教训不再随进程蒸发；经 spec 透传，供执行上下文/观察窗消费。
+                if hit.get("lessons"):
+                    spec["memory_lessons"] = hit["lessons"]
                 spec["binder_report"] = None
                 # 仍重新推断 evolve_requests（记忆里的可能过时）
                 spec["evolve_requests"] = _infer_evolve_requests(spec)
