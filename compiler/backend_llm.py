@@ -117,7 +117,7 @@ class RealLLMBackend(SimBackend):
     """真实 LLM 后端：resistor → OpenAI-compatible chat/completions；其余组件确定性。"""
 
     def __init__(self, rng=None, api_key=None, base_url=None, model_map=None,
-                 timeout=60.0, dry_run=False, http_post=None):
+                 timeout=60.0, dry_run=False, http_post=None, enable_tools=None):
         super().__init__(rng if rng is not None else random.Random(0))
         self.api_key = resolve_api_key(api_key)
         self.base_url = (base_url or os.environ.get("AGENT_API_BASE")
@@ -127,6 +127,31 @@ class RealLLMBackend(SimBackend):
         self.timeout = timeout
         self.dry_run = dry_run
         self._http_post = http_post   # 注入式：离线测试用假响应 / 计数
+        # ③ function calling：把 agent_skills.SKILLS 暴露为 tools，让模型自主决定调工具。
+        #    注册表本就带 description + JSON Schema parameters（function-calling 规格），
+        #    但此前从未接进后端——工具全程闲置，retrieve 节点只能凭参数知识硬编。
+        #    默认开；AGENT_TOOLS=0 可关；端点不认 tools 时自动降级重试一次。
+        if enable_tools is None:
+            enable_tools = os.environ.get("AGENT_TOOLS", "1") not in ("0", "false", "no")
+        self.enable_tools = bool(enable_tools)
+        self._tools = self._build_tools() if self.enable_tools else None
+        self._tools_downgraded = False
+
+    def _build_tools(self):
+        """从 SKILLS 注册表构建 OpenAI/DeepSeek function-calling tools 规格。"""
+        try:
+            from compiler.agent_skills import SKILLS
+        except Exception:
+            return None
+        tools = []
+        for name, spec in SKILLS.items():
+            tools.append({"type": "function", "function": {
+                "name": name,
+                "description": spec.get("description", ""),
+                "parameters": spec.get("parameters")
+                              or {"type": "object", "properties": {}},
+            }})
+        return tools or None
 
     # ---- 工具 ----
     def _resolve_model(self, tier):
@@ -217,6 +242,9 @@ class RealLLMBackend(SimBackend):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         body = {"model": model, "messages": messages, "temperature": 0.2}
+        if self._tools:
+            body["tools"] = self._tools
+            body["tool_choice"] = "auto"
 
         if self.dry_run:
             # 组装请求但不发送：返回带请求信息的 Signal，便于离线检视 prompt/形态
@@ -226,33 +254,108 @@ class RealLLMBackend(SimBackend):
                                 "request": body, "messages": messages})
 
         t0 = time.time()
-        RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
+        usage_acc = {}
+        tool_rounds = 0
+        calls_all = []
+        tools = self._tools
+        forced_final = False
         try:
-            resp = self._post_with_retry(
-                url, headers, body,
-                on_throttle=RATE_LIMITER.report_throttle,
-                on_success=RATE_LIMITER.report_success,
-            )
-            dt = (time.time() - t0) * 1000.0
-            choice = (resp.get("choices") or [{}])[0]
-            content = (choice.get("message") or {}).get("content", "") or ""
-            finish = choice.get("finish_reason", "")
-            usage = resp.get("usage") or {}
-            ok = bool(content) and finish != "error"
-            cap = comp.get("accuracy", self._tier_cap(tier))
-            quality = cap if ok else 0.0   # 已知近似：LLM 输出质量无法自动精确度量
-            cost = self._estimate_cost(model, usage)
-            return Signal(value=content, quality=quality, ok=ok,
-                          cost=cost, latency_ms=round(dt, 1),
-                          meta={"model": model, "tier": tier,
-                                "finish_reason": finish, "usage": usage})
-        except Exception as e:  # 网络/鉴权/超时等 → 开路（与 yield_fail 同语义）
+            try:
+                from compiler.agent_skills import execute_skill
+            except Exception:
+                execute_skill = None
+            # ③ 工具循环：模型决定调工具 → 本地 execute_skill 执行 → 回灌 tool 消息
+            #    → 继续，直到给出最终回答。轮数达上限(4)仍想调时，先执行完挂起调用
+            #    （保持消息序列合法），再【强制收口】：不带 tools 要一次最终交付——
+            #    否则模型把"Let me read..."式的中间独白当成品返回（实测踩坑）。
+            while True:
+                RATE_LIMITER.acquire()   # 全局双闸门：并发闸门压瞬时峰值 + RPM 令牌桶压频率
+                try:
+                    resp = self._post_with_retry(
+                        url, headers, body,
+                        on_throttle=RATE_LIMITER.report_throttle,
+                        on_success=RATE_LIMITER.report_success,
+                    )
+                finally:
+                    RATE_LIMITER.release()   # 成败都放行许可，绝不泄漏闸门
+                choice = (resp.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                calls = msg.get("tool_calls") or []
+                for k, v in (resp.get("usage") or {}).items():
+                    if isinstance(v, (int, float)):
+                        usage_acc[k] = usage_acc.get(k, 0) + v
+
+                want_more = bool(calls and execute_skill and not forced_final)
+                if want_more and tool_rounds < 4:
+                    # 正常工具轮
+                    messages.append({"role": "assistant",
+                                     "content": msg.get("content") or "",
+                                     "tool_calls": calls})
+                    for tc in calls:
+                        fn = tc.get("function") or {}
+                        try:
+                            result = execute_skill(fn.get("name") or "",
+                                                   fn.get("arguments") or "{}")
+                        except Exception as e:
+                            result = f"[skill 异常: {e}]"
+                        messages.append({"role": "tool",
+                                         "tool_call_id": tc.get("id") or "",
+                                         "content": result})
+                    tool_rounds += 1
+                    calls_all.extend(calls)
+                    body = {"model": model, "messages": messages, "temperature": 0.2}
+                    if tools:
+                        body["tools"] = tools
+                        body["tool_choice"] = "auto"
+                    continue
+                if want_more:
+                    # 达轮数上限仍想调 → 强制收口
+                    messages.append({"role": "assistant",
+                                     "content": msg.get("content") or "",
+                                     "tool_calls": calls})
+                    for tc in calls:
+                        fn = tc.get("function") or {}
+                        try:
+                            result = execute_skill(fn.get("name") or "",
+                                                   fn.get("arguments") or "{}")
+                        except Exception as e:
+                            result = f"[skill 异常: {e}]"
+                        messages.append({"role": "tool",
+                                         "tool_call_id": tc.get("id") or "",
+                                         "content": result})
+                    calls_all.extend(calls)
+                    tool_rounds += 1   # 挂起调用也已真实执行，计入轮数
+                    messages.append({"role": "user",
+                                     "content": ("工具调用已达上限。请基于以上工具返回的真实结果，"
+                                                 "直接给出本步骤的最终交付内容，不要再调用工具。")})
+                    body = {"model": model, "messages": messages, "temperature": 0.2}
+                    forced_final = True
+                    continue
+                # 最终交付（自然完成，或强制收口后的回答）
+                dt = (time.time() - t0) * 1000.0
+                content = msg.get("content", "") or ""
+                finish = choice.get("finish_reason", "")
+                ok = bool(content) and finish != "error"
+                cap = comp.get("accuracy", self._tier_cap(tier))
+                quality = cap if ok else 0.0   # 已知近似：LLM 输出质量无法自动精确度量
+                cost = self._estimate_cost(model, usage_acc)
+                meta = {"model": model, "tier": tier,
+                        "finish_reason": finish, "usage": usage_acc}
+                if tool_rounds:
+                    meta["tool_rounds"] = tool_rounds
+                    meta["tools_used"] = sorted(
+                        {c.get("function", {}).get("name", "?") for c in calls_all})
+                return Signal(value=content, quality=quality, ok=ok,
+                              cost=cost, latency_ms=round(dt, 1), meta=meta)
+        except Exception as e:  # 网络/鉴权/超时等 → 开路；端点不认 tools 则降级重试一次
+            if tools and not self._tools_downgraded:
+                self._tools_downgraded = True
+                self._tools = None
+                return self.run(comp, inputs)   # 降级重跑（此后不再带 tools）
             dt = (time.time() - t0) * 1000.0
             return Signal(value=None, quality=0.0, ok=False,
                           cost=0.0, latency_ms=round(dt, 1),
                           meta={"open": "http_error", "error": str(e)})
-        finally:
-            RATE_LIMITER.release()   # 成败都放行许可，绝不泄漏闸门
 
 
 # ---------------------------------------------------------------------------

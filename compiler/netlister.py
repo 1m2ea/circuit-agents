@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from .goal import VALID_TIERS, Goal
 
+# ① 检索类能力：编译期自动挂 query_db 技能（本地源码/文档检索），
+#    使 retrieve 节点真正读到项目代码而非凭参数知识硬编。
+_RETRIEVAL_CAPS = {"retrieve", "search", "research", "fetch"}
+
 
 class Netlister:
     def __init__(self, default_tier: str = "small"):
@@ -71,8 +75,16 @@ class Netlister:
         for i, cap in enumerate(goal.capabilities):
             rid = f"cap_{i}"
             tier = goal.tiers.get(cap, self.default_tier)
-            comps[rid] = {"type": "resistor", "label": cap, "model": tier,
-                          "recovery": goal.recovery}
+            comp = {"type": "resistor", "label": cap, "model": tier,
+                    "recovery": goal.recovery}
+            # ① 工具孤儿化修复：检索类节点自动挂技能——执行器在节点执行前主动派发
+            #    （CircuitExecutor._dispatch_declared_skills），把本地源码/文档检索的
+            #    真实结果注入上下文，杜绝凭参数知识编造（实测曾幻觉出不存在的 Redis）。
+            if cap.split("#")[0] in _RETRIEVAL_CAPS:
+                comp["skills"] = [{"skill": "query_db",
+                                   "args": {"query": (goal.description
+                                                      or goal.name or "")[:120]}}]
+            comps[rid] = comp
             wires.append([prev, rid])
             prev = rid
 
