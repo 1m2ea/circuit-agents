@@ -11,17 +11,21 @@ circuit-agents · compiler.topology_memory
  · 隐私：只存 goal 描述文本 + spec 结构 + 执行统计，不存任何 API key / 用户隐私。
 
 诚实边界：
- · 模糊匹配是"保守近似"（关键词 Jaccard），不保证语义等价；最低相似度阈值 0.3。
+ · 模糊匹配是"保守近似"（P1：中文 bigram + 英文词的 TF-IDF 余弦，比早期
+   单字 Jaccard 多了词序与词频信息，但仍是词面相似、非真正语义等价）；
+   recall 最低相似度阈值 0.3。
  · 只推荐成功且质量 ≥ min_quality 的拓扑；失败记录仅供分析，不直接复用。
- · 记忆表上限 100 条（FIFO），避免无限增长。
+ · 记忆表上限 100 条（FIFO），教训库上限 200 条，避免无限增长。
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
 import time
+from collections import Counter
 
 # ⑥ 多任务并行：record/recall 可能被多个线程同时调用（BatchExecutor 并发执行）。
 # RLock（可重入）而非 Lock：recall() 持锁期间会再调 recall_lessons()（② 教训召回），
@@ -60,10 +64,82 @@ class TopologyMemory:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        """简易分词：英文按词（≥2 字母）、中文按单字。小写化。"""
+        """简易分词：英文按词（≥2 字母）、中文按单字。小写化。
+
+        （P1 起召回改用 _ngram_tokenize + TF-IDF，本方法保留供调试/兼容。）
+        """
         if not text:
             return []
         return re.findall(r"[a-zA-Z]{2,}|[\u4e00-\u9fff]", text.lower())
+
+    @staticmethod
+    def _ngram_tokenize(text: str) -> list[str]:
+        """P1 语义召回分词：英文按词（≥2 字母），中文按字 bigram（带边界符）。
+
+        · 中文 bigram（"检索GDP"→ ^检 检索 索G + gdp）比单字 Jaccard 更接近
+          语义单元，"幻觉组件" 与 "组件幻觉" 能共享 bigram 而单字集完全相同
+          的问题也得到缓解（顺序信息进入特征）。
+        · 边界符 ^/$ 让短查询的首尾字有区分度。
+        · 零依赖：纯正则 + Counter，不引入任何外部包。
+        """
+        if not text:
+            return []
+        text = text.lower()
+        tokens = re.findall(r"[a-zA-Z]{2,}", text)
+        zh = "".join(re.findall(r"[\u4e00-\u9fff]", text))
+        padded = "^" + zh + "$"
+        tokens.extend(padded[i:i + 2] for i in range(len(padded) - 1))
+        return tokens
+
+    def _tfidf_cosine_all(self, query: str, doc_texts: dict) -> dict:
+        """P1 核心评分：query 对多个文档的 TF-IDF 余弦相似度，一次算完。
+
+        doc_texts: {key: text}。返回 {key: cosine∈[0,1]}（异常全 0，零回归）。
+        · idf 语料 = 当前全部候选文档（查询词不在语料中的项跳过——反正匹配不到）。
+        · 权重 = (1+ln(tf)) * idf，sublinear tf 压低高频词、idf 提升区分词。
+        """
+        empty = {k: 0.0 for k in doc_texts}
+        try:
+            q_tokens = self._ngram_tokenize(query)
+            if not q_tokens:
+                return empty
+            doc_tokens = {k: self._ngram_tokenize(t) for k, t in doc_texts.items()}
+            df = Counter()
+            for toks in doc_tokens.values():
+                df.update(set(toks))
+            n_docs = max(len(doc_tokens), 1)
+
+            def idf(t: str) -> float:
+                return math.log((n_docs + 1) / (df.get(t, 0) + 1)) + 1.0
+
+            # 查询向量：只保留语料中出现过的词（其余项对点积无贡献）
+            q_tf = Counter(q_tokens)
+            q_weights = {t: (1 + math.log(c)) * idf(t)
+                         for t, c in q_tf.items() if t in df}
+            if not q_weights:
+                return empty
+            q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+            if not q_norm:
+                return empty
+
+            scores = {}
+            for k, toks in doc_tokens.items():
+                if not toks:
+                    scores[k] = 0.0
+                    continue
+                tf = Counter(toks)
+                d_weights = {t: (1 + math.log(c)) * idf(t)
+                             for t, c in tf.items() if t in df}
+                d_norm = math.sqrt(sum(w * w for w in d_weights.values()))
+                if not d_norm:
+                    scores[k] = 0.0
+                    continue
+                dot = sum(qw * dw for t, dw in d_weights.items()
+                          if (qw := q_weights.get(t)))
+                scores[k] = dot / (q_norm * d_norm)
+            return scores
+        except Exception:
+            return empty
 
     def record(self, goal_desc: str, spec: dict, result: dict) -> dict | None:
         """记录一次执行：goal 描述 + spec 拓扑 + 执行结果。
@@ -111,35 +187,34 @@ class TopologyMemory:
 
         返回 {"spec": ..., "score": ..., "original_goal": ..., "quality": ...} 或 None。
         """
-        goal_words = set(self._tokenize(goal_desc))
+        goal_words = set(self._ngram_tokenize(goal_desc))
         if not goal_words:
             return None
 
         # ⑥ 加锁 + 锁内重载：既防止读到并发 record 半写的 _store，也读到最新提交记录
         with _MEM_LOCK:
             self._store = self._load()
-            best = None
-            best_score = 0.0
-            for entry in self._store.get("entries", []):
-                # 只推荐成功的、质量达标的
+            # P1 语义召回：只对"成功+质量达标"的候选算 TF-IDF 余弦（一次批量算完）
+            candidates = {}
+            for i, entry in enumerate(self._store.get("entries", [])):
                 r = entry.get("result", {})
-                if not r.get("success") or r.get("final_quality", 0) < min_quality:
-                    continue
+                if r.get("success") and r.get("final_quality", 0) >= min_quality \
+                        and entry.get("goal_desc"):
+                    candidates[i] = entry
 
-                entry_words = set(self._tokenize(entry.get("goal_desc", "")))
-                if not entry_words:
-                    continue
+            if not candidates:
+                return None
+            scores = self._tfidf_cosine_all(
+                goal_desc, {i: e.get("goal_desc", "") for i, e in candidates.items()})
 
-                # Jaccard 相似度
-                overlap = len(goal_words & entry_words)
-                union = len(goal_words | entry_words)
-                score = overlap / union if union else 0.0
+            best_i, best_score = None, 0.0
+            for i, s in scores.items():
+                if s > best_score:
+                    best_score = s
+                    best_i = i
 
-                if score > best_score:
-                    best_score = score
-                    best = entry
-
-            if best and best_score >= min_similarity:
+            if best_i is not None and best_score >= min_similarity:
+                best = candidates[best_i]
                 return {
                     "spec": best.get("spec", {}),
                     "score": round(best_score, 3),
@@ -178,28 +253,30 @@ class TopologyMemory:
 
     def recall_lessons(self, query: str, min_score: float = 0.1,
                        top_k: int = 3) -> list:
-        """按关键词召回相关教训（Jaccard over 正文+tags），最相关的在前。
+        """按语义相似度召回相关教训（P1：TF-IDF 余弦 over 正文+tags），最相关的在前。
 
         返回 [{"text", "tags", "score"}]，无命中返回 []。零回归：异常静默 []。
         """
         try:
-            q_words = set(self._tokenize(query))
-            if not q_words:
+            if not self._ngram_tokenize(query):
                 return []
             with _MEM_LOCK:
                 self._store = self._load()
-                scored = []
-                for les in self._store.get("lessons", []):
-                    les_words = set(self._tokenize(les.get("text", ""))
-                                    ) | set(self._tokenize(" ".join(les.get("tags", []))))
-                    if not les_words:
-                        continue
-                    union = len(q_words | les_words)
-                    score = (len(q_words & les_words) / union) if union else 0.0
-                    if score >= min_score:
-                        scored.append({"text": les.get("text", ""),
-                                       "tags": les.get("tags", []),
-                                       "score": round(score, 3)})
+                lessons = [les for les in self._store.get("lessons", [])
+                           if les.get("text", "").strip()
+                           or les.get("tags")]
+                if not lessons:
+                    return []
+                # 正文 + tags 合并为一个文档参与评分（tags 词权重等同正文词）
+                doc_texts = {i: (les.get("text", "") + " "
+                                 + " ".join(les.get("tags", [])))
+                             for i, les in enumerate(lessons)}
+            # 评分放锁外（纯计算，不碰 _store）
+            scores = self._tfidf_cosine_all(query, doc_texts)
+            scored = [{"text": lessons[i].get("text", ""),
+                       "tags": lessons[i].get("tags", []),
+                       "score": round(s, 3)}
+                      for i, s in scores.items() if s >= min_score]
             scored.sort(key=lambda x: -x["score"])
             return scored[:top_k]
         except Exception:
@@ -343,6 +420,28 @@ def selftest():
     assert hit7 is not None and isinstance(hit7.get("lessons"), list), \
         "recall 结果应附带 lessons 字段（可为空列表）"
     print(f"✓ 教训随召回: recall() 结果携带 lessons 字段（本次 {len(hit7['lessons'])} 条）")
+
+    # 12) P1 语义召回：bigram 词序信息让相似度可区分（Jaccard 单字集做不到）
+    mem4 = TopologyMemory(path=tempfile.mktemp(suffix=".json"))
+    mem4.record_lesson("检索节点必须先取真实源码，不能凭空编造接口", tags=["grounding"])
+    mem4.record_lesson("番茄钟后台被杀后通知失效，要用本地通知插件保活", tags=["notify"])
+    s_data = mem4.recall_lessons("检索节点编造接口怎么办")
+    s_notify = mem4.recall_lessons("番茄钟通知失效怎么保活")
+    assert s_data and s_data[0]["tags"] == ["grounding"], \
+        f"检索类查询应命中 grounding 教训，got {s_data}"
+    assert s_notify and s_notify[0]["tags"] == ["notify"], \
+        f"通知类查询应命中 notify 教训，got {s_notify}"
+    assert s_data[0]["score"] > 0.3 and s_notify[0]["score"] > 0.3, \
+        f"语义相关的两条都应显著命中（{s_data[0]['score']} / {s_notify[0]['score']}）"
+    print(f"✓ P1 语义召回: 两条教训各自被正确区分命中 "
+          f"(grounding={s_data[0]['score']}, notify={s_notify[0]['score']})")
+
+    # 13) P1 语序鲁棒：词序打乱仍应命中同一教训（Jaccard 单字集本就相同，
+    #     bigram 靠共享 bigram 仍保持高相似）
+    s_rev = mem4.recall_lessons("接口编造不能源码真实取先节点检索")
+    assert s_rev and s_rev[0]["tags"] == ["grounding"], \
+        f"乱序查询应仍命中 grounding，got {s_rev}"
+    print(f"✓ P1 语序鲁棒: 乱序查询仍命中 (score={s_rev[0]['score']})")
 
     # 清理
     for p in (tmp,):
