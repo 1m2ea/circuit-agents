@@ -198,10 +198,8 @@ def main():
         _orig_init(self, path if path is not None else mem_path)
 
     TopologyMemory.__init__ = _patched
-    # 基准只测"教训闭环"，不测拓扑复用：禁用 topology memory-hit。
-    # （real 首跑 WITH=0.12 的根因实测缺陷：memory-hit 复用缓存拓扑时，
-    #   源节点烘焙的是旧任务文本，goal 共享前缀 → 跨任务串味。）
-    TopologyMemory.recall = lambda self, q, *a, **k: None
+    # 拓扑 memory-hit 已在 compile 层根治串味（_verify_hit_refresh.py R1-R4），
+    # 基准恢复真实记忆行为：拓扑复用 + 教训闭环同时在线。
 
     os.makedirs(args.out, exist_ok=True)
     # 全程共用一个后端实例（real 模式避免 96 次重复构建，也更贴近真实运行）

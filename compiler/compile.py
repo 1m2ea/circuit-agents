@@ -153,7 +153,20 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
             mem = TopologyMemory()
             hit = mem.recall(goal.description)
             if hit is not None:
-                spec = dict(hit["spec"])
+                import copy as _copy
+                # 根治「memory-hit 串味」（2026-09-06 real 基准首跑定位，WITH=0.12 根因）：
+                # ① 缓存 spec 必须 deepcopy——record 存的是执行时 spec 的引用，
+                #    浅拷贝下对组件的任何改写（织教训/插校验节点/重打参数）都会
+                #    泄漏回记忆库污染历史条目；
+                # ② 电源节点烘焙的 task/label 是旧任务的真·描述
+                #    （netlister._prefix：task=goal.description），goal 共享前缀
+                #    跨任务命中时，LLM 收到的上游上下文仍是旧任务文本
+                #    → 复用必须以当前 goal 重新参数化任务字段。
+                spec = _copy.deepcopy(hit["spec"])
+                for c in (spec.get("components") or {}).values():
+                    if isinstance(c, dict) and c.get("type") == "power":
+                        c["task"] = goal.description or "自动编译目标"
+                        c["label"] = goal.name or "任务"
                 # 让本次复用运行以「当前 goal」落库，便于后续相似任务召回
                 spec["goal_desc"] = goal.description
                 spec["memory_hit"] = {
