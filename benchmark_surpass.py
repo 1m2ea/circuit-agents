@@ -48,24 +48,26 @@ from compiler.topology_memory import TopologyMemory
 # ---------------------------------------------------------------------------
 TRANSLATION_TASKS = [
     {"id": "t1", "src": "The resistor limits current in the circuit.",
-     "gold_term": "电阻", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电阻", "decoy": "阻抗", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t2", "src": "The capacitor stores electric charge temporarily.",
-     "gold_term": "电容", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电容", "decoy": "", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t3", "src": "The inductor opposes changes in current.",
-     "gold_term": "电感", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电感", "decoy": "感应线圈", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t4", "src": "The diode allows current to flow in one direction.",
-     "gold_term": "二极管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "二极管", "decoy": "整流管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t5", "src": "The transistor amplifies the input signal.",
-     "gold_term": "晶体管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "晶体管", "decoy": "三极管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t6", "src": "The oscillator generates a periodic waveform.",
-     "gold_term": "振荡器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "振荡器", "decoy": "振动器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t7", "src": "The transformer couples energy between coils.",
-     "gold_term": "变压器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "变压器", "decoy": "转换器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t8", "src": "The gate drives the power switch with pwm.",
-     "gold_term": "栅极", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "栅极", "decoy": "门电路", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
 ]
 
-ADC_THRESHOLD = 0.8  # 质量门：未命中关键术语(质量 0.3) → 失败 → 沉淀教训
+# 质量门 0.5：real 后端的质量是档位帽先验（small≈0.7，0.8 会虚假失败）；
+# 0.5 仍能让 lesson-sim 未命中(0.3)失败沉淀教训。
+ADC_THRESHOLD = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +111,14 @@ def make_backend(mode: str) -> object:
     if mode == "sim":
         return rt.SimBackend(random.Random(0))
     if mode == "real":
-        key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        ds = os.environ.get("DEEPSEEK_API_KEY")
+        key = ds or os.environ.get("OPENAI_API_KEY")
         if not key:
-            raise SystemExit("real 模式需要 DEEPSEEK_API_KEY / OPENAI_API_KEY")
-        return RealLLMBackend(api_key=key, base_url=os.environ.get("AGENT_API_BASE"))
+            raise SystemExit("real 模式需要 DEEPSEEK_API_KEY / OPENAI_API_KEY（系统环境变量）")
+        # DeepSeek key 自动路由 DeepSeek 域（否则默认打到 api.openai.com 必 401）
+        base = (os.environ.get("AGENT_API_BASE") or os.environ.get("OPENAI_BASE_URL")
+                or ("https://api.deepseek.com/v1" if ds else None))
+        return RealLLMBackend(api_key=key, base_url=base, enable_tools=False)
     raise SystemExit(f"未知 backend: {mode}")
 
 
@@ -121,7 +127,10 @@ def make_backend(mode: str) -> object:
 # ---------------------------------------------------------------------------
 def run_task(task: dict, backend, memory_enabled: bool, mem_path: str,
              captured: dict) -> dict:
-    goal = Goal(capabilities=["translate"], description=task["goal"])
+    # 每任务独立 goal_desc（含原句）：seed 教训文本含原句 → 语义召回精确命中
+    # 本任务自己的偏好，注入不被其它任务挤占
+    goal_desc = f"{task['goal']}｜{task['src']}"
+    goal = Goal(capabilities=["translate"], description=goal_desc)
     spec = compile_goal(goal, memory_enabled=memory_enabled)
     # 后处理：把测试元数据与质量门钉死
     for c in spec.get("components", {}).values():
@@ -130,7 +139,7 @@ def run_task(task: dict, backend, memory_enabled: bool, mem_path: str,
             c["src_text"] = task["src"]
         if isinstance(c, dict) and c.get("type") == "adc":
             c["threshold"] = ADC_THRESHOLD
-    spec["goal_desc"] = task["goal"]
+    spec["goal_desc"] = goal_desc
 
     ex = CircuitExecutor(
         Circuit(spec, backend),
@@ -144,8 +153,10 @@ def run_task(task: dict, backend, memory_enabled: bool, mem_path: str,
     for cid, sig in captured.items():
         comp = spec.get("components", {}).get(cid, {})
         if isinstance(comp, dict) and comp.get("type") == "resistor":
-            val = getattr(sig, "value", None) or ""
-            cover = 1.0 if task["gold_term"] in str(val) else 0.0
+            val = str(getattr(sig, "value", None) or "")
+            gold_ok = task["gold_term"] in val
+            decoy_hit = bool(task.get("decoy")) and task["decoy"] in val
+            cover = 1.0 if (gold_ok and not decoy_hit) else 0.0
     return {
         "success": res.get("success"),
         "final_quality": res.get("final_quality"),
@@ -192,9 +203,10 @@ def main():
     if args.seed_mem:
         m0 = TopologyMemory(path=mem_path)
         for t in TRANSLATION_TASKS:
-            m0.record_lesson(
-                f"翻译约定：领域句『{t['src']}』中关键术语『{t['gold_term']}』"
-                f"必须准确译出，不得泛化", tags=["human", "term"])
+            rule = (f"翻译约定：句子『{t['src']}』的关键术语必须译为『{t['gold_term']}』"
+                    + (f"，不得译为『{t['decoy']}』" if t.get("decoy") else "")
+                    + "（用户既定偏好，必须遵守）")
+            m0.record_lesson(rule, tags=["human", "term"])
 
     for r in range(1, args.rounds + 1):
         with_lessons.append(lesson_count(mem_path))
