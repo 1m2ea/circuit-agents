@@ -195,6 +195,16 @@ def main():
     TopologyMemory.__init__ = _patched
 
     os.makedirs(args.out, exist_ok=True)
+    # 全程共用一个后端实例（real 模式避免 96 次重复构建，也更贴近真实运行）
+    backend = make_backend(args.backend)
+    if args.backend == "real":
+        _has_key = bool(getattr(backend, "api_key", ""))
+        print(f"[real] endpoint={backend.base_url}"
+              f" model={backend._resolve_model('small')}"
+              f" key={'已配置' if _has_key else '未配置!'}", flush=True)
+    print(f"开始：{args.rounds} 轮 × {len(TRANSLATION_TASKS)} 任务 × 2 条件"
+          f" = {args.rounds * len(TRANSLATION_TASKS) * 2} 次执行"
+          f"（real 模式为真实 LLM 调用，每句约 2-5 秒，下方实时输出）", flush=True)
     rows = []
     with_lessons = []   # 每轮开始时 WITH 可用 lesson 数
     with_cov, without_cov = [], []
@@ -213,18 +223,20 @@ def main():
         wc_r, woc_r = [], []
         for task in TRANSLATION_TASKS:
             cap_w, cap_wo = {}, {}
-            rw = run_task(task, make_backend(args.backend), True, mem_path, cap_w)
-            # WITHOUT 不依赖记忆文件（memory_enabled=False 不读写），用全新后端
-            ro = run_task(task, make_backend(args.backend), False, mem_path, cap_wo)
+            rw = run_task(task, backend, True, mem_path, cap_w)
+            # WITHOUT 不依赖记忆文件（memory_enabled=False 不读写）
+            ro = run_task(task, backend, False, mem_path, cap_wo)
             wc_r.append(rw["coverage"])
             woc_r.append(ro["coverage"])
+            print(f"  轮{r} {task['id']} WITH={rw['coverage']:.0f}"
+                  f" WITHOUT={ro['coverage']:.0f}", flush=True)
             rows.append({"round": r, "task": task["id"],
                          "with_cov": rw["coverage"], "without_cov": ro["coverage"]})
         with_cov.append(sum(wc_r) / len(wc_r))
         without_cov.append(sum(woc_r) / len(woc_r))
         print(f"轮 {r}: WITH 覆盖={with_cov[-1]:.2f} "
               f"WITHOUT 覆盖={without_cov[-1]:.2f} "
-              f"可用lessons={with_lessons[-1]}")
+              f"可用lessons={with_lessons[-1]}", flush=True)
 
     # —— 相关性：可用 lesson 数 vs WITH-WITHOUT 抬升 ——
     lift = [w - o for w, o in zip(with_cov, without_cov)]
