@@ -148,6 +148,13 @@ class RealLLMBackend(SimBackend):
         """从 SKILLS 注册表构建 OpenAI/DeepSeek function-calling tools 规格。"""
         try:
             from compiler.agent_skills import SKILLS
+            # P3 元循环：self_improve（自诊断+改进提案）注册进技能表，
+            # 使模型在真跑中也能主动发起"对自身说话"（注册幂等、失败不致命）
+            try:
+                from compiler.self_improve import register_skill
+                register_skill()
+            except Exception:
+                pass
         except Exception:
             return None
         tools = []
