@@ -472,10 +472,12 @@ def selftest():
 
     # 14) P2 自动沉淀去重：归一化相同的教训只入一次
     before = len(mem4._store["lessons"])
-    dup1 = mem4.record_lesson("检索节点编造接口")
-    dup2 = mem4.record_lesson("检索节点  编造\n接口")   # 空白不同、归一化相同
-    assert dup1 is not None and dup2 is not None
-    assert len(mem4._store["lessons"]) == before, "重复教训不应重复入库"
+    dup1 = mem4.record_lesson("检索节点编造接口")   # 新教训 → 入库
+    assert dup1 is not None
+    assert len(mem4._store["lessons"]) == before + 1, "新教训应入库一次"
+    dup2 = mem4.record_lesson("检索节点  编造\n接口")   # 空白不同、归一化相同 → 去重
+    assert dup2 is not None
+    assert len(mem4._store["lessons"]) == before + 1, "重复教训不应重复入库"
     assert dup2["text"] == dup1["text"], "重复记录应返回已有条目"
     print("✓ P2 去重: 归一化相同文本的教训只入一次库")
 
