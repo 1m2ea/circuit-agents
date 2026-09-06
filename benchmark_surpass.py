@@ -46,23 +46,25 @@ from compiler.topology_memory import TopologyMemory
 # ---------------------------------------------------------------------------
 # 固定任务集（翻译强项；gold_term 为必须命中的关键术语，评分独立校验）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 固定任务集（翻译强项）· 偏好顺应设计（2026-09-06 real 首跑后定型）：
+#  real 首跑实测：标准术语维度基线 8/8 全对（天花板，无超越空间）。
+#  真正的超越轴 = 偏好顺应：gold=用户偏好项（合法但非模型默认），decoy=模型默认项。
+#  基线(无记忆)按默认译 → decoy 命中 → 0 分；受教(教训注入)按偏好译 → 1 分。
+# ---------------------------------------------------------------------------
 TRANSLATION_TASKS = [
     {"id": "t1", "src": "The resistor limits current in the circuit.",
-     "gold_term": "电阻", "decoy": "阻抗", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电阻器", "decoy": "电阻", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t2", "src": "The capacitor stores electric charge temporarily.",
-     "gold_term": "电容", "decoy": "", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电容器", "decoy": "电容", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
     {"id": "t3", "src": "The inductor opposes changes in current.",
-     "gold_term": "电感", "decoy": "感应线圈", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
-    {"id": "t4", "src": "The diode allows current to flow in one direction.",
-     "gold_term": "二极管", "decoy": "整流管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
-    {"id": "t5", "src": "The transistor amplifies the input signal.",
-     "gold_term": "晶体管", "decoy": "三极管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
-    {"id": "t6", "src": "The oscillator generates a periodic waveform.",
-     "gold_term": "振荡器", "decoy": "振动器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
-    {"id": "t7", "src": "The transformer couples energy between coils.",
-     "gold_term": "变压器", "decoy": "转换器", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
-    {"id": "t8", "src": "The gate drives the power switch with pwm.",
-     "gold_term": "栅极", "decoy": "门电路", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+     "gold_term": "电感器", "decoy": "电感", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+    {"id": "t4", "src": "The transistor amplifies the input signal.",
+     "gold_term": "三极管", "decoy": "晶体管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+    {"id": "t5", "src": "The diode allows current to flow in one direction.",
+     "gold_term": "整流二极管", "decoy": "二极管", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
+    {"id": "t6", "src": "The gate drives the power switch with pwm.",
+     "gold_term": "门极", "decoy": "栅极", "goal": "翻译 AI/电路领域英文句子为中文，使用准确术语"},
 ]
 
 # 质量门 0.5：real 后端的质量是档位帽先验（small≈0.7，0.8 会虚假失败）；
@@ -155,7 +157,10 @@ def run_task(task: dict, backend, memory_enabled: bool, mem_path: str,
         if isinstance(comp, dict) and comp.get("type") == "resistor":
             val = str(getattr(sig, "value", None) or "")
             gold_ok = task["gold_term"] in val
-            decoy_hit = bool(task.get("decoy")) and task["decoy"] in val
+            # 先剔除 gold 再查 decoy：gold(电阻器) 是 decoy(电阻) 的超串，
+            # 直接子串查会误杀合法的偏好译法
+            val_wo_gold = val.replace(task["gold_term"], "")
+            decoy_hit = bool(task.get("decoy")) and task["decoy"] in val_wo_gold
             cover = 1.0 if (gold_ok and not decoy_hit) else 0.0
     return {
         "success": res.get("success"),
@@ -193,6 +198,10 @@ def main():
         _orig_init(self, path if path is not None else mem_path)
 
     TopologyMemory.__init__ = _patched
+    # 基准只测"教训闭环"，不测拓扑复用：禁用 topology memory-hit。
+    # （real 首跑 WITH=0.12 的根因实测缺陷：memory-hit 复用缓存拓扑时，
+    #   源节点烘焙的是旧任务文本，goal 共享前缀 → 跨任务串味。）
+    TopologyMemory.recall = lambda self, q, *a, **k: None
 
     os.makedirs(args.out, exist_ok=True)
     # 全程共用一个后端实例（real 模式避免 96 次重复构建，也更贴近真实运行）
@@ -265,7 +274,7 @@ def main():
         f.write(f"- 任务类：翻译（{len(TRANSLATION_TASKS)} 句，固定）\n")
         f.write(f"- 轮数：{args.rounds}\n")
         f.write(f"- 条件：WITH(记忆开) vs WITHOUT(记忆关，等价于每轮清零)\n")
-        f.write(f"- lesson 数→抬升 相关(Pearson)：{corr:.3f}\n")
+        f.write(f"- lesson 数→抬升 相关(Pearson)：{fmt_corr(corr)}\n")
         f.write(f"- 最大抬升：{max(lift):.2f}\n")
         f.write(f"- 裁决：**{verdict}**\n")
         f.write(f"- 说明：{note}\n\n")
@@ -281,21 +290,25 @@ def main():
     render_html(html_path, with_cov, without_cov, with_lessons, args.backend,
                 corr, verdict)
 
-    print(f"\n裁决: {verdict} | Pearson(lesson→lift)={corr:.3f} | 最大抬升={max(lift):.2f}")
+    print(f"\n裁决: {verdict} | Pearson(lesson→lift)={fmt_corr(corr)} | 最大抬升={max(lift):.2f}")
     print(f"产物: {csv_path}\n       {md_path}\n       {html_path}")
 
 
 def pearson(xs, ys):
     n = len(xs)
     if n < 2:
-        return 0.0
+        return None
     mx, my = sum(xs) / n, sum(ys) / n
     cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     vx = sum((x - mx) ** 2 for x in xs) ** 0.5
     vy = sum((y - my) ** 2 for y in ys) ** 0.5
     if vx == 0 or vy == 0:
-        return 0.0
+        return None   # 零方差（如 --seed-mem 教训数恒定）→ 相关无定义
     return cov / (vx * vy)
+
+
+def fmt_corr(c):
+    return "n/a(教训数恒定)" if c is None else f"{c:.3f}"
 
 
 def render_html(path, with_cov, without_cov, lessons, backend, corr, verdict):
@@ -319,7 +332,7 @@ def render_html(path, with_cov, without_cov, lessons, backend, corr, verdict):
         bars += (f'<rect x="{px(i)-6:.1f}" y="{y1+10-bh:.1f}" width="12" height="{bh:.1f}" '
                  f'fill="#BA7517" opacity="0.55"/>')
 
-    legend = (f"backend={backend} · Pearson(lesson→lift)={corr:.3f} · 裁决={verdict}")
+    legend = (f"backend={backend} · Pearson(lesson→lift)={fmt_corr(corr)} · 裁决={verdict}")
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>超越基准曲线</title></head><body style="font-family:sans-serif;margin:24px">
 <h2>质量覆盖率随重复轮次（WITH 记忆 vs WITHOUT 记忆）</h2>
