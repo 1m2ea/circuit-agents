@@ -1514,10 +1514,59 @@ class CircuitExecutor:
                 mem = TopologyMemory()
                 goal_desc = self.circuit.spec.get("goal_desc") or self.circuit.spec.get("description", "")
                 mem.record(goal_desc, self.circuit.spec, result)
+                # ② P2 教训闭环自动化：失败/质量门未过 → 规则式沉淀教训
+                #    （mentor 思路落地：失败不再只躺在 entries 里，下次同类任务
+                #    编译期就能看到。规则式提取 = 只写真实事实，不经 LLM 不幻觉）
+                try:
+                    _les = self._auto_lesson(result, out, goal_desc)
+                    if _les:
+                        mem.record_lesson(_les, tags=["auto", "failure"])
+                except Exception:
+                    pass
             except Exception:
                 pass
         self._state = "done"
         return result
+
+    # ---- ② P2 教训闭环自动化：失败 run 规则式沉淀教训 ----
+    def _auto_lesson(self, result: dict, out: dict, goal_desc: str) -> str | None:
+        """从一次失败/低质 run 提取事实教训（纯规则、离线安全、不幻觉）。
+
+        只写可验证的事实：哪个节点（label+id）、失败原因（meta.error /
+        meta.open / gate）。成功且质量门通过 → 不制造教训（避免教训库被
+        无意义成功记录污染）。无可提取事实 → None。
+        """
+        try:
+            qg = result.get("quality_gate")
+            if result.get("success") and (qg is None or qg.get("passed")):
+                return None
+            parts = []
+            for cid, info in (result.get("components") or {}).items():
+                if not isinstance(info, dict) or info.get("ok"):
+                    continue
+                comp = self.circuit.components.get(cid, {})
+                label = comp.get("label", cid)
+                meta = getattr(out.get(cid), "meta", None) or {}
+                if meta.get("error"):
+                    reason = f"error={meta['error']}"
+                elif meta.get("open"):
+                    reason = f"open={meta['open']}"
+                elif meta.get("gate") is not None:
+                    reason = f"gate={meta['gate']}"
+                else:
+                    reason = "ok=False"
+                parts.append(f"{label}({cid})失败[{reason}]")
+                if len(parts) >= 3:
+                    break
+            if qg and not qg.get("passed"):
+                parts.append(f"质量门未过(final={result.get('final_quality')},"
+                             f"thr={qg.get('threshold')})")
+            if not parts:
+                return None
+            return (f"任务『{(goal_desc or '')[:60]}』踩坑: " + "；".join(parts)
+                    + "。同类任务应先排查此环节")
+        except Exception:
+            return None
 
     # ---- ② 流式执行：逐节点 yield 结果（供 SSE/API 消费）----
     def run_stream(self):

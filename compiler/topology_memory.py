@@ -231,15 +231,21 @@ class TopologyMemory:
         """记录一条经验教训（跨 run 持久化）。
 
         与拓扑记录（entries，FIFO 100）分开存放：教训价值不随时间衰减，
-        故独立 FIFO 上限 200 条。零回归：任何异常静默返回 None。
+        故独立 FIFO 上限 200 条。P2 自动沉淀会产生重复文本 → 归一化后
+        完全相同的教训跳过（不再重复入库）。零回归：异常静默返回 None。
         """
         try:
-            if not (text or "").strip():
+            norm = re.sub(r"\s+", "", str(text or ""))
+            if not norm:
                 return None
             with _MEM_LOCK:
                 self._store = self._load()
+                # 去重：归一化文本完全相同 → 跳过（返回已有条目，行为可预期）
+                for les in self._store.get("lessons", []):
+                    if re.sub(r"\s+", "", les.get("text", "")) == norm:
+                        return les
                 lesson = {
-                    "text": text.strip()[:500],
+                    "text": str(text).strip()[:500],
                     "tags": [str(t) for t in (tags or [])][:8],
                     "timestamp": time.time(),
                 }
@@ -250,6 +256,27 @@ class TopologyMemory:
             return lesson
         except Exception:
             return None
+
+    def recent_lessons(self, n: int = 2) -> list:
+        """P2 常驻兜底：返回最近 n 条教训（不按相似度，保证教训永不失联）。
+
+        用途：compile 织入时若语义召回无命中，仍把最近的坑带进提示词——
+        否则"命中才注入"会让教训库形同虚设。零回归：异常/空表返回 []。
+        """
+        try:
+            with _MEM_LOCK:
+                self._store = self._load()
+                out = []
+                for les in reversed(self._store.get("lessons", [])):
+                    if les.get("text", "").strip():
+                        out.append({"text": les.get("text", ""),
+                                    "tags": les.get("tags", []),
+                                    "score": None})
+                    if len(out) >= max(0, n):
+                        break
+                return out
+        except Exception:
+            return []
 
     def recall_lessons(self, query: str, min_score: float = 0.1,
                        top_k: int = 3) -> list:
@@ -442,6 +469,23 @@ def selftest():
     assert s_rev and s_rev[0]["tags"] == ["grounding"], \
         f"乱序查询应仍命中 grounding，got {s_rev}"
     print(f"✓ P1 语序鲁棒: 乱序查询仍命中 (score={s_rev[0]['score']})")
+
+    # 14) P2 自动沉淀去重：归一化相同的教训只入一次
+    before = len(mem4._store["lessons"])
+    dup1 = mem4.record_lesson("检索节点编造接口")
+    dup2 = mem4.record_lesson("检索节点  编造\n接口")   # 空白不同、归一化相同
+    assert dup1 is not None and dup2 is not None
+    assert len(mem4._store["lessons"]) == before, "重复教训不应重复入库"
+    assert dup2["text"] == dup1["text"], "重复记录应返回已有条目"
+    print("✓ P2 去重: 归一化相同文本的教训只入一次库")
+
+    # 15) P2 recent_lessons：不按相似度的常驻兜底
+    got_rec = mem4.recent_lessons(1)
+    assert len(got_rec) == 1 and got_rec[0]["text"], "recent_lessons 应返回最近 1 条"
+    assert got_rec[0]["score"] is None, "recent_lessons 非相似度召回，score=None"
+    empty_mem = TopologyMemory(path=tempfile.mktemp(suffix=".json"))
+    assert empty_mem.recent_lessons(2) == [], "空表 recent_lessons 应返回 []"
+    print("✓ P2 recent_lessons: 常驻兜底可用（最近优先、空表安全）")
 
     # 清理
     for p in (tmp,):

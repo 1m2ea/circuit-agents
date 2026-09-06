@@ -74,6 +74,22 @@ def _weave_lessons(spec: dict, les_texts: list) -> None:
             c["memory_lessons"] = texts
 
 
+def _lessons_for_goal(mem, goal_desc: str) -> list:
+    """P2 常驻注入：语义召回优先，无命中退最近教训——教训库永不失联。
+
+    召回（命中加权）：TF-IDF 余弦相关的教训排前；零命中时取最近 2 条
+    （recent_lessons）兜底。任何异常返回 []（零回归）。
+    """
+    try:
+        got = mem.recall_lessons(goal_desc)
+        if got:
+            return [l.get("text", "") for l in got if isinstance(l, dict)]
+        return [l.get("text", "") for l in mem.recent_lessons(2)
+                if isinstance(l, dict)]
+    except Exception:
+        return []
+
+
 def _ensure_hetero_verify(spec: dict) -> dict:
     """③ VERIFY_* 已配置时，在终端 adc 前自动插 verify#quality 电阻节点。
 
@@ -146,8 +162,10 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
                     "quality": hit["quality"],
                 }
                 # ② 第二圈：教训随拓扑带出并织进电阻组件（提示词将携带）
-                _weave_lessons(spec, [l.get("text", "") for l in (hit.get("lessons") or [])
-                                      if isinstance(l, dict)])
+                #    P2 常驻兜底：命中拓扑但教训召回空 → 仍带最近教训
+                les_texts = [l.get("text", "") for l in (hit.get("lessons") or [])
+                             if isinstance(l, dict)] or _lessons_for_goal(mem, goal.description)
+                _weave_lessons(spec, les_texts)
                 # ③ VERIFY_* 已配置 → 自动插真异构校验节点（幂等）
                 _ensure_hetero_verify(spec)
                 spec["binder_report"] = None
@@ -170,11 +188,11 @@ def compile_goal(goal: Goal, auto_bind: bool = True, route: bool = False,
     spec["binder_report"] = report
     spec["evolve_requests"] = _infer_evolve_requests(spec)  # ① 规划器自动产出
     # ② 第二圈：新编译同样召回教训、织进电阻组件（提示词将携带）
+    #    P2 常驻兜底：语义召回零命中 → 取最近 2 条（教训库永不失联）
     if memory_enabled:
         try:
             from .topology_memory import TopologyMemory
-            _les = [l.get("text", "")
-                    for l in TopologyMemory().recall_lessons(goal.description)]
+            _les = _lessons_for_goal(TopologyMemory(), goal.description)
         except Exception:
             _les = []
         _weave_lessons(spec, _les)
