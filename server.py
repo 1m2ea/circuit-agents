@@ -556,6 +556,7 @@ def _compile_execute(goal_text, params, on_node_done=None):
         on_node_done=_cb,
         memory_enabled=params.get("memory_enabled", True),
         auto_select_models=params.get("auto_select_models", False),
+        subconscious_hints=params.get("subconscious_hints"),
     )
     result = executor.run()
     # 真推理可见性：把后端实际消耗（token / 模型 / 耗时）写进结果，供前端「本次由 DeepSeek 生成」展示
@@ -1624,6 +1625,8 @@ def submit_run(req: GoalRequest):
         }
 
     params = req.model_dump()
+    # 把潜意识层浮出的候选假设一并交给执行器（意识层真正「采纳」这些候选）。
+    params["subconscious_hints"] = _runs[run_id]["subconscious_hints"]
     t = threading.Thread(target=_run_goal, args=(req.goal, params, run_id), daemon=True)
     t.start()
 
@@ -3758,6 +3761,35 @@ def selftest():
         print(f"✓ S31 导师-学生训练电路(MentorTrain): 诊断「{_mres['diagnosis']}」"
               f" · 质量 {_mres['before_quality']}→{_mres['after_quality']} 门通过"
               f" · 固化 1 条 · 原spec未改 · 反例拒固化 · /mentor/train 端点可用")
+
+    # S31b: 潜意识层接入执行器 —— 意识层真正「采纳」后台浮出的候选假设（离线，无 key）
+    if True:
+        import random as _rnd
+        from runtime import Circuit, CircuitExecutor, SimBackend, Signal as _Sig
+        from compiler.nl_parser import GoalParser as _GP
+        from compiler.compile import compile_goal as _cg
+        _hints = [{"text": "文言「见微知著」→ 现代「预测」", "score": 0.6, "source": "corpus"}]
+        _g = _GP().parse("分析文言文的压缩特性并给出可验证结论")
+        _spec = _cg(_g, auto_bind=True, route=True, memory_enabled=True, auto_select_models=False)
+        _ex = CircuitExecutor(Circuit(_spec, SimBackend(_rnd.Random(7))),
+                              data_fill_budget=2, evolve_enabled=True,
+                              subconscious_hints=_hints)
+        _res = _ex.run()
+        assert _res.get("subconscious", {}).get("available") == 1, _res.get("subconscious")
+        assert _res["subconscious"]["adopted"] is True, _res["subconscious"]
+        # 节点级采纳：SimBackend 电阻分支应打 subconscious_adopted + 质量加成；无候选则零回归
+        _be = SimBackend(_rnd.Random(7))
+        _comp = {"type": "resistor", "label": "reason", "model": "small"}
+        _ins = [_Sig(value="ctx", quality=0.9, ok=True)]
+        _s0 = _be.run(dict(_comp), _ins)
+        _s1 = _be.run(dict(_comp, subconscious_hints=_hints), _ins)
+        assert _s1.quality >= _s0.quality, (_s0.quality, _s1.quality)
+        assert _s1.meta.get("subconscious_adopted") is True
+        assert "subconscious_adopted" not in _s0.meta
+        print(f"✓ S31b 潜意识层→执行器接入(SubconsciousConsume): "
+              f"候选注入结果 available={_res['subconscious']['available']} "
+              f"adopted={_res['subconscious']['adopted']} · "
+              f"SimBackend 加成 {_s0.quality:.3f}→{_s1.quality:.3f} · 无候选零回归")
 
     # S32: 在线拓扑编辑（人在回路）端点接线 —— 直接调用端点函数验证请求模型/会话/编辑分发/404路径
     _spec = {

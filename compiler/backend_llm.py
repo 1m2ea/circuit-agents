@@ -229,6 +229,18 @@ class RealLLMBackend(SimBackend):
         if ctx:
             user += "Upstream context:\n" + "\n".join(f"- {c}" for c in ctx) + "\n"
         user += self._lessons_block(comp)
+        # 潜意识层：把后台浮出的候选假设直接呈现给意识层(本 LLM 步骤)，
+        # 让其在推理时「采纳/证伪」这些候选（不强制，仅作启发）。无候选则整段不出现。
+        sub_hints = comp.get("subconscious_hints")
+        if sub_hints:
+            user += "\nSubconscious-layer candidates (background hypotheses surfaced "
+            user += "by a daemon, not in the main context) — consider adopting or "
+            user += "refuting them:\n"
+            for i, h in enumerate(sub_hints, 1):
+                if isinstance(h, dict):
+                    user += f"- [{i}] {h.get('text', h)} (score={round(float(h.get('score', 0.0)), 3)})\n"
+                else:
+                    user += f"- [{i}] {h}\n"
         user += "Deliver the result now."
         return [{"role": "system", "content": system},
                 {"role": "user", "content": user}]

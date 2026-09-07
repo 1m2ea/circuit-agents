@@ -464,9 +464,20 @@ class SimBackend(Backend):
                     q = base
                 q = max(0.0, min(1.0, q)) + self.rng.uniform(-0.03, 0.03)
                 q = max(0.0, min(1.0, q))
+                # 潜意识层采纳奖励：本节点已携带后台浮出的候选假设(意识层「采纳」)，
+                # 给输出质量一个封顶的小幅加成——更好的初始假设 → 更好的执行。
+                # 严格零回归：无 subconscious_hints 字段时完全不触发（默认所有旧调用）。
+                _sub_meta = {}
+                _hints = comp.get("subconscious_hints")
+                if _hints:
+                    _best = max((float(h.get("score", 0.5)) if isinstance(h, dict) else 0.5)
+                                for h in _hints)
+                    q = min(1.0, q + min(0.04, 0.08 * _best))
+                    _sub_meta["subconscious_adopted"] = True
                 return Signal(value=f"result({tier})", quality=q, ok=True,
                               cost=cost, latency_ms=lat,
-                              meta={"input": round(inp, 3), "cap": cap, "recovery": round(eta, 2)})
+                              meta={"input": round(inp, 3), "cap": cap,
+                                    "recovery": round(eta, 2), **_sub_meta})
             return Signal(value=None, quality=0.0, ok=False,   # open circuit
                           cost=cost, latency_ms=lat,
                           meta={"open": "yield_fail", "input": round(inp, 3)})
@@ -1033,7 +1044,8 @@ class CircuitExecutor:
                  collaborators: "Optional[object]" = None,
                  recruiter: "Optional[object]" = None,
                  coop_timeout: float = 5.0,
-                 coop_help_threshold: "Optional[float]" = None):
+                 coop_help_threshold: "Optional[float]" = None,
+                 subconscious_hints: "Optional[list]" = None):
         """verbose     : 同时向控制台打印事件行（CI 冗余用，用户环境通常不可见）。
         on_event   : 结构化事件回调 (dict) -> None，供 SVG/UI 订阅，零重复埋点。
         events     : 外部传入的事件列表（子电路执行器共享父列表，时间线连续）。
@@ -1095,6 +1107,9 @@ class CircuitExecutor:
         # ── 人机协同·极致：协作者不分人机，机器卡住时主动招募（零回归：不传=不启用）──
         self.coop_timeout = float(coop_timeout)
         self.coop_help_threshold = coop_help_threshold
+        # 潜意识层接入：执行器把后台潜意识层浮出的候选假设注入每个节点，
+        # 让意识层(LLM/agent)在推理时真正「采纳」这些候选（零回归：默认空=不改任何行为）。
+        self._sub_hints = list(subconscious_hints or [])
         self.collaborators = collaborators
         if recruiter is not None:
             self.recruiter = recruiter
@@ -1314,6 +1329,10 @@ class CircuitExecutor:
             self._emit("layer_start", layer_idx=li, nodes=list(layer))
             for cid in layer:
                 comp = self.circuit.components[cid]
+                # 潜意识层：把后台浮出的候选假设注入本节点，供意识层(LLM/agent)采纳。
+                # 仅当本次执行携带候选时注入，默认不注入 → 零回归。
+                if self._sub_hints:
+                    comp["subconscious_hints"] = self._sub_hints
                 self._emit("node_start", node=cid, ctype=comp.get("type"),
                            label=comp.get("label"))
                 # ⑧ 加深：决策点暂停（主动请求人类审批，而非仅失败兜底）
@@ -1391,6 +1410,10 @@ class CircuitExecutor:
                     except Exception:
                         pass
                 out[cid] = sig
+                # 潜意识层：标记本节点在推理时「采纳」了后台浮出的候选假设（可观测/可审计）。
+                if self._sub_hints:
+                    sig.meta.setdefault("subconscious_hints", self._sub_hints)
+                    sig.meta["subconscious_adopted"] = True
                 # ── 指挥中⼼① 节点工作报告：记录每节点透明决策轨迹 ──
                 self._record_trace(cid, comp, sig, out)
                 # ── 人机协同·极致：卡住就主动招募（人/agent/知识源/系统同池）──
@@ -1506,6 +1529,12 @@ class CircuitExecutor:
             "skills_used": _skill_used,
             "model_selection": _model_recs,
             "memory_hit": self.circuit.spec.get("memory_hit"),
+            # 潜意识层：本次执行共向意识层注入了哪些后台候选假设（可观测/可审计）。
+            "subconscious": {
+                "available": len(self._sub_hints),
+                "adopted": bool(self._sub_hints),
+                "hints": self._sub_hints,
+            },
         }
         # C 记忆与学习：执行后记录拓扑+结果（零回归：失败静默）
         if self.memory_enabled and not self.scope:  # 子电路(evolve)不记录
