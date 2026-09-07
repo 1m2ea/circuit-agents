@@ -36,6 +36,16 @@ except Exception:  # pragma: no cover
     PiHeartbeat = None
     pi_heartbeat_selftest = None
 
+# 潜意识层（Subconscious Layer）：常驻后台加工模块——意识层受限取用 + 人类回放干预
+# 设计见 compiler/subconscious_layer.py；离线安全、零新核心逻辑、不依赖网络。
+try:
+    from compiler.subconscious_layer import (
+        SubconsciousLayer, subconscious_layer_selftest,
+    )
+except Exception:  # pragma: no cover
+    SubconsciousLayer = None
+    subconscious_layer_selftest = None
+
 # 导师-学生训练电路（Phase 3：强模型优化弱模型的外部电路结构，非知识蒸馏）
 try:
     from mentor import (mentor_train_cycle, make_ollama_student,
@@ -68,6 +78,39 @@ PI_HEARTBEAT = PiHeartbeat(
     # 升级：心跳可从「按 π 贪」切换为「按 ROI 贪」（env CA_PI_ROI=1 开启）
     roi_guided=os.environ.get("CA_PI_ROI", "0") == "1",
 ) if PiHeartbeat else None
+
+# 潜意识层实例（常驻 daemon 默认关闭，由 /subconscious/start 或启动参数开启）。
+# 与 π 心跳同款 idiom：对主链路透明，仅经受限 query() 暴露策展结果，供人类回放/干预。
+# associate_fn 默认接「文言文语料适配器」：让潜意识层的联想压缩由真实文言典故驱动
+# （验证"文言文训练提升联想压缩"论点）；导入失败则降级为确定性本地引擎，零网络依赖。
+try:
+    from compiler.wenyan_corpus import wenyan_associate_fn as _WENYAN_FN
+except Exception:  # pragma: no cover
+    _WENYAN_FN = None
+
+SUBCONSCIOUS = (SubconsciousLayer(interval=30.0, associate_fn=_WENYAN_FN)
+                if (SubconsciousLayer and _WENYAN_FN) else
+                (SubconsciousLayer(interval=30.0) if SubconsciousLayer else None))
+
+
+def subconscious_hints(goal: str, top_k: int = 5) -> list:
+    """意识层取用通道：把当前目标喂给潜意识层（后台异步加工），并拉取 top-K 候选假设。
+
+    返回 [{id,text,score,source}]（可能为空）。离线安全：SUBCONSCIOUS 为 None 或
+    任意异常时静默返回 []，绝不拖崩 /run。主编译器（executor）可读 run 记录的
+    subconscious_hints 作为候选想法；潜意识层对主上下文不可见，只经此受限接口取用。
+    """
+    if SUBCONSCIOUS is None:
+        return []
+    try:
+        # 高优先喂入（成为焦点）+ 同步跑几拍生成该目标的候选假设，再拉 top-K。
+        # 每拍仅 compress+associate（无 LLM），耗时毫秒级，不拖垮 /run；
+        # 同时把目标灌入后台常驻队列，供后续 daemon 拍持续深化。
+        SUBCONSCIOUS.feed(goal, priority=1.0)
+        SUBCONSCIOUS.run_once(n=3)
+        return SUBCONSCIOUS.query(top_k=top_k, min_score=0.0).get("hypotheses", [])
+    except Exception:
+        return []
 
 # ──────────────────────────────────────────────────────────
 # 模型
@@ -1577,6 +1620,7 @@ def submit_run(req: GoalRequest):
             "result": None,
             "_events": [],
             "error": None,
+            "subconscious_hints": subconscious_hints(req.goal),  # 意识层取用：潜意识层 top-K 候选
         }
 
     params = req.model_dump()
@@ -2857,6 +2901,58 @@ if PI_HEARTBEAT is not None:
 
 
 # ──────────────────────────────────────────────────────────
+# 潜意识层（Subconscious Layer）· 意识层受限取用 + 人类回放干预
+# ──────────────────────────────────────────────────────────
+if SUBCONSCIOUS is not None:
+
+    @app.get("/subconscious")
+    def subconscious_state():
+        """公开快照：运行状态/计数/回放长度/顶层假设样本（不含原始 KV/队列）。"""
+        return SUBCONSCIOUS.snapshot()
+
+    @app.post("/subconscious/start")
+    def subconscious_start(interval: float = Query(30.0, ge=1.0, le=3600)):
+        ok = SUBCONSCIOUS.start(interval=interval)
+        return {"started": ok, "running": SUBCONSCIOUS.is_running(),
+                "interval": SUBCONSCIOUS.interval}
+
+    @app.post("/subconscious/stop")
+    def subconscious_stop():
+        SUBCONSCIOUS.stop()
+        return {"running": SUBCONSCIOUS.is_running()}
+
+    @app.post("/subconscious/tick")
+    def subconscious_tick(n: int = Query(1, ge=1, le=50)):
+        """手动推进 n 拍（演示/调试用）。"""
+        return {"ticks": SUBCONSCIOUS.run_once(n=n)}
+
+    @app.post("/subconscious/feed")
+    def subconscious_feed(prompt: str = Query(..., min_length=1, max_length=500),
+                          priority: float = Query(0.0, ge=0.0, le=1.0)):
+        """意识层把当前目标喂进潜意识层种子队列（后台异步加工）。"""
+        return SUBCONSCIOUS.feed(prompt, priority=priority)
+
+    @app.post("/subconscious/query")
+    def subconscious_query(top_k: int = Query(5, ge=1, le=50),
+                           min_score: float = Query(0.0, ge=0.0, le=1.0)):
+        """受限查询接口：意识层只拉 top-K 已策展候选（看不到原始工作记忆）。"""
+        return SUBCONSCIOUS.query(top_k=top_k, min_score=min_score)
+
+    @app.get("/subconscious/replay")
+    def subconscious_replay(n: int = Query(20, ge=1, le=500)):
+        """人类回放：最近 n 条 trace（每拍快照 + 干预事件），黑箱可视化。"""
+        return {"replay": SUBCONSCIOUS.replay(n=n)}
+
+    @app.post("/subconscious/intervene")
+    def subconscious_intervene(
+            action: str = Query(..., pattern="^(prune|boost|promote|clear)$"),
+            hid: str = Query(None, max_length=16),
+            score: float = Query(None, ge=0.0, le=1.0)):
+        """人类干预：prune(剪枝)/boost(提权)/promote(提拔)/clear(清空)。"""
+        return SUBCONSCIOUS.intervene(action=action, hid=hid, score=score)
+
+
+# ──────────────────────────────────────────────────────────
 # S31 导师-学生训练电路：强模型优化弱模型的外部电路结构（非知识蒸馏）
 # ──────────────────────────────────────────────────────────
 
@@ -3601,6 +3697,10 @@ def selftest():
     # S30: π 永动心跳（spigot 正确性 + f(π) 四动作覆盖 + 状态恒变 + 反馈闭环）
     if pi_heartbeat_selftest is not None:
         pi_heartbeat_selftest()
+
+    # S30b: 潜意识层（常驻 daemon + 压缩/联想产假设 + 受限查询 + 人类干预 + 回放）
+    if subconscious_layer_selftest is not None:
+        subconscious_layer_selftest()
 
     # S31: 导师-学生训练电路（离线：注入式导师 + 注入式学生，不走网络/不调本地模型）
     if mentor_train_cycle is not None:
@@ -4470,6 +4570,8 @@ if __name__ == "__main__":
         if PI_HEARTBEAT is not None:
             PI_HEARTBEAT.start(interval=60.0,
                                roi=os.environ.get("CA_PI_ROI", "0") == "1")  # 永动心跳：开机即启动（ROI 模式由 env 决定）
+        if SUBCONSCIOUS is not None:
+            SUBCONSCIOUS.start(interval=30.0)  # 潜意识层：开机即常驻（对主链路透明）
         print(f"circuit-agents API Server → http://{args.host}:{args.port}")
         print("端点: POST /run | GET /run/{id} | GET /run/{id}/stream | GET /health")
         print("π 永动心跳: GET /pi/heartbeat | POST /pi/heartbeat/start|stop|tick")
