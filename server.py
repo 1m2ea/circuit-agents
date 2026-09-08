@@ -56,6 +56,12 @@ except Exception:  # pragma: no cover
     default_content_quality = None
     MENTOR_MODEL = MENTOR_BASE = None
 
+# 对话式智能体（桌面端聊天）：多轮对话连接层（key > 本地端点 > 离线兜底）
+try:
+    import chat_agent as _chat_agent
+except Exception:  # pragma: no cover
+    _chat_agent = None
+
 # 训练成果模板库（质量门通过的优化方案在此累积，供 π 心跳 / 后续编译复用）
 MENTOR_REGISTRY = []
 
@@ -648,6 +654,283 @@ def index():
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
+
+
+# ================= Chat 对话式智能体（桌面端） =================
+class ChatMsg(BaseModel):
+    role: str = "user"
+    content: str = ""
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMsg] = Field(default_factory=list)
+    plan: str = "auto"     # auto | off | force
+    execute: bool = False
+    sid: str = ""          # 会话持久化 id（服务端存档对话，支持断点续跑）
+
+
+@app.get("/chat")
+def chat_page():
+    """对话式智能体前端界面。"""
+    p = _HERE / "chat.html"
+    if p.exists():
+        return HTMLResponse(p.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>chat.html not found</h1>")
+
+
+@app.get("/api/chat/mode")
+def chat_mode():
+    """当前对话后端档位：deepseek / openai / local / offline。"""
+    if _chat_agent is None:
+        return {"mode": "offline", "online": False, "reason": "chat_agent 未加载"}
+    try:
+        return _chat_agent.detect_mode()
+    except Exception as e:  # pragma: no cover
+        return {"mode": "offline", "online": False, "reason": str(e)}
+
+
+@app.get("/api/agent/status")
+def agent_status():
+    """工具智能体状态：工作区根、可用工具、是否在线（有 key）。"""
+    st = {"root": None, "tools": [], "online": False}
+    try:
+        import agent_tools as _at
+        _s = _at.status()
+        st["root"] = _s.get("root")
+        st["tools"] = _s.get("tools") or []
+    except Exception as e:  # pragma: no cover
+        st["error"] = str(e)
+    if _chat_agent is not None:
+        try:
+            st["online"] = bool(_chat_agent.detect_mode().get("online"))
+        except Exception:  # pragma: no cover
+            pass
+    return st
+
+
+_TASK_KW = ("检索", "研究", "分析", "整理", "总结", "对比", "设计", "实现", "开发",
+            "编写", "写一个", "翻译", "计算", "调研", "采集", "报告", "修复", "重构",
+            "规划", "拓扑", "电路", "circuit", "多步", "并行", "评估", "梳理")
+
+
+def _chat_looks_like_task(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if len(t) >= 40:
+        return True
+    if "规划：" in t or "规划:" in t:
+        return True
+    tl = t.lower()
+    return len(t) >= 8 and any(k in tl or k in t for k in _TASK_KW)
+
+
+def _chat_plan_summary(goal_text: str):
+    """离线把自然语言编译成电路拓扑，产出人读的规划摘要（不执行仿真）。"""
+    try:
+        from compiler.nl_parser import GoalParser
+        from compiler.compile import compile_goal
+        from compiler.refs import build_ref_index
+        parser = GoalParser()
+        goal = parser.parse(goal_text)
+        spec = compile_goal(goal, auto_bind=True, route=True,
+                            memory_enabled=True, auto_select_models=False)
+    except Exception as ex:
+        return {"error": str(ex)}
+    comps = spec.get("components") or {}
+    try:
+        refs = build_ref_index(comps)
+    except Exception:
+        refs = {}
+    by_type = {}
+    steps = []
+    for cid, c in comps.items():
+        if not isinstance(c, dict):
+            continue
+        typ = c.get("type", "?")
+        by_type[typ] = by_type.get(typ, 0) + 1
+        steps.append({"id": cid, "ref": refs.get(cid, ""), "type": typ,
+                      "capability": c.get("capability") or c.get("label") or ""})
+    return {"name": spec.get("name", goal_text[:24]),
+            "components_total": len(comps),
+            "by_type": by_type,
+            "steps": steps[:80],
+            "wires": len(spec.get("wires") or [])}
+
+
+def _agent_chat_resp(out, plan_text=None):
+    """把 chat_agent 返回统一成 /api/chat 响应形状（含审批/工具记录/离线规划卡）。"""
+    r = {"reply": out.get("text", ""), "meta": out.get("meta", {})}
+    na = out.get("needApproval")
+    if na:
+        r["needApproval"] = na
+    _tl = out.get("tools") or []
+    if _tl:
+        r["tools"] = [{"name": t.get("name"), "ok": t.get("ok"),
+                       "args": json.dumps(t.get("args"), ensure_ascii=False)[:180],
+                       "out": (t.get("out") or "")[:180]} for t in _tl]
+    if plan_text is not None and not (out.get("meta") or {}).get("online", False):
+        r["plan"] = _chat_plan_summary(plan_text)
+    return r
+
+
+# ---- 会话持久化（sid → 对话历史，支持断点续跑/重启恢复）----
+_CHAT_SESSIONS = {}
+_CHAT_SESS_LOCK = threading.Lock()
+
+
+def _chat_sessions_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "circuit-agents")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(d, "chat_sessions.json")
+
+
+def _chat_load(sid):
+    with _CHAT_SESS_LOCK:
+        if sid in _CHAT_SESSIONS:
+            return list(_CHAT_SESSIONS[sid])
+    try:
+        with open(_chat_sessions_path(), "r", encoding="utf-8") as f:
+            alls = json.load(f)
+        return list(alls.get(sid, []))
+    except Exception:
+        return []
+
+
+def _chat_save(sid, msgs):
+    if not sid:
+        return
+    with _CHAT_SESS_LOCK:
+        _CHAT_SESSIONS[sid] = list(msgs)
+        try:
+            alls = {}
+            try:
+                with open(_chat_sessions_path(), "r", encoding="utf-8") as f:
+                    alls = json.load(f)
+            except Exception:
+                alls = {}
+            alls[sid] = list(msgs)
+            if len(alls) > 100:
+                alls = dict(list(alls.items())[-100:])
+            with open(_chat_sessions_path(), "w", encoding="utf-8") as f:
+                json.dump(alls, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+@app.get("/api/chat/history")
+def chat_history(sid: str = ""):
+    """按 sid 取回服务端存档的对话历史。"""
+    if not sid:
+        return {"sid": "", "messages": []}
+    return {"sid": sid, "messages": _chat_load(sid)}
+
+
+class ApproveRequest(BaseModel):
+    id: str
+    allow: bool = True
+
+
+@app.post("/api/chat/approve")
+def api_chat_approve(req: ApproveRequest):
+    """批准/拒绝 run_command，并续跑被暂停的工具循环。"""
+    if _chat_agent is None:
+        raise HTTPException(500, "chat_agent 未加载")
+    out = _chat_agent.approve(req.id, bool(req.allow))
+    if not out.get("text") and not out.get("needApproval"):
+        if out.get("error"):
+            raise HTTPException(404, out["error"])
+    return _agent_chat_resp(out)
+
+
+@app.post("/api/chat/stream")
+def api_chat_stream(req: ChatRequest):
+    """流式对话端点（NDJSON 事件）：普通在线对话逐字推 delta；需要工具/规划/审批/离线时
+    回退为单条 {"type":"json","payload":{...}}（与 /api/chat 响应同构）。"""
+    msgs = [{"role": m.role, "content": m.content} for m in (req.messages or [])]
+    if not msgs or msgs[-1].get("role") != "user":
+        raise HTTPException(400, "最后一条消息必须是 user")
+    text = (msgs[-1].get("content") or "").strip()
+    plan_choice = (req.plan or "auto").lower()
+    want_plan = plan_choice == "force" or (
+        plan_choice == "auto" and _chat_looks_like_task(text))
+    _m = {"online": False}
+    if _chat_agent is not None:
+        try:
+            _m = _chat_agent.detect_mode()
+        except Exception:  # pragma: no cover
+            _m = {"online": False}
+
+    def gen():
+        if _chat_agent is not None and _m.get("online") and not want_plan and not req.execute:
+            for ev in _chat_agent.chat_stream(msgs):
+                yield json.dumps(ev, ensure_ascii=False) + "\n"
+            return
+        # 回退：整包（工具/规划/审批/离线/执行）
+        if _chat_agent is not None:
+            out = _chat_agent.agent_chat(msgs) if _m.get("online") else _chat_agent.chat(msgs)
+        else:
+            out = {"text": "（对话模块不可用）", "meta": {"mode": "offline", "online": False}}
+        resp = _agent_chat_resp(out, plan_text=(text if want_plan else None))
+        if want_plan and not _m.get("online") and req.execute and not resp.get("needApproval"):
+            try:
+                res, _sp, _ev = _compile_execute(
+                    text, {"route": True, "memory_enabled": True})
+                resp["executed"] = {k: res.get(k) for k in
+                                    ("final_quality", "success_rate", "elapsed_ms",
+                                     "llm", "failed_nodes") if k in res}
+            except Exception as ex:  # pragma: no cover
+                resp["executed"] = {"error": str(ex)}
+        yield json.dumps({"type": "json", "payload": resp}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/chat")
+def api_chat(req: ChatRequest):
+    """多轮对话；执行型消息自动做电路规划；execute=true 时再跑一次仿真。"""
+    msgs = [{"role": m.role, "content": m.content} for m in (req.messages or [])]
+    if not msgs or msgs[-1].get("role") != "user":
+        raise HTTPException(400, "最后一条消息必须是 user")
+    text = (msgs[-1].get("content") or "").strip()
+    plan_choice = (req.plan or "auto").lower()
+    want_plan = plan_choice == "force" or (
+        plan_choice == "auto" and _chat_looks_like_task(text))
+    _meta0 = {"online": False}
+    if _chat_agent is not None:
+        try:
+            _meta0 = _chat_agent.detect_mode()
+        except Exception:  # pragma: no cover
+            _meta0 = {"online": False}
+        if _meta0.get("online"):
+            out = _chat_agent.agent_chat(msgs)
+        else:
+            out = _chat_agent.chat(msgs)
+    else:
+        out = {"text": "（对话模块不可用）", "meta": {"mode": "offline", "online": False}}
+    resp = _agent_chat_resp(out, plan_text=(text if want_plan else None))
+    if resp.get("needApproval"):
+        return resp
+    if want_plan and not _meta0.get("online") and req.execute:
+        try:
+            res, _sp, _ev = _compile_execute(
+                text, {"route": True, "memory_enabled": True})
+            resp["executed"] = {k: res.get(k) for k in
+                                ("final_quality", "success_rate", "elapsed_ms",
+                                 "llm", "failed_nodes") if k in res}
+        except Exception as ex:  # pragma: no cover
+            resp["executed"] = {"error": str(ex)}
+    if req.sid and resp.get("reply"):
+        _ms = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in msgs]
+        _ms.append({"role": "assistant", "content": resp["reply"]})
+        _chat_save(req.sid, _ms)
+    elif req.sid:
+        _chat_save(req.sid, msgs)
+    return resp
 
 
 @app.post("/batch")

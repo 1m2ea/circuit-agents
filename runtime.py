@@ -1107,10 +1107,10 @@ class CircuitExecutor:
         # ── 人机协同·极致：协作者不分人机，机器卡住时主动招募（零回归：不传=不启用）──
         self.coop_timeout = float(coop_timeout)
         self.coop_help_threshold = coop_help_threshold
-        # 潜意识层接入：执行器把后台潜意识层浮出的候选假设注入每个节点，
+        self.collaborators = collaborators
+        # 潜意识层：持有后台浮出的候选假设(意识层可采纳)，执行时注入各节点。
         # 让意识层(LLM/agent)在推理时真正「采纳」这些候选（零回归：默认空=不改任何行为）。
         self._sub_hints = list(subconscious_hints or [])
-        self.collaborators = collaborators
         if recruiter is not None:
             self.recruiter = recruiter
             if getattr(self.recruiter, "on_event", None) is None:
@@ -1329,8 +1329,7 @@ class CircuitExecutor:
             self._emit("layer_start", layer_idx=li, nodes=list(layer))
             for cid in layer:
                 comp = self.circuit.components[cid]
-                # 潜意识层：把后台浮出的候选假设注入本节点，供意识层(LLM/agent)采纳。
-                # 仅当本次执行携带候选时注入，默认不注入 → 零回归。
+                # 潜意识层：仅当本次执行携带候选时注入，默认不注入 → 零回归。
                 if self._sub_hints:
                     comp["subconscious_hints"] = self._sub_hints
                 self._emit("node_start", node=cid, ctype=comp.get("type"),
@@ -1529,7 +1528,6 @@ class CircuitExecutor:
             "skills_used": _skill_used,
             "model_selection": _model_recs,
             "memory_hit": self.circuit.spec.get("memory_hit"),
-            # 潜意识层：本次执行共向意识层注入了哪些后台候选假设（可观测/可审计）。
             "subconscious": {
                 "available": len(self._sub_hints),
                 "adopted": bool(self._sub_hints),
