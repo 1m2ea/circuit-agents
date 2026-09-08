@@ -58,3 +58,14 @@ _ui_*.log
 dist/
 build/
 circuit-agents.spec
+
+# 会话工作区数据 / 基准产物（可由 benchmark_surpass.py 重生成，2026-09-09 副本收敛批次）
+.workbuddy/
+benchmark_out*/
+
+# 全局日志兜底 + 散落临时输出
+*.log
+_ds_o.txt
+_dsh_gui_*.txt
+_health_selftest.err
+_subconscious_bak_*/

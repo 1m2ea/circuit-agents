@@ -1,7 +1,7 @@
 import os, struct
 
 desktop = r"C:\Users\lgw12\Desktop"
-target = r"C:\Users\lgw12\WorkBuddy\666\circuit-agents\dist\circuit-agents.exe"
+target = r"D:\dev\projects\666\circuit-agents\dist\circuit-agents.exe"
 lnk_path = os.path.join(desktop, "电路拓扑工作台.lnk")
 
 CLSID_SHELLINK = bytes([0x01,0x14,0x02,0x00,0x00,0x00,0x00,0x00,

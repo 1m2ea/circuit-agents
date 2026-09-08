@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CA_PORT", "8765"))
 BASE = f"http://{HOST}:{PORT}"
-EDITOR_URL = f"{BASE}/"  # 默认开最简 Live Console（新手友好；高级用户在页面内切「完整」模式或访问 /topology/editor）
+EDITOR_URL = f"{BASE}/chat"  # 默认打开「对话式智能体」聊天页（原 Live Console 仍可在页面右上角进入）
 
 _uv = None  # uvicorn.Server 实例
 
