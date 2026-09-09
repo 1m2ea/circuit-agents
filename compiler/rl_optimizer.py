@@ -265,7 +265,7 @@ class RLOptimizer:
                  holdout: bool = True, holdout_tasks=None,
                  holdout_max_tasks: int = 0,
                  vertical: bool = False, policy=None,
-                 revise_every: int = 8):
+                 revise_every: int = 8, holdout_backend=None):
         self.w = dict(self.DEFAULT_WEIGHTS)
         if weights:
             self.w.update(weights)
@@ -279,6 +279,8 @@ class RLOptimizer:
         self.holdout = bool(holdout)
         self.holdout_tasks = holdout_tasks
         self.holdout_max_tasks = int(holdout_max_tasks or 0)
+        # 传真后端 → holdout 才有真实辨别力（离线 add_verify/drop_verify delta 恒为 0）
+        self.holdout_backend = holdout_backend
         # 纵轴优化（MetaRSI）：改写算子**内部策略**（横轴只决定「选哪个算子」）
         # 默认 OFF —— 实测（2026-09-10，4 seed A/B）开启后 3 差 1 平 0 好：
         #   seed 7: 0.175→0.0875 | 3: 0.1975→0.1015 | 11: 持平 | 42: 0.4492→0.0875
@@ -460,7 +462,8 @@ class RLOptimizer:
             else:
                 audit = _replay_on_holdout(
                     ops, tasks=self.holdout_tasks, seed=self.exec_seed,
-                    max_tasks=self.holdout_max_tasks)
+                    max_tasks=self.holdout_max_tasks,
+                    backend=self.holdout_backend)
         except Exception as e:
             audit = {"n": 0, "error": f"{type(e).__name__}: {e}",
                      "mean_delta": 0.0, "median_delta": 0.0,
@@ -692,6 +695,22 @@ def holdout_selftest():
     res_off = opt_off.optimize(base_spec, episodes=12, patience=8)
     assert res_off["holdout_audit"]["verdict"] == "NO_DATA", "关闭后不应跑审计"
     print("✓ 可关闭: holdout=False 时 verdict=NO_DATA，主流程不受影响")
+
+    # 8) 真后端接线：dry_run 证明注入通路正确（无 key / 无网也能验）
+    try:
+        from .backend_llm import RealLLMBackend
+        _dry = RealLLMBackend(rng=random.Random(0), dry_run=True)
+        _ad = replay_on_holdout(["swap_model"], max_tasks=2, seed=0,
+                                backend=_dry)
+        assert _ad["n"] == 2, f"真后端应覆盖 2 任务, got {_ad['n']}"
+        assert _ad["backend"] == "real", "传入 backend 应标记为 real"
+        assert _ad["baseline_cached"] is False, \
+            "真后端有波动 → 基线不应缓存（否则拿单次采样当基准）"
+        print(f"✓ 真后端接线: dry_run 跑通 · backend={_ad['backend']} · "
+              f"基线不缓存 · mean_delta={_ad['mean_delta']} "
+              f"（传真后端即可测真实辨别力）")
+    except Exception as e:                      # 后端不可用不拖崩自检
+        print(f"  (跳过真后端 dry_run 验证: {type(e).__name__}: {e})")
 
     print("\nP0 不可写面 holdout 审计 离线自检全部通过 ✓")
 

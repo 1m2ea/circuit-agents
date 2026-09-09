@@ -152,20 +152,35 @@ def _cached_spec(task: str) -> dict:
     return json.loads(json.dumps(_SPEC_CACHE[task]))
 
 
-def _cached_baseline(task: str, seed: int) -> tuple:
-    """基线分缓存：(quality, success)。基准固定不变，缓存它就是「基准」的本义。"""
-    key = (task, seed)
-    if key not in _BASE_CACHE:
-        res = _execute(_cached_spec(task), seed)
-        _BASE_CACHE[key] = (_q(res), bool(res.get("success")))
-    return _BASE_CACHE[key]
+def _cached_baseline(task: str, seed: int, tag: str = "sim",
+                     backend=None, use_cache: bool = True) -> tuple:
+    """基线分：(quality, success)。
+
+    缓存语义（重要）：
+      · SimBackend（确定性）→ 缓存，基准固定不变，缓存它就是「基准」的本义
+      · 真 backend（有波动）→ **不缓存**，每次重跑。
+        否则会拿「一次采样」当基准去比「另一次采样」，把噪声当成 delta
+    """
+    key = (task, seed, tag)
+    if use_cache and key in _BASE_CACHE:
+        return _BASE_CACHE[key]
+    res = _execute(_cached_spec(task), seed, backend)
+    val = (_q(res), bool(res.get("success")))
+    if use_cache:
+        _BASE_CACHE[key] = val
+    return val
 
 
-def _execute(spec: dict, seed: int) -> dict:
-    """真跑一遍（与 RLOptimizer.evaluate 同路径：CircuitExecutor + SimBackend）。"""
+def _execute(spec: dict, seed: int, backend=None) -> dict:
+    """真跑一遍（与 RLOptimizer.evaluate 同路径：CircuitExecutor）。
+
+    backend=None → SimBackend（默认，确定性、离线）
+    backend 传入   → 用它（真后端 / 注入的假后端），可测真实辨别力
+    """
     from runtime import Circuit, CircuitExecutor, SimBackend
     try:
-        circ = Circuit(spec, SimBackend(random.Random(seed)))
+        be = backend if backend is not None else SimBackend(random.Random(seed))
+        circ = Circuit(spec, be)
         return CircuitExecutor(circ, memory_enabled=False,
                                auto_select_models=False).run()
     except Exception as e:
@@ -201,7 +216,8 @@ def apply_ops(spec: dict, op_names: list, rng: random.Random) -> Optional[dict]:
 def replay_on_holdout(op_names: list,
                       tasks: Optional[list] = None,
                       seed: int = 0,
-                      max_tasks: int = 0) -> dict:
+                      max_tasks: int = 0,
+                      backend=None) -> dict:
     """把算子序列重放到 holdout 任务集，用绝对分检验是否泛化。
 
     返回::
@@ -212,6 +228,10 @@ def replay_on_holdout(op_names: list,
 
     绝对分 = `final_quality`（不做任何 self 归一）——这是「不可写面」的关键：
     一旦允许按自身基线归一，闭环就能通过抬高基线制造进步的假象。
+
+    backend：默认 None（SimBackend，确定性离线）。传入真后端即可测**真实辨别力**
+    —— 离线状态下 add_verify/drop_verify 的 delta 恒为 0（模拟质量不建模 verify），
+    只有换上真后端，这几类结构改动才可能显出信号。真后端有波动 → 基线不缓存。
     """
     out = {"n": 0, "per_task": [], "mean_delta": 0.0, "median_delta": 0.0,
            "positive_rate": 0.0, "error": None}
@@ -226,6 +246,9 @@ def replay_on_holdout(op_names: list,
         return out
 
     deltas = []
+    real = backend is not None
+    tag = "real" if real else "sim"
+    use_cache = not real          # 真后端有波动 → 基线每次重跑，不拿单次采样当基准
     try:
         for i, task in enumerate(task_list):
             try:
@@ -236,7 +259,7 @@ def replay_on_holdout(op_names: list,
                      "replayed_quality": None, "delta": None,
                      "applied_ops": [], "error": f"编译失败: {type(e).__name__}"})
                 continue
-            bq, bok = _cached_baseline(task, seed)      # 基线走缓存（固定基准）
+            bq, bok = _cached_baseline(task, seed, tag, backend, use_cache)
             r = apply_ops(base_spec, op_names, random.Random(seed))
             if r is None:
                 out["per_task"].append(
@@ -260,6 +283,8 @@ def replay_on_holdout(op_names: list,
 
     scored = [d for d in deltas if d is not None]
     out["n"] = len(out["per_task"])
+    out["backend"] = tag
+    out["baseline_cached"] = use_cache
     if scored:
         out["mean_delta"] = round(statistics.fmean(scored), 4)
         out["median_delta"] = round(statistics.median(scored), 4)
