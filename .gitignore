@@ -19,6 +19,9 @@ venv/
 # Topology memory cache (auto-generated)
 .topology_memory.json
 
+# P0 不可写面 holdout 编译缓存（auto-generated；clear_cache() 可清）
+.holdout_spec_cache.json
+
 # ⑦ 长周期任务 checkpoint 文件（运行时生成，含断点续跑状态）
 .longtask_*.json
 longtask_*.json

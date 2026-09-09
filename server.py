@@ -1540,6 +1540,12 @@ class RLOptimizeRequest(BaseModel):
     seed: int = Field(0, description="搜索随机种子（可复现）")
     distill: bool = Field(False, description="是否把最优拓扑沉淀进 TopologyMemory")
     return_history: bool = Field(False, description="是否返回逐轮搜索轨迹（较大）")
+    holdout: bool = Field(True, description=(
+        "是否跑不可写面 holdout 审计（MetaRSI 定律四）：把搜出的算子序列重放到"
+        "只读任务集，检验改法是否泛化。结果在 holdout_audit.verdict "
+        "(GENERALIZES/OVERFIT/MIXED/NO_CLAIM/NO_DATA)"))
+    holdout_max_tasks: int = Field(0, description=(
+        "holdout 审计最多跑几个任务（0=全部，默认 6 个）；调小可省时"))
 
 
 @app.post("/rl/optimize")
@@ -1556,7 +1562,9 @@ def rl_optimize(req: RLOptimizeRequest):
     target = req.spec if req.spec is not None else req.goal
     if target is None:
         raise HTTPException(400, "goal 与 spec 至少提供一个")
-    opt = RLOptimizer(weights=req.weights, seed=req.seed)
+    opt = RLOptimizer(weights=req.weights, seed=req.seed,
+                      holdout=req.holdout,
+                      holdout_max_tasks=req.holdout_max_tasks)
     res = opt.optimize(target, episodes=req.episodes, patience=req.patience)
     if req.distill:
         res["distilled"] = opt.distill(
@@ -4866,6 +4874,46 @@ def selftest():
     print("✓ S46 人机协同(极致): 人/agent/知识源/系统四类协作者同池 · 按能力择优可解释 · "
           "offline自动绕开 · 机器主动点名人类专家并异步作答回灌节点 · "
           "求援过程SSE实时可见 · 重复应答404 · 无人可解不吊死 · 关闭开关零回归 全通过")
+
+    # ── S47 P0 不可写面 holdout 审计（MetaRSI 定律四）──────────────
+    from compiler.holdout import load_tasks, replay_on_holdout
+    from compiler.holdout import verdict as _ho_verdict
+    from compiler.rl_optimizer import RLOptimizer as _HO_RL
+    # ① 任务集只读：外部改不到模块常量（不可写面的前提）
+    _ho_t = load_tasks()
+    _ho_t.append("污染测试")
+    assert len(load_tasks()) == len(_ho_t) - 1, "S47: holdout 任务集应只读"
+    # ② 重放跑通（2 任务控耗时）+ 同 seed 可复现（否则无从谈"基准"）
+    _ho_a1 = replay_on_holdout(["swap_model"], max_tasks=2, seed=0)
+    _ho_a2 = replay_on_holdout(["swap_model"], max_tasks=2, seed=0)
+    assert _ho_a1["n"] == 2 and not _ho_a1.get("error"), \
+        f"S47: 重放应覆盖 2 个任务且无错 {_ho_a1.get('error')}"
+    assert _ho_a1["mean_delta"] == _ho_a2["mean_delta"], "S47: 同 seed 审计应可复现"
+    # ③ 五态裁决（定律四的核心判据）
+    assert _ho_verdict({"n": 4, "error": None, "mean_delta": 0.12,
+                        "positive_rate": 0.75}, 0.5) == "GENERALIZES"
+    assert _ho_verdict({"n": 4, "error": None, "mean_delta": -0.05,
+                        "positive_rate": 0.25}, 0.5) == "OVERFIT"
+    assert _ho_verdict({"n": 4, "error": None, "mean_delta": 0.05,
+                        "positive_rate": 0.4}, 0.5) == "MIXED"
+    assert _ho_verdict({"n": 4, "error": None, "mean_delta": 0.12,
+                        "positive_rate": 0.75}, 0.0) == "NO_CLAIM"
+    assert _ho_verdict({"n": 0, "error": "x"}, 0.5) == "NO_DATA"
+    # ④ 集成：optimize 自带审计 + 可关闭（零回归）
+    _ho_res = _HO_RL(seed=7, holdout_max_tasks=2).optimize(
+        _rlspec, episodes=12, patience=8)
+    _ho_aud = _ho_res.get("holdout_audit") or {}
+    assert _ho_aud.get("verdict") in ("GENERALIZES", "OVERFIT", "MIXED",
+                                      "NO_CLAIM", "NO_DATA"), \
+        f"S47: verdict 越界 {_ho_aud.get('verdict')}"
+    assert _ho_res["improved"], "S47: 接入审计不应影响搜索有效性（零回归）"
+    _ho_off = _HO_RL(seed=7, holdout=False).optimize(
+        _rlspec, episodes=12, patience=8)
+    assert _ho_off["holdout_audit"]["verdict"] == "NO_DATA", "S47: 关闭后不应跑审计"
+    print(f"✓ S47 不可写面 holdout 审计: {len(load_tasks())} 任务只读(改不到常量) · "
+          f"重放可复现 · 五态裁决齐全 · 集成 verdict={_ho_aud.get('verdict')} "
+          f"(mean_delta={_ho_aud.get('mean_delta')}, 重放 "
+          f"{len(_ho_aud.get('replayed_ops') or [])} 算子) · 可关闭零回归")
 
     print("\nserver.py 离线自检全部通过 ✓")
 
