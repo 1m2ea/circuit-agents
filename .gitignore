@@ -56,6 +56,7 @@ _procs*.txt
 _s*.log
 _test_*.py
 _ui_*.log
+_holdout_real_probe.py
 
 # PyInstaller 桌面壳构建产物（含 19MB 单文件 exe，本地使用、不入库）
 dist/
