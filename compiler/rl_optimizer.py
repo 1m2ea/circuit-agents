@@ -662,7 +662,10 @@ def holdout_selftest():
     assert verdict(gen, 0.5) == "GENERALIZES", "自报涨+holdout 涨 → 真改进"
     assert verdict(over, 0.5) == "OVERFIT", "自报涨但 holdout 跌 → 定律四命中"
     assert verdict(mixed, 0.5) == "MIXED", "半数以下为正 → 证据不足"
-    assert verdict(gen, 0.0) == "NO_CLAIM", "自报没涨 → 无所谓泛化"
+    # 修复验证：裁决的「赢」只能由外部 holdout(judge) 认定，循环自报不能否决/自证
+    assert verdict(gen, 0.0) == "GENERALIZES", "外部 judge 证真即泛化，循环自报 0 不能否决（修自我判赢）"
+    assert verdict(over, 0.0) == "NO_CLAIM", "自报没涨且外部不涨 → 诚实 NO_CLAIM，而非 OVERFIT"
+    assert verdict(over, None) == "NO_CLAIM", "循环无自报且外部不涨 → NO_CLAIM"
     assert verdict({"n": 0, "error": "x"}, 0.5) == "NO_DATA", "审计没跑成 → 不妄下结论"
     print("✓ 裁决逻辑: GENERALIZES / OVERFIT / MIXED / NO_CLAIM / NO_DATA 五态齐全")
 

@@ -339,26 +339,41 @@ def replay_on_holdout(op_names: list,
     return out
 
 
-def verdict(audit: dict, self_improvement: float) -> str:
-    """对照不可写面给出裁决。
+def verdict(audit: dict, self_improvement: float = None) -> str:
+    """对照不可写面给出裁决（定律四核心判据，已修「闭环自我判赢」结构漏洞）。
+
+    修复点（2026-09-11）：裁决的「赢」只能由**外部 holdout 基准（异构 judge 评分）**
+    认定，循环自报的 ``self_improvement`` 不再能单独产出正向裁决。旧实现里
+    ``self_improvement <= EPS_GAIN`` 会直接返回 NO_CLAIM——等于让循环自己决定
+    「我有没有赢」，典型的闭环自我判赢。新实现：
 
     · NO_DATA     —— 审计没跑成（空算子/编译失败/无分数）；不妄下结论
-    · GENERALIZES —— 自报提升 + holdout 也涨 → 真改进（可写面与不可写面一致）
-    · OVERFIT     —— 自报提升 但 holdout 不涨 → **定律四命中**：标准可能被放宽
-    · MIXED       —— holdout 部分为正但未过半，证据不足
-    · NO_CLAIM    —— 自报没提升，无所谓是否泛化
+    · GENERALIZES —— **外部 holdout（judge 评分）明确涨**（md>EPS 且正率≥下限）→ 真改进。
+                     与循环自报无关：即便循环自报 0，外部证真即为泛化。
+    · OVERFIT     —— holdout 不涨 **但循环自报涨** → **定律四命中**：标准被放宽，
+                     循环用可写先验灌出自报分，却骗不过异构 judge。
+    · NO_CLAIM    —— holdout 不涨 且 循环自报也不涨（或无自报）→ 无所谓泛化，
+                     诚实放弃裁决，不再让循环自我定性。
+    · MIXED       —— holdout 部分为正但未过半，证据不足（与自报无关）。
+
+    一句话：循环可以「自称赢了」（self_improvement 灌水），但裁决的「赢」必须外部
+    judge 背书；自称赢而外部不认 → OVERFIT，而不是 GENERALIZES。
     """
     if not audit or audit.get("error") or not audit.get("n"):
         return "NO_DATA"
-    if self_improvement is None or self_improvement <= EPS_GAIN:
-        return "NO_CLAIM"
     md = audit.get("mean_delta") or 0.0
     pr = audit.get("positive_rate") or 0.0
+    # ① 外部（不可写面）信号优先：明确涨 → 直接判泛化，不受循环自报影响
     if md > EPS_GAIN and pr >= POSITIVE_RATE_MIN:
         return "GENERALIZES"
-    if md <= EPS_GAIN:
+    # ② 外部部分涨但未过半 → 证据不足（与自报无关）
+    if md > EPS_GAIN:
+        return "MIXED"
+    # ③ 外部不涨：此时才看循环自报，且只能区分两种负向结论
+    #    循环自称涨 → 定律四命中（标准被放宽）；否则诚实 NO_CLAIM
+    if self_improvement is not None and self_improvement > EPS_GAIN:
         return "OVERFIT"
-    return "MIXED"
+    return "NO_CLAIM"
 
 
 def _q(res: dict) -> float:

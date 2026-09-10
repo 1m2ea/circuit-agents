@@ -4897,7 +4897,10 @@ def selftest():
     assert _ho_verdict({"n": 4, "error": None, "mean_delta": 0.05,
                         "positive_rate": 0.4}, 0.5) == "MIXED"
     assert _ho_verdict({"n": 4, "error": None, "mean_delta": 0.12,
-                        "positive_rate": 0.75}, 0.0) == "NO_CLAIM"
+                        "positive_rate": 0.75}, 0.0) == "GENERALIZES"
+    # 修复验证：循环自报 0 不能否决外部证真；自报没涨且外部不涨 → 诚实 NO_CLAIM
+    assert _ho_verdict({"n": 4, "error": None, "mean_delta": -0.05,
+                        "positive_rate": 0.25}, 0.0) == "NO_CLAIM"
     assert _ho_verdict({"n": 0, "error": "x"}, 0.5) == "NO_DATA"
     # ④ 集成：optimize 自带审计 + 可关闭（零回归）
     _ho_res = _HO_RL(seed=7, holdout_max_tasks=2).optimize(
