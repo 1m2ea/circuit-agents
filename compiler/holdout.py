@@ -40,6 +40,13 @@ optimize 产出的是针对某个具体任务拓扑的改动，直接把 spec �
 · 要真·不可写面辨别力，必须让质量由**独立校验器**量真实正确率：
   即 `resolve_verify_backend()`（VERIFY_API_KEY / VERIFY_API_BASE 异构校验路径）或外部评判，
   用与生产者不同的模型/供应商给 final_quality 打分。这才是定律四要求的「闭环写不到的外部基准」。
+· **P2′（2026-09-10 落地）：真正的不可写面校验器是 `HoldoutVerifier` + 本地模型 judge**。
+  它只看 `(task, answer)` 文本、打 0–1 正确率，loop 改不了其权重也改不了它给的分——
+  这才是定律四要求的「闭环写不到的外部基准」。关键陷阱：仅把 `verify` 节点路由到独立后端
+  （`resolve_verify_backend()`）仍救不了辨别力，因为那后端返回的还是 tier-cap 先验 quality
+  （`backend_llm.py:382`）；必须对「实际产出的答案」用**异构本地模型**当 judge 打分才算真·外部基准。
+  `replay_on_holdout(..., verifier=HoldoutVerifier(LocalModelJudge()))` 即启用；
+  离线自测可注入 `MockJudge` 验证接线（见 `rl_optimizer.holdout_selftest`）。
 · 本审计的正确定位（修正版）：它是**诚实的度量框架**——离线可分辨换档类改动，
   真后端接上异构校验器后可分辨结构类改动；但**单靠换真后端（同构质量先验）救不了辨别力**。
 · 本模块只读、只审计，绝不修改任何被优化对象；失败一律静默降级，不拖崩主流程。
@@ -52,6 +59,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import statistics
 from typing import Optional
 
@@ -162,7 +170,10 @@ def _cached_spec(task: str) -> dict:
 
 def _cached_baseline(task: str, seed: int, tag: str = "sim",
                      backend=None, use_cache: bool = True) -> tuple:
-    """基线分：(quality, success)。
+    """基线分：(quality, success, answer)。
+
+    quality = final_quality（若调用方传入 verifier，则由其换算成 judge 分）。
+    answer  = 最终答案文本（executor result 的 ``answer`` 字段），供 judge 对实际产出打分。
 
     缓存语义（重要）：
       · SimBackend（确定性）→ 缓存，基准固定不变，缓存它就是「基准」的本义
@@ -173,7 +184,7 @@ def _cached_baseline(task: str, seed: int, tag: str = "sim",
     if use_cache and key in _BASE_CACHE:
         return _BASE_CACHE[key]
     res = _execute(_cached_spec(task), seed, backend)
-    val = (_q(res), bool(res.get("success")))
+    val = (_q(res), bool(res.get("success")), res.get("answer"))
     if use_cache:
         _BASE_CACHE[key] = val
     return val
@@ -225,7 +236,8 @@ def replay_on_holdout(op_names: list,
                       tasks: Optional[list] = None,
                       seed: int = 0,
                       max_tasks: int = 0,
-                      backend=None) -> dict:
+                      backend=None,
+                      verifier=None) -> dict:
     """把算子序列重放到 holdout 任务集，用绝对分检验是否泛化。
 
     返回::
@@ -240,9 +252,16 @@ def replay_on_holdout(op_names: list,
     backend：默认 None（SimBackend，确定性离线）。传入真后端即可测**真实辨别力**
     —— 离线状态下 add_verify/drop_verify 的 delta 恒为 0（模拟质量不建模 verify），
     只有换上真后端，这几类结构改动才可能显出信号。真后端有波动 → 基线不缓存。
+
+    verifier：默认 None。传入 `HoldoutVerifier`（包一个本地模型 judge，见 P2′）后，
+    审计的【绝对分】从 `final_quality` 换成 judge 对「task+实际答案」打的 0–1 正确率——
+    这才是定律四要求的「闭环写不到的外部基准」。judge 不可用/解析失败的任务自动跳过、
+    不计入 delta（避免污染均值）。离线自测可注入 `MockJudge` 验证接线。
     """
     out = {"n": 0, "per_task": [], "mean_delta": 0.0, "median_delta": 0.0,
-           "positive_rate": 0.0, "error": None}
+           "positive_rate": 0.0, "error": None,
+           "verdict_metric": "judge" if verifier is not None else "final_quality",
+           "verifier": type(verifier).__name__ if verifier is not None else None}
     if not op_names:
         out["error"] = "空算子序列（无可重放改动）"
         return out
@@ -267,7 +286,7 @@ def replay_on_holdout(op_names: list,
                      "replayed_quality": None, "delta": None,
                      "applied_ops": [], "error": f"编译失败: {type(e).__name__}"})
                 continue
-            bq, bok = _cached_baseline(task, seed, tag, backend, use_cache)
+            bq, bok, banswer = _cached_baseline(task, seed, tag, backend, use_cache)
             r = apply_ops(base_spec, op_names, random.Random(seed))
             if r is None:
                 out["per_task"].append(
@@ -276,7 +295,24 @@ def replay_on_holdout(op_names: list,
                      "applied_ops": [], "error": "算子序列在该任务上全部不适用"})
                 continue
             rres = _execute(r["spec"], seed)
-            rq = _q(rres)
+            if verifier is not None:
+                bjs = verifier.score(task, banswer,
+                                     meta={"applied_ops": [], "replayed": False})
+                rjs = verifier.score(task, rres.get("answer"),
+                                     meta={"applied_ops": r["applied"],
+                                           "replayed": True})
+                if bjs is None or rjs is None:
+                    out["per_task"].append(
+                        {"task": task, "baseline_quality": round(bq, 4),
+                         "replayed_quality": None, "delta": None,
+                         "applied_ops": r["applied"],
+                         "baseline_success": bok,
+                         "replayed_success": bool(rres.get("success")),
+                         "error": "judge 不可用 / 解析失败（答案未产出或 judge 静默降级）"})
+                    continue
+                bq, rq = bjs, rjs
+            else:
+                rq = _q(rres)
             delta = round(rq - bq, 4)
             deltas.append(delta)
             out["per_task"].append(
@@ -331,3 +367,149 @@ def _q(res: dict) -> float:
         return float(res.get("final_quality") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# P2′ 不可写面校验器：本地模型当 LLM-judge（治 MetaRSI 定律四）
+# ---------------------------------------------------------------------------
+class HoldoutVerifier:
+    """把「质量由谁度量」从 loop 内部转移到闭环写不到的外部 judge。
+
+    用法::
+
+        from compiler.holdout import HoldoutVerifier, LocalModelJudge
+        ver = HoldoutVerifier(LocalModelJudge())          # 真实：本地模型打分
+        aud = replay_on_holdout(["add_verify"], verifier=ver)
+
+    核心：judge 只看 ``(task, answer)`` 文本，打 0–1 正确率分；
+    loop 既改不了 judge 的权重，也改不了它给的分——这才是定律四要求的
+    「不可写面」。本 verifier 是 judge 的薄封装，负责：
+      · 取最终答案文本（executor result 的 ``answer`` 字段）
+      · 调 judge 打分、容错解析、夹紧到 [0,1]
+      · 缓存（同 (task, answer, meta) 只判一次，省本地算力）
+
+    judge 接口：``judge(task: str, answer: str, meta: dict|None) -> float|None``。
+    真实 judge（LocalModelJudge）只吃 task+answer；meta 仅供离线 MockJudge 注入预设分。
+    """
+
+    def __init__(self, judge, cache: bool = True):
+        self.judge = judge
+        self._cache = {} if cache else None
+
+    def score(self, task: str, answer, meta: Optional[dict] = None):
+        """对 (task, answer) 打分；answer 缺失 / judge 抛错 / 解析失败 → None。"""
+        if answer is None:
+            return None
+        ans = answer if isinstance(answer, str) else str(answer)
+        if self._cache is not None:
+            # meta 进缓存键：离线 MockJudge 同 (task,answer) 但 baseline/replayed
+            # 的 meta 不同 → 必须区分，否则 replayed 会命中 baseline 的缓存分。
+            k = (task, ans, json.dumps(meta or {}, sort_keys=True))
+            if k in self._cache:
+                return self._cache[k]
+        try:
+            s = self.judge(task, ans, meta)
+            s = float(s)
+        except Exception:
+            s = None
+        if s is not None:
+            s = max(0.0, min(1.0, s))   # 夹紧到 [0,1]
+            if self._cache is not None:
+                self._cache[k] = s
+        return s
+
+
+class LocalModelJudge:
+    """真实 judge：把 (task, answer) 发给本地 OpenAI 兼容端点，解析 0–1 正确率分。
+
+    端点默认 ``http://127.0.0.1:8000/v1``（local_llm_bridge.py 起的 1.5B/7B 桥），
+    可用 ``VERIFY_API_BASE`` 覆盖（如 ``http://127.0.0.1:8001/v1`` 指向 7B-GGUF）。
+    不依赖任何外部 API、零 token 成本、loop 不可改写其权重或分数——真·不可写面。
+
+    与 ``resolve_verify_backend()`` 的区别（关键）：后者返回的 LLM 后端仍是
+    tier-cap 先验 quality（backend_llm.py:382），不是对实际产出的度量；
+    本 judge 直接吃 (task, answer) 文本、自己解析正确率，绕开先验。
+    """
+
+    JUDGE_PROMPT = (
+        "你是严格的答案正确性评审。下面给了一个任务和一份候选答案。\n"
+        "请只根据候选答案是否真正、完整地回答了任务来打分，"
+        "不要被答案长短或措辞迷惑。\n"
+        "只输出一个 0.0 到 1.0 之间的小数（不要任何解释）：\n"
+        "任务：{task}\n\n候选答案：{answer}\n\n分数："
+    )
+
+    def __init__(self, base_url=None, api_key="not-needed", model=None,
+                 timeout=120.0, http_post=None, temperature=0.0):
+        self.base_url = (base_url or os.environ.get("VERIFY_API_BASE")
+                         or "http://127.0.0.1:8000/v1").rstrip("/")
+        self.api_key = api_key
+        self.model = model or os.environ.get("VERIFY_MODEL") or "local"
+        self.timeout = timeout
+        self._http_post = http_post
+        self.temperature = temperature
+
+    def __call__(self, task, answer, meta=None):
+        prompt = self.JUDGE_PROMPT.format(task=task, answer=answer)
+        messages = [{"role": "user", "content": prompt}]
+        return self._score(messages)
+
+    def _score(self, messages):
+        raw = self._post(messages)
+        if isinstance(raw, dict):
+            try:
+                raw = raw["choices"][0]["message"]["content"]
+            except Exception:
+                raw = str(raw)
+        return self._parse_score(raw)
+
+    def _post(self, messages):
+        payload = {"model": self.model, "messages": messages,
+                   "temperature": self.temperature, "max_tokens": 8}
+        if self._http_post is not None:
+            return self._http_post(self.base_url + "/chat/completions", json=payload)
+        import urllib.request
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.base_url + "/chat/completions", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.api_key}"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    @staticmethod
+    def _parse_score(text):
+        if not text:
+            return None
+        # 取最后一个浮点数（模型可能前缀些废话），夹紧到 [0,1]
+        found = re.findall(r"1\.0|0\.\d+|\.\d+|\b\d+\.\d+\b|\b0\b|\b1\b", str(text))
+        if not found:
+            return None
+        try:
+            val = float(found[-1])
+        except ValueError:
+            return None
+        return max(0.0, min(1.0, val))
+
+
+class MockJudge:
+    """离线自测用 oracle：按 (task, applied_ops, replayed) 返回预设分。
+
+    真实 judge 只看 (task, answer)；MockJudge 额外吃 meta 仅用于自测
+    「注入不同分 → 审计辨别力随 judge 改变」这一集成事实（stand-in 本地模型）。
+    table 键：``(task, frozenset(ops), replayed) -> score``。
+    """
+
+    def __init__(self, table: dict):
+        self.table = table
+
+    def __call__(self, task, answer, meta=None):
+        meta = meta or {}
+        ops = frozenset(meta.get("applied_ops") or [])
+        replayed = bool(meta.get("replayed", False))
+        return self.table.get((task, ops, replayed))
+
+
+def build_local_judge(base_url=None, **kw) -> "LocalModelJudge":
+    """构造真实本地 judge（默认指向 local_llm_bridge 的 127.0.0.1:8000）。"""
+    return LocalModelJudge(base_url=base_url, **kw)

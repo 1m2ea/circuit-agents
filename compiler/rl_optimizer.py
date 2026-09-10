@@ -623,7 +623,7 @@ def holdout_selftest():
     import os
     os.environ.pop("AGENT_API_KEY", None)
     from .holdout import (HOLDOUT_TASKS, load_tasks, replay_on_holdout,
-                          verdict, EPS_GAIN)
+                          verdict, EPS_GAIN, HoldoutVerifier, MockJudge)
 
     # 1) 任务集只读语义：load_tasks 返回副本，改不到模块常量
     t = load_tasks()
@@ -711,6 +711,27 @@ def holdout_selftest():
               f"（传真后端即可测真实辨别力）")
     except Exception as e:                      # 后端不可用不拖崩自检
         print(f"  (跳过真后端 dry_run 验证: {type(e).__name__}: {e})")
+
+    # 9) P2′ judge 路径：注入 oracle（本地模型的 stand-in），证明审计改用 judge 分后
+    #    辨别力随 judge 改变（add_verify 在 final_quality 下恒为 0，在真 judge 下应转正）
+    #    oracle：基准 0.5；加了 add_verify 的答案判到 0.8（模拟本地模型认为校验后更正确）
+    oracle = MockJudge({
+        (HOLDOUT_TASKS[0], frozenset(), False): 0.5,
+        (HOLDOUT_TASKS[0], frozenset(["add_verify"]), True): 0.8,
+        (HOLDOUT_TASKS[1], frozenset(), False): 0.5,
+        (HOLDOUT_TASKS[1], frozenset(["add_verify"]), True): 0.8,
+    })
+    a9 = replay_on_holdout(["add_verify"], max_tasks=2, seed=0,
+                           verifier=HoldoutVerifier(oracle))
+    assert a9["n"] == 2, f"judge 审计应覆盖 2 任务, got {a9['n']}"
+    assert a9.get("verdict_metric") == "judge", "应标记 metric=judge"
+    assert a9.get("verifier") == "HoldoutVerifier", "应记录所用 verifier 类型"
+    scored = [p["delta"] for p in a9["per_task"] if p.get("delta") is not None]
+    assert scored and all(d > EPS_GAIN for d in scored), \
+        f"真 judge 下 add_verify 应转正 delta, got {scored}"
+    assert a9["mean_delta"] > 0.2, f"judge 应给出明显正 delta, got {a9['mean_delta']}"
+    print(f"✓ P2′ judge 路径: 注入 oracle 后 add_verify mean_delta="
+          f"{a9['mean_delta']}（final_quality 下恒为 0）→ 辨别力随 judge 改变")
 
     print("\nP0 不可写面 holdout 审计 离线自检全部通过 ✓")
 

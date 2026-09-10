@@ -1510,7 +1510,14 @@ class CircuitExecutor:
             except Exception:
                 pass
 
+        # 暴露最终答案文本：供外部校验器 / 审计对「实际产出」打分（零回归：新增字段）
+        _final_node = next(iter(terminals), None) if terminals else None
+        _answer = None
+        if _final_node and _final_node in out:
+            _v = out[_final_node]
+            _answer = _v.value if hasattr(_v, "value") else _v
         result = {
+            "answer": _answer,
             "success": all(out[c].ok for c in terminals),
             "final_quality": round(fq, 3),
             "total_cost": round(total_cost, 4),
