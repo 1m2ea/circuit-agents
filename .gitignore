@@ -78,3 +78,8 @@ _subconscious_bak_*/
 .operator_policy.json
 .topology_memory_pending.json
 _mcp_topo.json
+
+# 技能 master 的运行期产物（随每次规划生成，不纳入版本控制）
+skills/circuit-planner/scripts/runbooks/
+skills/circuit-planner/scripts/diagrams/
+skills/circuit-planner/scripts/__pycache__/
