@@ -73,3 +73,8 @@ _ds_o.txt
 _dsh_gui_*.txt
 _health_selftest.err
 _subconscious_bak_*/
+
+# MCP 引擎在仓库根产生的运行态文件（2026-09-11 收编后新增，由 circuit-harness 补）
+.operator_policy.json
+.topology_memory_pending.json
+_mcp_topo.json
