@@ -165,10 +165,21 @@ def main() -> int:
         _stop_server()
         return rc
 
-    # GUI 模式：运行期产物落地到 %LOCALAPPDATA%/circuit-agents，避免污染启动目录
-    data_dir = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "circuit-agents")
+    # GUI 模式：运行期产物落地点（executions.db + 拓扑记忆），优先级：
+    #   ① CIRCUIT_DATA_DIR 环境变量（显式指定，部署 / 便携用）
+    #   ② exe 位于 <仓库>\dist\ 下 → 用仓库根，与 MCP 引擎共用同一份领域记忆
+    #      （《秩序宪章》第 1 条：领域记忆只允许一个写入者 / 一份真相源）
+    #   ③ 兜底 %LOCALAPPDATA%\circuit-agents，避免污染启动目录
+    data_dir = os.environ.get("CIRCUIT_DATA_DIR", "")
+    if not data_dir:
+        cand = (os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+                if getattr(sys, "frozen", False) else HERE)
+        data_dir = (cand if os.path.isdir(os.path.join(cand, "compiler"))
+                    else os.path.join(os.environ.get("LOCALAPPDATA", HERE), "circuit-agents"))
     os.makedirs(data_dir, exist_ok=True)
     os.chdir(data_dir)
+    # 让 TopologyMemory 落到同一目录（否则冻结后它会写进 _MEIxxxx 临时目录，记忆退出即失）
+    os.environ["CIRCUIT_MEMORY_PATH"] = os.path.join(data_dir, ".topology_memory.json")
 
     t = threading.Thread(target=_start_server, daemon=True)
     t.start()

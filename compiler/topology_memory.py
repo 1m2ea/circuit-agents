@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -38,9 +39,20 @@ class TopologyMemory:
 
     def __init__(self, path: str | None = None):
         if path is None:
-            # 默认存在 circuit-agents 项目根目录
-            here = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(os.path.dirname(here), ".topology_memory.json")
+            # 默认路径优先级：
+            #   ① CIRCUIT_MEMORY_PATH 环境变量（部署 / 便携 / 由启动器指定）
+            #   ② 冻结为 exe：用 exe 所在目录 —— 否则 __file__ 指向 _MEIxxxx 临时目录，
+            #      记忆会随进程退出被删除（桌面端表现为"每次都是新的、教训攒不下来"）
+            #   ③ 源码运行：项目根目录
+            env_path = os.environ.get("CIRCUIT_MEMORY_PATH")
+            if env_path:
+                path = env_path
+            elif getattr(sys, "frozen", False):
+                path = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                    ".topology_memory.json")
+            else:
+                here = os.path.dirname(os.path.abspath(__file__))
+                path = os.path.join(os.path.dirname(here), ".topology_memory.json")
         self.path = path
         self._store = self._load()
 
