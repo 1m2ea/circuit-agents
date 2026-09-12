@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 circuit-planner · plan.py — NL → Goal → 编译 → 可读执行计划
@@ -459,15 +459,20 @@ def _extract_node_values(results):
       by_node   : 节点 id -> 产出值
       by_output : 产出字段名（如 interface_design）-> 产出值（更可读，优先用它）
     """
-    by_cid, by_output = {}, {}
+    by_cid, by_output, errs = {}, {}, {}
     for cid, sig in (results or {}).items():
         val = getattr(sig, "value", sig)
         if not isinstance(val, (str, int, float, bool, type(None), list, dict)):
             val = str(val)
         by_cid[cid] = val
-        for name in ((getattr(sig, "meta", {}) or {}).get("produced_outputs") or []):
+        meta = getattr(sig, "meta", {}) or {}
+        # 错误可见性：RealLLMBackend 开路时把 {open: http_error, error: <原文>} 放在 meta 里，
+        # 修复前被整块丢弃 → 全链路失败只表现为一串 null，无法定位（鉴权/端点/网络分不清）。
+        if meta.get("error") or meta.get("open"):
+            errs[cid] = {"open": meta.get("open"), "error": str(meta.get("error"))[:600]}
+        for name in (meta.get("produced_outputs") or []):
             by_output.setdefault(name, val)
-    return {"by_node": by_cid, "by_output": by_output}
+    return {"by_node": by_cid, "by_output": by_output, "errors": errs}
 
 
 def _run_real(spec, api_key, base_url):
@@ -482,9 +487,11 @@ def _run_real(spec, api_key, base_url):
         backend = RealLLMBackend(rng=random.Random(0), dry_run=True)
         mode = "dry_run（未检测到 API key，仅组装请求不发起真调用）"
     else:
-        # 未显式给 base_url 时：若设了 DEEPSEEK_API_KEY 则默认走 DeepSeek 兼容端点
+        # 未显式给 base_url 时：只要拿到了 key（环境变量 *或* key 文件）就默认走 DeepSeek 兼容端点
         # （RealLLMBackend 会据 base_url 自动套 deepseek 模型映射），否则默认 OpenAI。
-        if not base_url and os.environ.get("DEEPSEEK_API_KEY"):
+        # 修复：原判据只看 DEEPSEEK_API_KEY 环境变量，从 key 文件取到 key 时 base_url 会保持
+        # None → 拿着 DeepSeek 的 key 去打 api.openai.com → 全节点 401 开路（静默拿 D 分）。
+        if not base_url and (os.environ.get("DEEPSEEK_API_KEY") or api_key):
             base_url = "https://api.deepseek.com/v1"
         backend = RealLLMBackend(api_key=api_key, base_url=base_url, rng=random.Random(0))
         mode = f"真实在线（base_url={base_url or '默认 OpenAI'}）"
@@ -845,6 +852,11 @@ def main(argv):
         # res["state"]["_fetched"] 即各节点真实产出正文（runtime 一直返回，只是从未往外取）
         nv = res.get("node_values") or {}
         fetched = (nv.get("by_output") or nv.get("by_node") or {})
+        errs = nv.get("errors") or {}
+        if errs:
+            print("  开路节点错误详情（修复前被丢弃）:")
+            for k, e in errs.items():
+                print(f"    ! {k}: open={e.get('open')} error={e.get('error')}")
         if fetched:
             print("  各节点产出正文（A 修复前：生成后直接丢弃）:")
             for k, v in fetched.items():
@@ -861,7 +873,8 @@ def main(argv):
                 json.dump(
                     {"goal": nl, "spec_name": base, "mode": mode,
                      "summary": {k: v for k, v in res.items() if k != "state"},
-                     "node_outputs": fetched},
+                     "node_outputs": fetched,
+                     "node_errors": errs},
                     f, ensure_ascii=False, indent=2, default=str,
                 )
             print(f"  ↳ 节点正文已落盘: {out_path}"

@@ -83,3 +83,7 @@ _mcp_topo.json
 skills/circuit-planner/scripts/runbooks/
 skills/circuit-planner/scripts/diagrams/
 skills/circuit-planner/scripts/__pycache__/
+
+# 9/12 复核批次
+._health_selftest.*
+skills/circuit-planner/scripts/outputs/
